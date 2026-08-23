@@ -27,6 +27,13 @@ jobs:
       - run: rustup install ${{ env.RUST_VERSION }} && rustup default ${{ env.RUST_VERSION }}
       - run: rustup component add clippy
       - run: make clippy
+  test-unit:
+    name: Host-Independent Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup install ${{ env.RUST_VERSION }} && rustup default ${{ env.RUST_VERSION }}
+      - run: make test-unit
   test:
     name: Unit and Integration Test / ${{ matrix.hierarchy }}
     runs-on: ubuntu-24.04

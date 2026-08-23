@@ -880,15 +880,11 @@ impl Manager for FsManager {
     }
 }
 
-/// Parse cgroup subsystem paths from `/proc/self/cgroup`.
-fn parse_cgroup_subsystems() -> Result<HashMap<String, String>> {
+/// Parse cgroup subsystem paths from a `/proc/self/cgroup` content string.
+fn parse_cgroup_subsystems_str(input: &str) -> HashMap<String, String> {
     let mut cgroup_paths = HashMap::new();
-    let data = fs::read_to_string(CGROUP_PATH)
-        .map_err(|err| FsError::with_cause(FsErrorKind::FsError, err))
-        .map_err(Error::Cgroupfs)?;
-
     // Expected line format: `10:memory:/user.slice`
-    for line in data.lines() {
+    for line in input.lines() {
         let parts: Vec<&str> = line.split(':').collect();
         if parts.len() != 3 {
             // Ignore corrupt lines
@@ -900,8 +896,15 @@ fn parse_cgroup_subsystems() -> Result<HashMap<String, String>> {
             cgroup_paths.insert(subsystem.to_string(), path.to_string());
         });
     }
+    cgroup_paths
+}
 
-    Ok(cgroup_paths)
+/// Parse cgroup subsystem paths from `/proc/self/cgroup`.
+fn parse_cgroup_subsystems() -> Result<HashMap<String, String>> {
+    let data = fs::read_to_string(CGROUP_PATH)
+        .map_err(|err| FsError::with_cause(FsErrorKind::FsError, err))
+        .map_err(Error::Cgroupfs)?;
+    Ok(parse_cgroup_subsystems_str(&data))
 }
 
 /// Parse cgroup mount information from `/proc/self/mountinfo`.
@@ -1420,5 +1423,97 @@ mod tests {
         let mut manager = new_manager();
         assert!(!manager.systemd(), "FsManager should not be systemd");
         manager.destroy().unwrap();
+    }
+}
+
+/// Host-independent parser tests driven by fixture data.
+/// This module is separate from `tests` so that the privileged-suite skip
+/// filter (`manager::fs::tests`) does not exclude these non-privileged tests.
+#[cfg(test)]
+mod parse_tests {
+    use super::parse_cgroup_subsystems_str;
+
+    const V2_SINGLE: &str = include_str!("../../tests/fixtures/membership/v2-single.txt");
+    const V1_MULTI: &str = include_str!("../../tests/fixtures/membership/v1-multi.txt");
+    const COLON_PATH: &str = include_str!("../../tests/fixtures/membership/colon-path.txt");
+    const NESTED: &str = include_str!("../../tests/fixtures/membership/nested.txt");
+    const MALFORMED: &str = include_str!("../../tests/fixtures/membership/malformed.txt");
+
+    fn parse_fixture(input: &str) -> std::collections::HashMap<String, String> {
+        let lines: Vec<&str> = input.lines().filter(|l| !l.starts_with('#')).collect();
+        parse_cgroup_subsystems_str(&lines.join("\n"))
+    }
+
+    #[test]
+    fn test_parse_v2_single_fixture() {
+        let paths = parse_fixture(V2_SINGLE);
+        assert!(paths.contains_key(""), "v2 must map empty controller key");
+        assert_eq!(
+            paths.get(""),
+            Some(
+                &"/user.slice/user-1001.slice/user@1001.service/app.slice/snap.opencode.scope"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_v1_multi_fixture() {
+        let paths = parse_fixture(V1_MULTI);
+        // v1 controllers present
+        assert_eq!(
+            paths.get("memory"),
+            Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
+        );
+        assert_eq!(paths.get("cpu"), Some(&"/user.slice".to_string()));
+        assert_eq!(paths.get("cpuacct"), Some(&"/user.slice".to_string()));
+        assert_eq!(
+            paths.get("pids"),
+            Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
+        );
+        // name=systemd is a single key
+        assert_eq!(
+            paths.get("name=systemd"),
+            Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
+        );
+        // v2 line maps empty key
+        assert_eq!(
+            paths.get(""),
+            Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
+        );
+        // controllers at root
+        assert_eq!(paths.get("cpuset"), Some(&"/".to_string()));
+    }
+
+    #[test]
+    fn test_parse_colon_path_fixture() {
+        // Known defect: both lines are silently dropped because the colon in
+        // the path breaks the 3-part split (v2: 4 parts, v1: 4 parts).
+        let paths = parse_fixture(COLON_PATH);
+        assert!(
+            paths.is_empty(),
+            "current behavior: all colon-path lines dropped, got {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_parse_nested_fixture() {
+        let paths = parse_fixture(NESTED);
+        assert_eq!(
+            paths.get(""),
+            Some(&"/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_malformed_fixture() {
+        // Known behavior: every malformed line is silently dropped.
+        let paths = parse_fixture(MALFORMED);
+        assert!(
+            paths.is_empty(),
+            "current behavior: all malformed lines dropped, got {:?}",
+            paths
+        );
     }
 }

@@ -1,0 +1,4 @@
+# Fixture: colon inside a cgroup mount point. mountinfo does not escape
+# colons, and split-based parsing must keep them part of the mount point.
+# Expected: parse_mountinfo_for_line returns mount_point "/sys/fs/cgroup/work:dev".
+70 26 0:26 / /sys/fs/cgroup/work:dev rw,nosuid,nodev,noexec,relatime shared:22 - cgroup cgroup rw,memory
