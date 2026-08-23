@@ -1,0 +1,7 @@
+# Fixture: process inside a mount namespace; cgroup mounts appear at
+# nonstandard mount points and the mount root is not "/".
+# Expected: all lines parse; mount_point values differ from a host view and
+# the cgroup root for the namespace is under /docker/abcd1234.
+50 22 0:26 /docker/abcd1234 /sys/fs/cgroup/cpu,cpuacct rw,relatime shared:10 - cgroup cgroup rw,cpu,cpuacct
+51 22 0:27 /docker/abcd1234 /sys/fs/cgroup/memory rw,relatime shared:11 - cgroup cgroup rw,memory
+52 22 0:28 /docker/abcd1234 /sys/fs/cgroup rw,relatime shared:12 - cgroup2 cgroup2 rw,nsdelegate

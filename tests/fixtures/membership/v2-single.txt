@@ -1,0 +1,6 @@
+# Fixture: /proc/<pid>/cgroup on a cgroup v2 host.
+# Captured from a real host; the session scope suffix is redacted.
+# Format: <hierarchy-id>:<controller-list>:<path>
+# Expected: parse_cgroup_subsystems returns {"" -> path} per line; the
+# empty controller list maps the path under the "" key (v2 convention).
+0::/user.slice/user-1001.slice/user@1001.service/app.slice/snap.opencode.scope

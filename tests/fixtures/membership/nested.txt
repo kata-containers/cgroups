@@ -1,0 +1,4 @@
+# Fixture: process inside a nested container, cgroup namespace view.
+# Expected: paths resolve relative to the namespace root, not the host root.
+0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/init
+0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec

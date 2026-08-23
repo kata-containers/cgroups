@@ -362,6 +362,24 @@ pub fn auto() -> Box<dyn Hierarchy> {
 mod tests {
     use super::*;
 
+    // Fixture data captured from real hosts and QEMU guests.
+    const V1_MIXED: &str = include_str!("../../tests/fixtures/mountinfo/v1-mixed.txt");
+    const V2_UNIFIED: &str = include_str!("../../tests/fixtures/mountinfo/v2-unified.txt");
+    const HYBRID: &str = include_str!("../../tests/fixtures/mountinfo/hybrid.txt");
+    const NAMESPACED: &str = include_str!("../../tests/fixtures/mountinfo/namespaced.txt");
+    const ESCAPED: &str = include_str!("../../tests/fixtures/mountinfo/escaped.txt");
+    const COLON_PATH: &str = include_str!("../../tests/fixtures/mountinfo/colon-path.txt");
+    const MALFORMED: &str = include_str!("../../tests/fixtures/mountinfo/malformed.txt");
+
+    /// Parse all non-comment lines from a fixture file.
+    fn parse_fixture(input: &str) -> Vec<Option<Mountinfo>> {
+        input
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(parse_mountinfo_for_line)
+            .collect()
+    }
+
     #[test]
     fn test_parse_mount() {
         let mountinfo = vec![
@@ -388,5 +406,112 @@ mod tests {
             let info = parse_mountinfo_for_line(mi.0).unwrap();
             assert_eq!(info, mi.1)
         }
+    }
+
+    #[test]
+    fn test_parse_v1_mixed_fixture() {
+        let parsed = parse_fixture(V1_MIXED);
+        assert!(
+            parsed.iter().all(|m| m.is_some()),
+            "every v1-mixed line should parse"
+        );
+        for mi in parsed.iter().flatten() {
+            assert_eq!(
+                mi.fs_type.0, "cgroup",
+                "v1-mixed fs_type must be cgroup, got {:?}",
+                mi.fs_type.0
+            );
+        }
+        assert_eq!(parsed.len(), 13);
+    }
+
+    #[test]
+    fn test_parse_v2_unified_fixture() {
+        let parsed = parse_fixture(V2_UNIFIED);
+        assert!(
+            parsed.iter().all(|m| m.is_some()),
+            "every v2-unified line should parse"
+        );
+        for mi in parsed.iter().flatten() {
+            assert_eq!(
+                mi.fs_type.0, "cgroup2",
+                "v2-unified fs_type must be cgroup2, got {:?}",
+                mi.fs_type.0
+            );
+        }
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_hybrid_fixture() {
+        let parsed = parse_fixture(HYBRID);
+        assert!(
+            parsed.iter().all(|m| m.is_some()),
+            "every hybrid line should parse"
+        );
+        let types: Vec<&str> = parsed
+            .iter()
+            .flatten()
+            .map(|m| m.fs_type.0.as_str())
+            .collect();
+        assert!(
+            types.contains(&"cgroup"),
+            "hybrid must have v1 cgroup lines"
+        );
+        assert!(types.contains(&"cgroup2"), "hybrid must have cgroup2 line");
+        assert!(types.contains(&"tmpfs"), "hybrid must have tmpfs line");
+    }
+
+    #[test]
+    fn test_parse_namespaced_fixture() {
+        let parsed = parse_fixture(NAMESPACED);
+        assert!(
+            parsed.iter().all(|m| m.is_some()),
+            "every namespaced line should parse"
+        );
+        for mi in parsed.iter().flatten() {
+            assert!(
+                mi.mount_point.starts_with("/sys/fs/cgroup"),
+                "namespaced mount_point unexpected: {:?}",
+                mi.mount_point
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_escaped_fixture() {
+        // Known defect: the parser does NOT unescape \040/\011, so mount
+        // points parse as literal strings containing the escape sequences.
+        // Phase 1 should fix the parser and update this test.
+        let parsed = parse_fixture(ESCAPED);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|m| m.is_some()));
+        let m0 = parsed[0].as_ref().unwrap();
+        assert!(
+            m0.mount_point.to_string_lossy().contains(r"\040"),
+            "current behavior: escaped space not decoded, got {:?}",
+            m0.mount_point
+        );
+    }
+
+    #[test]
+    fn test_parse_colon_path_fixture() {
+        let parsed = parse_fixture(COLON_PATH);
+        assert_eq!(parsed.len(), 1);
+        let mi = parsed[0].as_ref().unwrap();
+        assert!(
+            mi.mount_point.to_string_lossy().contains(':'),
+            "colon must be preserved in mount_point, got {:?}",
+            mi.mount_point
+        );
+    }
+
+    #[test]
+    fn test_parse_malformed_fixture() {
+        let parsed = parse_fixture(MALFORMED);
+        assert!(
+            parsed.iter().all(|m| m.is_none()),
+            "every malformed line should return None"
+        );
     }
 }

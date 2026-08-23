@@ -39,14 +39,10 @@ if [[ "$(wc -l <<<"${library_test}")" -ne 1 ]]; then
 fi
 
 # Match the phases in the Makefile: cgroup-manipulating suites are isolated
-# and sequential, followed by all remaining unit tests.
+# and sequential, followed by integration test binaries from manifest.
 run_test "${library_test}" systemd::dbus::client::tests
 run_test "${library_test}" manager::fs::tests
 run_test "${library_test}" manager::systemd::tests
-run_test "${library_test}" \
-    --skip systemd::dbus::client::tests \
-    --skip manager::fs::tests \
-    --skip manager::systemd::tests
 
 while IFS= read -r test_binary; do
     [[ "${test_binary}" == "${library_test}" ]] && continue

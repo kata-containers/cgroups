@@ -72,6 +72,9 @@ pub(crate) fn memory_swap_to_cgroup_v2(memswap_limit: i64, mem_limit: i64) -> Re
 mod tests {
     use crate::manager::conv::*;
 
+    const SHARES_WEIGHT_CSV: &str =
+        include_str!("../../tests/fixtures/conversions/shares-weight.csv");
+
     #[test]
     fn test_cpu_shares_to_cgroup_v2() {
         assert_eq!(cpu_shares_to_cgroup_v2(0), 0);
@@ -87,6 +90,25 @@ mod tests {
             CPU_WEIGHT_V2_MAX - 1
         );
         assert_eq!(cpu_shares_to_cgroup_v2(u64::MAX), CPU_WEIGHT_V2_MAX);
+    }
+
+    #[test]
+    fn test_cpu_shares_to_cgroup_v2_table() {
+        for line in SHARES_WEIGHT_CSV.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split(',');
+            let shares: u64 = parts.next().unwrap().parse().unwrap();
+            let expected: u64 = parts.next().unwrap().parse().unwrap();
+            assert_eq!(
+                cpu_shares_to_cgroup_v2(shares),
+                expected,
+                "shares={}",
+                shares
+            );
+        }
     }
 
     #[test]
