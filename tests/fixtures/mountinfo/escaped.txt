@@ -1,8 +1,0 @@
-# Fixture: mountinfo fields containing escaped characters. mountinfo escapes
-# spaces (\040), tabs (\011) and newlines (\012) in the root and mount point.
-# Known defect (current behavior): parse_mountinfo_for_line does NOT unescape,
-# so the mount points below parse as the literal strings "my\040dir" and
-# "tab\011dir" instead of "my dir" and "tab<TAB>dir". The expected result is
-# recorded as-is so Phase 1 can fix the parser and update this test.
-60 26 0:26 / /sys/fs/cgroup/my\040dir rw,nosuid,nodev,noexec,relatime shared:20 - cgroup cgroup rw,memory
-61 26 0:27 / /sys/fs/cgroup/tab\011dir rw,nosuid,nodev,noexec,relatime shared:21 - cgroup cgroup rw,memory

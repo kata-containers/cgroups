@@ -1,9 +1,0 @@
-# Fixture: malformed /proc/<pid>/cgroup records.
-# Known behavior: parse_cgroup_subsystems splits on ':' and requires exactly
-# three parts; every line below is silently dropped.
-# Line 1: cgroup v2 line with an extra colon in the path (four parts).
-0::/user.slice/session:c1.scope
-# Line 2: v1 line missing the path field (two parts).
-8:memory
-# Line 3: v1 line with an empty controller list and colon in path (five parts).
-0::/a:b:c

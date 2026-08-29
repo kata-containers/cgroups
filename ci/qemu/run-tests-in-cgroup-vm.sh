@@ -16,18 +16,30 @@ readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly GUEST_TEST_RUNNER="${SCRIPT_DIR}/run-test-binaries-in-guest.sh"
 
 case "${HIERARCHY}" in
-    v1)
+    legacy-v1)
         hierarchy_check='
-            grep -qw systemd.unified_cgroup_hierarchy=0 /proc/cmdline &&
+            grep -Fqw systemd.unified_cgroup_hierarchy=0 /proc/cmdline &&
+            grep -Fqw systemd.legacy_systemd_cgroup_controller=1 /proc/cmdline &&
             test "$(stat -fc %T /sys/fs/cgroup)" != cgroup2fs &&
-            test -n "$(findmnt -rn -t cgroup -o TARGET)"
+            test -n "$(findmnt -rn -t cgroup -o TARGET)" &&
+            test -z "$(findmnt -rn -t cgroup2 -o TARGET)"
         '
         ;;
-    v2)
+    hybrid-v1)
         hierarchy_check='
-            grep -qw systemd.unified_cgroup_hierarchy=1 /proc/cmdline &&
+            grep -Fqw systemd.unified_cgroup_hierarchy=0 /proc/cmdline &&
+            grep -Fqw systemd.legacy_systemd_cgroup_controller=0 /proc/cmdline &&
+            test "$(stat -fc %T /sys/fs/cgroup)" != cgroup2fs &&
+            test -n "$(findmnt -rn -t cgroup -o TARGET)" &&
+            test -n "$(findmnt -rn -t cgroup2 -o TARGET)"
+        '
+        ;;
+    unified-v2)
+        hierarchy_check='
+            grep -Fqw systemd.unified_cgroup_hierarchy=1 /proc/cmdline &&
             test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs &&
-            test -f /sys/fs/cgroup/cgroup.controllers
+            test -f /sys/fs/cgroup/cgroup.controllers &&
+            test -z "$(findmnt -rn -t cgroup -o TARGET)"
         '
         ;;
     *)
@@ -83,4 +95,4 @@ tar -czf - \
         'tar -xzf - -C /tmp/cgroups-rs-tests'
 
 ssh "${ssh_options[@]}" "${SSH_USER}@127.0.0.1" \
-    'bash /tmp/cgroups-rs-tests/run-test-binaries-in-guest.sh /tmp/cgroups-rs-tests'
+    "bash /tmp/cgroups-rs-tests/run-test-binaries-in-guest.sh /tmp/cgroups-rs-tests ${HIERARCHY}"

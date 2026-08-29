@@ -916,6 +916,9 @@ fn parse_cgroup_mountinfo(paths: &HashMap<String, String>) -> Result<HashMap<Str
 
     for line in data.lines() {
         let parts: Vec<&str> = line.splitn(2, " - ").collect();
+        if parts.len() != 2 {
+            continue;
+        }
         let part1: Vec<&str> = parts[0].split(' ').collect();
         let part2: Vec<&str> = parts[1].split(' ').collect();
 
@@ -1215,6 +1218,51 @@ mod tests {
         child.wait().unwrap();
     }
 
+    /// Kernel-drift canary: read the real `/proc/self/mountinfo` and confirm
+    /// the parser still copes with whatever the running kernel produces.
+    ///
+    /// Fixtures lock our changes to the parser; this locks the parser against
+    /// the live host. The realistic risk is not format breakage (`/proc` is
+    /// userspace ABI) but additions: new controllers, new fields. If a kernel
+    /// change makes `parse_mountinfo_for_line` reject every cgroup line, this
+    /// fails at the source instead of surfacing indirectly as "couldn't find
+    /// the memory controller" in a downstream integration test.
+    ///
+    /// `mountinfo_self()` keeps only v1 `cgroup` mounts (it drops `cgroup2`),
+    /// so it is legitimately empty on a unified v2 host; on v1/hybrid it must
+    /// be non-empty. The line-parser canary covers both versions.
+    #[test]
+    fn test_live_mountinfo_canary() {
+        let data = fs::read_to_string("/proc/self/mountinfo")
+            .expect("canary: /proc/self/mountinfo must be readable");
+
+        let cgroup_mounts: Vec<_> = data
+            .lines()
+            .filter_map(hierarchies::parse_mountinfo_for_line)
+            .filter(|mi| mi.fs_type.0 == "cgroup" || mi.fs_type.0 == "cgroup2")
+            .collect();
+        assert!(
+            !cgroup_mounts.is_empty(),
+            "canary: no cgroup/cgroup2 mounts parsed from live /proc/self/mountinfo; \
+             parser may have regressed on a kernel format change"
+        );
+
+        let mounts = hierarchies::mountinfo_self();
+        if hierarchies::is_cgroup2_unified_mode() {
+            assert!(
+                mounts.is_empty(),
+                "canary: mountinfo_self() drops cgroup2 on a unified v2 host, got {:?}",
+                mounts
+            );
+        } else {
+            assert!(
+                !mounts.is_empty(),
+                "canary: mountinfo_self() found no v1 cgroup mounts on a v1/hybrid host; \
+                 parser may have regressed"
+            );
+        }
+    }
+
     #[test]
     fn test_parse_value_from_tuples() {
         let tuple_str = "system 100000\nuser 200000";
@@ -1426,94 +1474,95 @@ mod tests {
     }
 }
 
-/// Host-independent parser tests driven by fixture data.
-/// This module is separate from `tests` so that the privileged-suite skip
-/// filter (`manager::fs::tests`) does not exclude these non-privileged tests.
+/// Host-independent parser tests for `parse_cgroup_subsystems_str`.
+///
+/// Separate from `tests` so the privileged-suite skip filter
+/// (`manager::fs::tests`) does not exclude these non-privileged tests. Input
+/// and expectation are kept adjacent in inline tables so failures pin an exact
+/// (controller, path) pair instead of a vague "is_empty" / "contains_key".
 #[cfg(test)]
 mod parse_tests {
     use super::parse_cgroup_subsystems_str;
+    use std::collections::HashMap;
 
-    const V2_SINGLE: &str = include_str!("../../tests/fixtures/membership/v2-single.txt");
-    const V1_MULTI: &str = include_str!("../../tests/fixtures/membership/v1-multi.txt");
-    const COLON_PATH: &str = include_str!("../../tests/fixtures/membership/colon-path.txt");
-    const NESTED: &str = include_str!("../../tests/fixtures/membership/nested.txt");
-    const MALFORMED: &str = include_str!("../../tests/fixtures/membership/malformed.txt");
-
-    fn parse_fixture(input: &str) -> std::collections::HashMap<String, String> {
-        let lines: Vec<&str> = input.lines().filter(|l| !l.starts_with('#')).collect();
-        parse_cgroup_subsystems_str(&lines.join("\n"))
+    /// One `/proc/<pid>/cgroup` input plus the expected controller->path map.
+    /// `expect` is the full HashMap the parser must produce; an empty map means
+    /// every line was rejected.
+    struct Case {
+        name: &'static str,
+        input: &'static str,
+        expect: &'static [(&'static str, &'static str)],
     }
 
-    #[test]
-    fn test_parse_v2_single_fixture() {
-        let paths = parse_fixture(V2_SINGLE);
-        assert!(paths.contains_key(""), "v2 must map empty controller key");
-        assert_eq!(
-            paths.get(""),
-            Some(
-                &"/user.slice/user-1001.slice/user@1001.service/app.slice/snap.opencode.scope"
-                    .to_string()
-            )
-        );
-    }
+    const CASES: &[Case] = &[
+        Case {
+            name: "v2-single: empty controller key maps to path",
+            input: "0::/user.slice/user-1001.slice/user@1001.service/app.slice/snap.opencode.scope",
+            expect: &[("", "/user.slice/user-1001.slice/user@1001.service/app.slice/snap.opencode.scope")],
+        },
+        Case {
+            name: "v1-multi: multi-line file merges into one map",
+            input: "\
+13:pids:/user.slice/user-1000.slice/session-4.scope
+12:cpu,cpuacct:/user.slice
+11:perf_event:/
+10:misc:/
+9:rdma:/
+8:freezer:/
+7:memory:/user.slice/user-1000.slice/session-4.scope
+6:devices:/user.slice
+5:blkio:/user.slice
+4:cpuset:/
+3:net_cls,net_prio:/
+2:hugetlb:/
+1:name=systemd:/user.slice/user-1000.slice/session-4.scope
+0::/user.slice/user-1000.slice/session-4.scope",
+            expect: &[
+                ("pids", "/user.slice/user-1000.slice/session-4.scope"),
+                ("cpu", "/user.slice"),
+                ("cpuacct", "/user.slice"),
+                ("perf_event", "/"),
+                ("misc", "/"),
+                ("rdma", "/"),
+                ("freezer", "/"),
+                ("memory", "/user.slice/user-1000.slice/session-4.scope"),
+                ("devices", "/user.slice"),
+                ("blkio", "/user.slice"),
+                ("cpuset", "/"),
+                ("net_cls", "/"),
+                ("net_prio", "/"),
+                ("hugetlb", "/"),
+                ("name=systemd", "/user.slice/user-1000.slice/session-4.scope"),
+                ("", "/user.slice/user-1000.slice/session-4.scope"),
+            ],
+        },
+        Case {
+            name: "colon-path: known defect, colon in path breaks 3-part split (all dropped)",
+            input: "0::/user.slice/session:c1.scope\n6:memory:/docker/ab:cd/init\n0::/a:b:c",
+            expect: &[],
+        },
+        Case {
+            name: "nested: last v2 line wins for the empty key",
+            input: "0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/init\n0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec",
+            expect: &[("", "/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec")],
+        },
+        Case {
+            name: "malformed: missing path field is dropped",
+            input: "8:memory",
+            expect: &[],
+        },
+    ];
 
     #[test]
-    fn test_parse_v1_multi_fixture() {
-        let paths = parse_fixture(V1_MULTI);
-        // v1 controllers present
-        assert_eq!(
-            paths.get("memory"),
-            Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
-        );
-        assert_eq!(paths.get("cpu"), Some(&"/user.slice".to_string()));
-        assert_eq!(paths.get("cpuacct"), Some(&"/user.slice".to_string()));
-        assert_eq!(
-            paths.get("pids"),
-            Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
-        );
-        // name=systemd is a single key
-        assert_eq!(
-            paths.get("name=systemd"),
-            Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
-        );
-        // v2 line maps empty key
-        assert_eq!(
-            paths.get(""),
-            Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
-        );
-        // controllers at root
-        assert_eq!(paths.get("cpuset"), Some(&"/".to_string()));
-    }
-
-    #[test]
-    fn test_parse_colon_path_fixture() {
-        // Known defect: both lines are silently dropped because the colon in
-        // the path breaks the 3-part split (v2: 4 parts, v1: 4 parts).
-        let paths = parse_fixture(COLON_PATH);
-        assert!(
-            paths.is_empty(),
-            "current behavior: all colon-path lines dropped, got {:?}",
-            paths
-        );
-    }
-
-    #[test]
-    fn test_parse_nested_fixture() {
-        let paths = parse_fixture(NESTED);
-        assert_eq!(
-            paths.get(""),
-            Some(&"/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_malformed_fixture() {
-        // Known behavior: every malformed line is silently dropped.
-        let paths = parse_fixture(MALFORMED);
-        assert!(
-            paths.is_empty(),
-            "current behavior: all malformed lines dropped, got {:?}",
-            paths
-        );
+    fn test_parse_cgroup_subsystems_str_table() {
+        for case in CASES {
+            let got = parse_cgroup_subsystems_str(case.input);
+            let want: HashMap<String, String> = case
+                .expect
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            assert_eq!(got, want, "{}", case.name);
+        }
     }
 }

@@ -1,7 +1,0 @@
-# Fixture: cgroup path containing a colon (legal in cgroup names).
-# Known defect (current behavior): parse_cgroup_subsystems splits on ':' and
-# requires exactly three parts, so BOTH lines below are silently dropped:
-# the v2 line splits into 4 parts, and the v1 line also splits into 4 parts
-# because the colon in the path breaks the split.
-0::/user.slice/session:c1.scope
-6:memory:/docker/ab:cd/init
