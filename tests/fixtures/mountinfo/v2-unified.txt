@@ -1,6 +1,0 @@
-# Fixture: cgroup v2 unified host (systemd.unified_cgroup_hierarchy=1).
-# Captured from a real host's /proc/self/mountinfo.
-# Note: fs::hierarchies::mountinfo_file filters fs_type == "cgroup", so the
-# cgroup2 line below is dropped there; that is the current behavior to lock
-# in. parse_mountinfo_for_line itself parses it with super_opts [rw].
-47 44 0:30 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:7 - cgroup2 cgroup2 rw

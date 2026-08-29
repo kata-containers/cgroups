@@ -28,23 +28,25 @@ jobs:
       - run: rustup component add clippy
       - run: make clippy
   test-unit:
-    name: Host-Independent Unit Tests
+    name: Unprivileged Library Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - run: rustup install ${{ env.RUST_VERSION }} && rustup default ${{ env.RUST_VERSION }}
       - run: make test-unit
   test:
-    name: Unit and Integration Test / ${{ matrix.hierarchy }}
+    name: Controlled Guest Tests / ${{ matrix.hierarchy }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          - hierarchy: v1
+          - hierarchy: legacy-v1
             unexpected_skip: Skipping test in cgroups v2 mode
-          - hierarchy: v2
+          - hierarchy: hybrid-v1
+            unexpected_skip: Skipping test in cgroups v2 mode
+          - hierarchy: unified-v2
             unexpected_skip: Skipping test in cgroups v1 mode
     env:
       CGROUP_HIERARCHY: ${{ matrix.hierarchy }}

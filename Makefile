@@ -20,42 +20,38 @@ build: debug
 #
 PRIVILEGED_FILTERS = --skip systemd::dbus::client::tests --skip manager::fs::tests --skip manager::systemd::tests
 
-# sudo's `env_reset` strips the user environment before running the command,
-# which breaks the rustup cargo shim (it needs HOME to locate the toolchain
-# and PATH to find cargo itself). `sudo env VAR=value ...` sets the variables
-# explicitly, which is honored regardless of env_reset / env_keep, unlike `-E`
-# (which some sudoers configurations reject with "preserving the entire
-# environment is not supported").
+# Privileged targets build unprivileged with `cargo test --no-run` and then
+# sudo only the finished test executable, via ci/run-root-tests.sh. Running
+# cargo itself as root leaves root-owned files in target/ and the cargo
+# registry, which breaks the next unprivileged build (the .cargo-build-lock
+# becomes unwritable). `sudo env PATH=... HOME=...` re-sets the two variables
+# sudo's env_reset strips, so the test binary still finds helper commands.
 # Run `make test` (not `sudo make test`): this file self-elevates for the
 # privileged targets, and sudo would strip the user PATH before make sees it.
-SUDO_CARGO = sudo env "PATH=$(PATH)" "HOME=$(HOME)" cargo
-
 test: test-systemd test-fs-manager test-systemd-manager test-integration test-unit
 
-.PHONY: test-systemd
-# Privileged: talks to the real system D-Bus. Needs root and serialization
-# (`--test-threads=1`).
-test-systemd:
-	$(SUDO_CARGO) test --package cgroups-rs --lib \
-	    -- systemd::dbus::client::tests \
-	    --color always --nocapture \
-		--test-threads=1
+# The three privileged lib suites run the same library test binary, differing
+# only in the filter argument. Shared cargo flags are factored out here; each
+# suite sets its own PRIV_FILTER via a target-specific variable. The binary is
+# compiled once by test-lib-compile and reused by all three, so `cargo test
+# --no-run` is invoked once, not three times.
+PRIV_LIB_CARGO = --all-features --package cgroups-rs --lib
+PRIV_TEST_ARGS = --color always --nocapture --test-threads=1
 
-.PHONY: test-fs-manager
-# Privileged: writes live cgroup files. Needs root and serialization
-# (`--test-threads=1`).
-test-fs-manager:
-	$(SUDO_CARGO) test --all-features --package cgroups-rs \
-		--lib -- manager::fs::tests \
-		--color always --nocapture --test-threads=1
+.PHONY: test-lib-compile
+test-lib-compile:
+	ci/run-root-tests.sh compile lib $(PRIV_LIB_CARGO)
 
-.PHONY: test-systemd-manager
-# Privileged: drives real systemd transient units. Needs root and
+# Privileged lib suites: talk to the real system D-Bus, write live cgroup
+# files, and drive real systemd transient units respectively. Need root and
 # serialization (`--test-threads=1`).
-test-systemd-manager:
-	$(SUDO_CARGO) test --all-features --package cgroups-rs \
-	  --lib -- manager::systemd::tests \
-	  --color always --nocapture --test-threads=1
+test-systemd:         PRIV_FILTER = systemd::dbus::client::tests
+test-fs-manager:      PRIV_FILTER = manager::fs::tests
+test-systemd-manager: PRIV_FILTER = manager::systemd::tests
+
+.PHONY: test-systemd test-fs-manager test-systemd-manager
+test-systemd test-fs-manager test-systemd-manager: test-lib-compile
+	ci/run-root-tests.sh run lib -- $(PRIV_FILTER) $(PRIV_TEST_ARGS)
 
 .PHONY: test-unit
 test-unit:
@@ -63,10 +59,15 @@ test-unit:
 
 # Integration tests in tests/ manipulate live cgroups and need root.
 # They run inside the QEMU guests in CI; this target is for local runs.
+# Only the tests/ binaries run -- the library unit-test binary that --tests
+# also builds is filtered out by target kind in ci/run-root-tests.sh.
+.PHONY: test-tests-compile
+test-tests-compile:
+	ci/run-root-tests.sh compile tests --all-features --tests
+
 .PHONY: test-integration
-test-integration:
-	$(SUDO_CARGO) test --all-features --tests -- --color always --nocapture \
-		--test-threads=1
+test-integration: test-tests-compile
+	ci/run-root-tests.sh run tests -- --color always --nocapture --test-threads=1
 
 .PHONY: check
 check: fmt clippy

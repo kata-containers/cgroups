@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Start an Ubuntu 22.04 VM in an explicit cgroup mode. TCG is the default
+# Start an Ubuntu 22.04 VM in an explicit cgroup layout. TCG is the default
 # accelerator because standard GitHub-hosted runners do not promise
 # general-purpose nested virtualization. Set QEMU_ACCEL=kvm explicitly when
 # running on a host where /dev/kvm is part of the supported environment.
@@ -18,20 +18,33 @@ readonly QEMU_ACCEL="${QEMU_ACCEL:-tcg}"
 readonly SSH_USER="runner"
 
 case "${HIERARCHY}" in
-    v1)
-        unified="0"
+    legacy-v1)
+        kernel_args="systemd.unified_cgroup_hierarchy=0 systemd.legacy_systemd_cgroup_controller=1"
         hierarchy_check='
-            grep -qw systemd.unified_cgroup_hierarchy=0 /proc/cmdline &&
+            grep -Fqw systemd.unified_cgroup_hierarchy=0 /proc/cmdline &&
+            grep -Fqw systemd.legacy_systemd_cgroup_controller=1 /proc/cmdline &&
             test "$(stat -fc %T /sys/fs/cgroup)" != cgroup2fs &&
-            test -n "$(findmnt -rn -t cgroup -o TARGET)"
+            test -n "$(findmnt -rn -t cgroup -o TARGET)" &&
+            test -z "$(findmnt -rn -t cgroup2 -o TARGET)"
         '
         ;;
-    v2)
-        unified="1"
+    hybrid-v1)
+        kernel_args="systemd.unified_cgroup_hierarchy=0 systemd.legacy_systemd_cgroup_controller=0"
         hierarchy_check='
-            grep -qw systemd.unified_cgroup_hierarchy=1 /proc/cmdline &&
+            grep -Fqw systemd.unified_cgroup_hierarchy=0 /proc/cmdline &&
+            grep -Fqw systemd.legacy_systemd_cgroup_controller=0 /proc/cmdline &&
+            test "$(stat -fc %T /sys/fs/cgroup)" != cgroup2fs &&
+            test -n "$(findmnt -rn -t cgroup -o TARGET)" &&
+            test -n "$(findmnt -rn -t cgroup2 -o TARGET)"
+        '
+        ;;
+    unified-v2)
+        kernel_args="systemd.unified_cgroup_hierarchy=1"
+        hierarchy_check='
+            grep -Fqw systemd.unified_cgroup_hierarchy=1 /proc/cmdline &&
             test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs &&
-            test -f /sys/fs/cgroup/cgroup.controllers
+            test -f /sys/fs/cgroup/cgroup.controllers &&
+            test -z "$(findmnt -rn -t cgroup -o TARGET)"
         '
         ;;
     *)
@@ -101,7 +114,7 @@ ssh_key="$(<"${PUBLIC_KEY}")"
     echo "    owner: root:root"
     echo "    permissions: '0644'"
     echo "    content: |"
-    echo "      GRUB_CMDLINE_LINUX=\"\${GRUB_CMDLINE_LINUX} systemd.unified_cgroup_hierarchy=${unified}\""
+    echo "      GRUB_CMDLINE_LINUX=\"\${GRUB_CMDLINE_LINUX} ${kernel_args}\""
     echo "runcmd:"
     echo "  - [update-grub]"
     echo "  - [touch, /var/lib/cgroup-hierarchy-configured]"

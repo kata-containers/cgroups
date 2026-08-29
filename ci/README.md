@@ -9,20 +9,27 @@ See `qemu/README.md` for the mechanics of the QEMU guest scripts.
 
 ## Test classification
 
-A test is **privileged** when it writes cgroup state or talks to the
-systemd D-Bus bus:
+The host suite is **unprivileged**. It contains the current library tests for
+parsers and resource conversions, plus tests which use ordinary temporary
+files and Linux inotify. In particular, the `fs::events` tests exercise the
+real filesystem and inotify APIs, but do not read or modify the host's cgroup
+hierarchy.
+
+The controlled-guest suite contains tests which depend on a specific live
+cgroup layout or need elevated privileges:
 
 - creates or removes real cgroup directories
 - writes controller files (`cgroup.procs`, `memory.max`, ...)
 - attaches processes or threads
 - connects to a real systemd instance
-- watches real `memory.events` through inotify
+- reads live discovery inputs as a kernel-drift canary
+- runs inside a delegated subtree or a private cgroup namespace
 
-Everything else is **host-independent**: parser tests over fixture data,
-path validation, resource conversions, contract tests against recording I/O
-implementations, error propagation, and capability tests. Host-dependent
-reads such as `mountinfo_self()` belong to the fixture-based parser tests,
-not to the privileged suite.
+Parser tables protect expected behavior against source changes. The live
+`mountinfo_self()` canary runs in the controlled guests so it sees each
+intentional hierarchy layout. Validated-path, recording-I/O contract,
+capability, and systematic error-propagation tests are planned for later
+refactoring phases; they are not part of the current host suite.
 
 The privileged suites are listed once in the Makefile as
 `PRIVILEGED_FILTERS` and are skipped by every plain `cargo test` run.
@@ -33,42 +40,56 @@ filter keeps working.
 
 | Tier | What runs | Where | Privileges |
 | --- | --- | --- | --- |
-| Host-independent | `make test-unit` (lib tests with `$(PRIVILEGED_FILTERS)` skips) | GitHub runner directly | none |
-| Privileged | three serialized lib suites plus the `tests/` integration binaries | QEMU guest | guest root |
+| Unprivileged library | `make test-unit` (lib tests with `$(PRIVILEGED_FILTERS)` skips) | GitHub runner directly | none |
+| Controlled guest | three serialized lib suites, the `tests/` integration binaries, and live environment scenarios | QEMU guest | guest root, plus a delegated non-root service |
 
 The QEMU job in `.github/workflows/bvt.yaml` therefore runs only the
-privileged suites, while the separate `test-unit` job covers the
-host-independent tests on the GitHub runner. `make test` still runs the
+controlled-guest suites, while the separate `test-unit` job covers the
+unprivileged library tests on the GitHub runner. `make test` still runs the
 three serialized suites and the integration tests on a local machine under
-`sudo` for convenience, but CI never relies on host privileges.
+`sudo` for convenience, but CI never relies on privileges or cgroup layout
+provided by the GitHub runner host.
 
 ## Backend and version matrix
 
-Every guest runs both the cgroupfs and the systemd backend, so each guest
-covers two of the four required combinations:
+Every guest runs both the cgroupfs and the systemd backend:
 
 | Guest mode | cgroupfs backend | systemd backend |
 | --- | --- | --- |
-| Ubuntu 22.04, cgroup v1 | cgroupfs-v1 | systemd-on-v1 |
-| Ubuntu 22.04, cgroup v2 | cgroupfs-v2 | systemd-on-v2 |
+| Ubuntu 22.04, pure legacy v1 | cgroupfs-v1 | systemd-on-v1 |
+| Ubuntu 22.04, hybrid v1/v2 | cgroupfs-v1 | systemd-on-v1 |
+| Ubuntu 22.04, unified v2 | cgroupfs-v2 | systemd-on-v2 |
 
-Guests are selected with an explicit `systemd.unified_cgroup_hierarchy=<0|1>`
-kernel argument. Each guest must pass an exact hierarchy check before tests
-start, because several existing tests return early when their expected
-cgroup version is unavailable. A test that silently skips on the wrong
-hierarchy is detected by the `UNEXPECTED_SKIP` check in `bvt.yaml` and fails
-the job.
+Guests are selected with explicit systemd cgroup-hierarchy kernel arguments.
+Each guest must pass an exact mount-layout check before tests start, because
+several existing tests return early when their expected cgroup version is
+unavailable. A test that silently skips on the wrong hierarchy is detected by
+the `UNEXPECTED_SKIP` check in `bvt.yaml` and fails the job.
 
 ## Guest environments and hierarchy checks
 
 | Guest mode | Kernel argument | Hierarchy check |
 | --- | --- | --- |
-| cgroup v1 | `systemd.unified_cgroup_hierarchy=0` | `grep -qw systemd.unified_cgroup_hierarchy=0 /proc/cmdline`, `/sys/fs/cgroup` is not `cgroup2fs`, at least one `cgroup` mount |
-| cgroup v2 | `systemd.unified_cgroup_hierarchy=1` | `grep -qw systemd.unified_cgroup_hierarchy=1 /proc/cmdline`, `/sys/fs/cgroup` is `cgroup2fs`, `/sys/fs/cgroup/cgroup.controllers` exists |
+| pure legacy v1 | `systemd.unified_cgroup_hierarchy=0 systemd.legacy_systemd_cgroup_controller=1` | `/sys/fs/cgroup` is not `cgroup2fs`, at least one `cgroup` mount, no `cgroup2` mount |
+| hybrid v1/v2 | `systemd.unified_cgroup_hierarchy=0 systemd.legacy_systemd_cgroup_controller=0` | `/sys/fs/cgroup` is not `cgroup2fs`, both `cgroup` and `cgroup2` mounts exist |
+| unified v2 | `systemd.unified_cgroup_hierarchy=1` | `/sys/fs/cgroup` is `cgroup2fs`, `cgroup.controllers` exists, no v1 `cgroup` mount |
 
-Note: on Ubuntu 22.04 the `unified_cgroup_hierarchy=0` guest runs a hybrid
-layout (cgroup v1 hierarchies plus a unified hierarchy), so the v1 guest
-also covers hybrid-mode behavior. It is not a pure v1-only environment.
+## Delegation and namespace scenarios
+
+The unified-v2 guest also runs two ignored integration tests explicitly in
+controlled environments:
+
+- A transient system service with `Delegate=yes` and `User=runner` executes
+  the cgroupfs test as a non-root user. The test first moves itself into a
+  manager leaf, then creates a workload cgroup inside the delegated subtree,
+  attaches its own child process, and removes the workload cgroup.
+- A delegated root service unshares its cgroup and mount namespaces, replaces
+  `/sys/fs/cgroup` with a namespace-rooted cgroup2 mount, and executes the
+  nested-layout test. The test verifies the namespace-relative membership and
+  mount root before creating and using a child cgroup.
+
+These scenarios use kernel and systemd primitives directly; they do not infer
+or depend on a container runtime.
 
 ## Image pinning
 
@@ -81,7 +102,7 @@ The guest base image is pinned by URL, filename, and SHA-256 checksum in
 | Script | Responsibility |
 | --- | --- |
 | `qemu/build-static-test-binaries.sh` | Cross-compile portable test harnesses |
-| `qemu/boot-cgroup-test-vm.sh` | Configure, boot, and verify a v1 or v2 QEMU guest |
+| `qemu/boot-cgroup-test-vm.sh` | Configure, boot, and verify the requested QEMU cgroup layout |
 | `qemu/run-tests-in-cgroup-vm.sh` | Transfer tests and coordinate execution over SSH |
-| `qemu/run-test-binaries-in-guest.sh` | Execute the privileged test harnesses inside the guest |
+| `qemu/run-test-binaries-in-guest.sh` | Execute controlled-guest test harnesses and environment scenarios |
 | `qemu/stop-cgroup-test-vm.sh` | Stop the disposable QEMU guest |

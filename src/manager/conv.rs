@@ -72,9 +72,6 @@ pub(crate) fn memory_swap_to_cgroup_v2(memswap_limit: i64, mem_limit: i64) -> Re
 mod tests {
     use crate::manager::conv::*;
 
-    const SHARES_WEIGHT_CSV: &str =
-        include_str!("../../tests/fixtures/conversions/shares-weight.csv");
-
     #[test]
     fn test_cpu_shares_to_cgroup_v2() {
         assert_eq!(cpu_shares_to_cgroup_v2(0), 0);
@@ -94,14 +91,22 @@ mod tests {
 
     #[test]
     fn test_cpu_shares_to_cgroup_v2_table() {
-        for line in SHARES_WEIGHT_CSV.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let mut parts = line.split(',');
-            let shares: u64 = parts.next().unwrap().parse().unwrap();
-            let expected: u64 = parts.next().unwrap().parse().unwrap();
+        // v1 CPU shares -> v2 CPU weight. Known defects recorded as visible
+        // expected values: shares 1 and 2 both map to 1; values at or above
+        // CPU_SHARES_V1_MAX saturate at CPU_WEIGHT_V2_MAX.
+        const CASES: &[(u64, u64)] = &[
+            (0, 0),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (128, 5),
+            (1024, 39),
+            (4096, 157),
+            (65536, 2500),
+            (262144, 10000),
+            (300000, 10000),
+        ];
+        for &(shares, expected) in CASES {
             assert_eq!(
                 cpu_shares_to_cgroup_v2(shares),
                 expected,
