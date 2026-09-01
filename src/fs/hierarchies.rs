@@ -495,9 +495,15 @@ mod tests {
             line: "121 1731 0:42 / /shm rw,nosuid,nodev,noexec,relatime shared:68 master:66 - tmpfs.123 shm rw,size=65536k",
             expect: Some(("/", "/shm", "tmpfs", Some("123"), &["rw", "size=65536k"])),
         },
-        // --- escaped: known defect, parser does NOT unescape \040/\011.
-        //     Expected values record the current (buggy) literal behavior so
-        //     Phase 1 can fix the parser and flip these to the decoded form.
+        // TODO: deferred parser defect. In /proc/self/mountinfo (see proc(5)),
+        // characters such as space, tab, newline, and backslash in mount paths
+        // are octal-escaped (e.g. \040 for space, \011 for tab).
+        // `parse_mountinfo_for_line` currently does NOT unescape \040/\011.
+        // Expected values record the current literal behavior so this characterization
+        // test pins existing behavior; a follow-up fix should implement octal
+        // unescaping and flip the expectations to the decoded form:
+        //   - "/sys/fs/cgroup/my\\040dir" -> "/sys/fs/cgroup/my dir"
+        //   - "/sys/fs/cgroup/tab\\011dir" -> "/sys/fs/cgroup/tab\tdir"
         Case {
             name: "escaped: \\040 kept literal (known defect)",
             line: "60 26 0:26 / /sys/fs/cgroup/my\\040dir rw,nosuid,nodev,noexec,relatime shared:20 - cgroup cgroup rw,memory",

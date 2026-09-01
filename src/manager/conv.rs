@@ -91,9 +91,11 @@ mod tests {
 
     #[test]
     fn test_cpu_shares_to_cgroup_v2_table() {
-        // v1 CPU shares -> v2 CPU weight. Known defects recorded as visible
-        // expected values: shares 1 and 2 both map to 1; values at or above
-        // CPU_SHARES_V1_MAX saturate at CPU_WEIGHT_V2_MAX.
+        // v1 CPU shares -> v2 CPU weight conversion table covering boundary
+        // and saturation cases: the documented v1 range begins at 2, where 2 -> 1
+        // is the expected lower-bound mapping (with values <= 2 mapping to 1,
+        // and 0 mapping to 0), and values at or above CPU_SHARES_V1_MAX
+        // deliberately saturate at CPU_WEIGHT_V2_MAX.
         const CASES: &[(u64, u64)] = &[
             (0, 0),
             (1, 1),

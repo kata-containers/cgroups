@@ -907,41 +907,38 @@ fn parse_cgroup_subsystems() -> Result<HashMap<String, String>> {
     Ok(parse_cgroup_subsystems_str(&data))
 }
 
-/// Parse cgroup mount information from `/proc/self/mountinfo`.
-fn parse_cgroup_mountinfo(paths: &HashMap<String, String>) -> Result<HashMap<String, String>> {
+/// Parse cgroup mount information from a `/proc/self/mountinfo` content string.
+fn parse_cgroup_mountinfo_str(
+    data: &str,
+    paths: &HashMap<String, String>,
+) -> HashMap<String, String> {
     let mut mounts = HashMap::new();
-    let data = fs::read_to_string(MOUNTINFO_PATH)
-        .map_err(|err| FsError::with_cause(FsErrorKind::FsError, err))
-        .map_err(Error::Cgroupfs)?;
 
     for line in data.lines() {
-        let parts: Vec<&str> = line.splitn(2, " - ").collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let part1: Vec<&str> = parts[0].split(' ').collect();
-        let part2: Vec<&str> = parts[1].split(' ').collect();
-
-        if part2.len() != 3 {
-            continue;
-        }
-
-        let fs_type = part2[0];
-        if fs_type != "cgroup" && fs_type != "cgroup2" {
-            continue;
-        }
-
-        let super_opts: Vec<&str> = part2[2].split(',').collect();
-        for opt in super_opts.iter() {
-            // If opt matchs the one of cgroup subsystems
-            if paths.contains_key(*opt) {
-                let mountpoint = part1[4];
-                mounts.insert(opt.to_string(), mountpoint.to_string());
+        if let Some(mi) = hierarchies::parse_mountinfo_for_line(line) {
+            if mi.fs_type.0 != "cgroup" && mi.fs_type.0 != "cgroup2" {
+                continue;
+            }
+            for opt in &mi.super_opts {
+                if paths.contains_key(opt) {
+                    if let Some(mountpoint) = mi.mount_point.to_str() {
+                        mounts.insert(opt.clone(), mountpoint.to_string());
+                    }
+                }
             }
         }
     }
 
-    Ok(mounts)
+    mounts
+}
+
+/// Parse cgroup mount information from `/proc/self/mountinfo`.
+fn parse_cgroup_mountinfo(paths: &HashMap<String, String>) -> Result<HashMap<String, String>> {
+    let data = fs::read_to_string(MOUNTINFO_PATH)
+        .map_err(|err| FsError::with_cause(FsErrorKind::FsError, err))
+        .map_err(Error::Cgroupfs)?;
+
+    Ok(parse_cgroup_mountinfo_str(&data, paths))
 }
 
 pub(crate) fn join_path(base: &str, path: &str) -> String {
@@ -1218,51 +1215,6 @@ mod tests {
         child.wait().unwrap();
     }
 
-    /// Kernel-drift canary: read the real `/proc/self/mountinfo` and confirm
-    /// the parser still copes with whatever the running kernel produces.
-    ///
-    /// Fixtures lock our changes to the parser; this locks the parser against
-    /// the live host. The realistic risk is not format breakage (`/proc` is
-    /// userspace ABI) but additions: new controllers, new fields. If a kernel
-    /// change makes `parse_mountinfo_for_line` reject every cgroup line, this
-    /// fails at the source instead of surfacing indirectly as "couldn't find
-    /// the memory controller" in a downstream integration test.
-    ///
-    /// `mountinfo_self()` keeps only v1 `cgroup` mounts (it drops `cgroup2`),
-    /// so it is legitimately empty on a unified v2 host; on v1/hybrid it must
-    /// be non-empty. The line-parser canary covers both versions.
-    #[test]
-    fn test_live_mountinfo_canary() {
-        let data = fs::read_to_string("/proc/self/mountinfo")
-            .expect("canary: /proc/self/mountinfo must be readable");
-
-        let cgroup_mounts: Vec<_> = data
-            .lines()
-            .filter_map(hierarchies::parse_mountinfo_for_line)
-            .filter(|mi| mi.fs_type.0 == "cgroup" || mi.fs_type.0 == "cgroup2")
-            .collect();
-        assert!(
-            !cgroup_mounts.is_empty(),
-            "canary: no cgroup/cgroup2 mounts parsed from live /proc/self/mountinfo; \
-             parser may have regressed on a kernel format change"
-        );
-
-        let mounts = hierarchies::mountinfo_self();
-        if hierarchies::is_cgroup2_unified_mode() {
-            assert!(
-                mounts.is_empty(),
-                "canary: mountinfo_self() drops cgroup2 on a unified v2 host, got {:?}",
-                mounts
-            );
-        } else {
-            assert!(
-                !mounts.is_empty(),
-                "canary: mountinfo_self() found no v1 cgroup mounts on a v1/hybrid host; \
-                 parser may have regressed"
-            );
-        }
-    }
-
     #[test]
     fn test_parse_value_from_tuples() {
         let tuple_str = "system 100000\nuser 200000";
@@ -1482,8 +1434,10 @@ mod tests {
 /// (controller, path) pair instead of a vague "is_empty" / "contains_key".
 #[cfg(test)]
 mod parse_tests {
-    use super::parse_cgroup_subsystems_str;
+    use super::{parse_cgroup_mountinfo_str, parse_cgroup_subsystems_str};
+    use crate::fs::hierarchies;
     use std::collections::HashMap;
+    use std::fs;
 
     /// One `/proc/<pid>/cgroup` input plus the expected controller->path map.
     /// `expect` is the full HashMap the parser must produce; an empty map means
@@ -1536,6 +1490,15 @@ mod parse_tests {
                 ("", "/user.slice/user-1000.slice/session-4.scope"),
             ],
         },
+        // TODO: deferred parser defect. `parse_cgroup_subsystems_str` splits on ':'
+        // without limiting to 3 parts (e.g. `splitn(3, ':')`), so any path
+        // containing a colon results in `parts.len() != 3` and is dropped.
+        // This characterization test records the current behavior (`expect: &[]`);
+        // the follow-up fix will update the parser and flip the expectation to
+        // retain the parsed entries:
+        //   ("", "/user.slice/session:c1.scope")
+        //   ("memory", "/docker/ab:cd/init")
+        //   ("", "/a:b:c")
         Case {
             name: "colon-path: known defect, colon in path breaks 3-part split (all dropped)",
             input: "0::/user.slice/session:c1.scope\n6:memory:/docker/ab:cd/init\n0::/a:b:c",
@@ -1563,6 +1526,85 @@ mod parse_tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             assert_eq!(got, want, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_parse_cgroup_mountinfo_str() {
+        let mut paths = HashMap::new();
+        paths.insert("memory".to_string(), "/user.slice".to_string());
+        paths.insert("cpu".to_string(), "/user.slice".to_string());
+        paths.insert("cpuacct".to_string(), "/user.slice".to_string());
+        paths.insert("pids".to_string(), "/user.slice".to_string());
+
+        let input = "\
+31 22 0:26 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:15 - cgroup cgroup rw,memory
+32 22 0:27 / /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:16 - cgroup cgroup rw,cpu,cpuacct
+121 1731 0:42 / /shm rw,nosuid,nodev,noexec,relatime shared:68 master:66 - tmpfs shm rw,size=65536k
+1 2 3 - cgroup cgroup rw,memory
+31 22 0:26 / /sys/fs/cgroup/devices rw,nosuid - cgroup
+no separator here
+";
+
+        let mounts = parse_cgroup_mountinfo_str(input, &paths);
+        assert_eq!(
+            mounts.get("memory"),
+            Some(&"/sys/fs/cgroup/memory".to_string())
+        );
+        assert_eq!(
+            mounts.get("cpu"),
+            Some(&"/sys/fs/cgroup/cpu,cpuacct".to_string())
+        );
+        assert_eq!(
+            mounts.get("cpuacct"),
+            Some(&"/sys/fs/cgroup/cpu,cpuacct".to_string())
+        );
+        assert_eq!(mounts.get("pids"), None);
+        assert_eq!(mounts.len(), 3);
+    }
+
+    /// Kernel-drift canary: read the real `/proc/self/mountinfo` and confirm
+    /// the parser still copes with whatever the running kernel produces.
+    ///
+    /// Fixtures lock our changes to the parser; this locks the parser against
+    /// the live host. The realistic risk is not format breakage (`/proc` is
+    /// userspace ABI) but additions: new controllers, new fields. If a kernel
+    /// change makes `parse_mountinfo_for_line` reject every cgroup line, this
+    /// fails at the source instead of surfacing indirectly as "couldn't find
+    /// the memory controller" in a downstream integration test.
+    ///
+    /// `mountinfo_self()` keeps only v1 `cgroup` mounts (it drops `cgroup2`),
+    /// so it is legitimately empty on a unified v2 host; on v1/hybrid it must
+    /// be non-empty. The line-parser canary covers both versions.
+    #[test]
+    fn test_live_mountinfo_canary() {
+        let data = fs::read_to_string("/proc/self/mountinfo")
+            .expect("canary: /proc/self/mountinfo must be readable");
+
+        let cgroup_mounts: Vec<_> = data
+            .lines()
+            .filter_map(hierarchies::parse_mountinfo_for_line)
+            .filter(|mi| mi.fs_type.0 == "cgroup" || mi.fs_type.0 == "cgroup2")
+            .collect();
+        assert!(
+            !cgroup_mounts.is_empty(),
+            "canary: no cgroup/cgroup2 mounts parsed from live /proc/self/mountinfo; \
+             parser may have regressed on a kernel format change"
+        );
+
+        let mounts = hierarchies::mountinfo_self();
+        if hierarchies::is_cgroup2_unified_mode() {
+            assert!(
+                mounts.is_empty(),
+                "canary: mountinfo_self() drops cgroup2 on a unified v2 host, got {:?}",
+                mounts
+            );
+        } else {
+            assert!(
+                !mounts.is_empty(),
+                "canary: mountinfo_self() found no v1 cgroup mounts on a v1/hybrid host; \
+                 parser may have regressed"
+            );
         }
     }
 }
