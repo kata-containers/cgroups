@@ -4,16 +4,16 @@
 #
 # `sudo cargo test` runs cargo itself as root, which leaves root-owned files in
 # target/ and ~/.cargo/registry; the next unprivileged build then fails with
-# "Permission denied" on target/debug/.cargo-build-lock. Building with --no-run
-# as the invoking user and sudo'ing only the finished test executable avoids
-# that, mirroring ci/qemu/build-static-test-binaries.sh +
+# "Permission denied" on target/debug/.cargo-build-lock. Building with a
+# recording target runner as the invoking user and sudo'ing only the finished
+# test executable avoids that, mirroring ci/qemu/build-static-test-binaries.sh +
 # ci/qemu/run-test-binaries-in-guest.sh.
 #
 # The compile and run phases are split so that several suites sharing one test
 # binary (the three privileged lib suites) compile once and reuse it, instead
-# of each invoking `cargo test --no-run` again. Each kind writes its own
-# manifest (target/.test-binaries-<kind>), so concurrent lib/tests runs (e.g.
-# `make -j`) never clobber each other.
+# of each asking Cargo to prepare the same test target again. Each kind writes
+# its own manifest (target/.test-binaries-<kind>), so concurrent lib/tests runs
+# (e.g. `make -j`) never clobber each other.
 #
 # Usage:
 #   ci/run-root-tests.sh compile <lib|tests> <cargo-test-args>...
@@ -31,30 +31,39 @@ cmd="${1:?usage: run-root-tests.sh <compile <lib|tests>|run <lib|tests>> ...}"
 shift
 
 case "${cmd}" in
+# Internal Cargo runner entry point: record the executable without running it.
+capture)
+    manifest="${CGROUPS_ROOT_TEST_MANIFEST:?capture: manifest is not set}"
+    executable="${1:?capture: want test executable}"
+    printf '%s\n' "${executable}" >>"${manifest}"
+    ;;
+
 compile)
     mode="${1:?compile: want <lib|tests>}"
     shift
     case "${mode}" in
-        lib)   kind="lib" ;;
-        tests) kind="test" ;;
+        lib)   ;;
+        tests) ;;
         *) echo "run-root-tests.sh: unknown mode '${mode}' (want 'lib' or 'tests')" >&2; exit 2 ;;
     esac
 
-    messages="$(mktemp)"
     tmp_manifest="$(mktemp)"
-    trap 'rm -f "${messages}" "${tmp_manifest}"' EXIT
+    trap 'rm -f "${tmp_manifest}"' EXIT
 
-    cargo test --no-run --message-format=json "$@" >"${messages}"
+    host="$(cargo -vV | sed -n 's/^host: //p')"
+    if [[ -z "${host}" ]]; then
+        echo "run-root-tests.sh: cargo did not report its host target" >&2
+        exit 1
+    fi
+    runner_env="CARGO_TARGET_${host^^}_RUNNER"
+    runner_env="${runner_env//-/_}"
 
-    jq -r --arg kind "${kind}" '
-        select(
-            .reason == "compiler-artifact"
-            and .profile.test == true
-            and .executable != null
-            and (.target.kind | index($kind))
-        )
-        | .executable
-    ' "${messages}" | sort -u >"${tmp_manifest}"
+    (
+        export "${runner_env}=ci/run-root-tests.sh capture"
+        export CGROUPS_ROOT_TEST_MANIFEST="${tmp_manifest}"
+        cargo test "$@"
+    )
+    sort -u -o "${tmp_manifest}" "${tmp_manifest}"
 
     if [[ ! -s "${tmp_manifest}" ]]; then
         echo "run-root-tests.sh: no test executables matched mode '${mode}'" >&2
@@ -90,7 +99,8 @@ run)
     while IFS= read -r exe; do
         echo
         echo "Running (root): ${exe##*/}" "$@"
-        sudo env "PATH=${PATH}" "HOME=${HOME}" "${exe}" "$@"
+        # Do not let the test consume executable paths from the loop manifest.
+        sudo env "PATH=${PATH}" "${exe}" "$@" </dev/null
     done <"${manifest}"
     ;;
 
