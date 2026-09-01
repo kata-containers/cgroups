@@ -20,21 +20,22 @@ build: debug
 #
 PRIVILEGED_FILTERS = --skip systemd::dbus::client::tests --skip manager::fs::tests --skip manager::systemd::tests
 
-# Privileged targets build unprivileged with `cargo test --no-run` and then
+# Privileged targets build unprivileged with a recording Cargo runner and then
 # sudo only the finished test executable, via ci/run-root-tests.sh. Running
-# cargo itself as root leaves root-owned files in target/ and the cargo
-# registry, which breaks the next unprivileged build (the .cargo-build-lock
-# becomes unwritable). `sudo env PATH=... HOME=...` re-sets the two variables
-# sudo's env_reset strips, so the test binary still finds helper commands.
+# cargo itself as root leaves root-owned files in target/ and the cargo registry,
+# which breaks the next unprivileged build (the .cargo-build-lock becomes
+# unwritable). `sudo env PATH=...` restores the user PATH that sudo's env_reset
+# strips, so the test binary still finds helper commands.
 # Run `make test` (not `sudo make test`): this file self-elevates for the
 # privileged targets, and sudo would strip the user PATH before make sees it.
+.NOTPARALLEL: test
 test: test-systemd test-fs-manager test-systemd-manager test-integration test-unit
 
 # The three privileged lib suites run the same library test binary, differing
 # only in the filter argument. Shared cargo flags are factored out here; each
 # suite sets its own PRIV_FILTER via a target-specific variable. The binary is
-# compiled once by test-lib-compile and reused by all three, so `cargo test
-# --no-run` is invoked once, not three times.
+# prepared once by test-lib-compile and reused by all three, so Cargo is invoked
+# once to prepare it, not three times.
 PRIV_LIB_CARGO = --all-features --package cgroups-rs --lib
 PRIV_TEST_ARGS = --color always --nocapture --test-threads=1
 
@@ -53,17 +54,21 @@ test-systemd-manager: PRIV_FILTER = manager::systemd::tests
 test-systemd test-fs-manager test-systemd-manager: test-lib-compile
 	ci/run-root-tests.sh run lib -- $(PRIV_FILTER) $(PRIV_TEST_ARGS)
 
+.PHONY: test-doc
+test-doc:
+	cargo test --all-features --doc
+
 .PHONY: test-unit
-test-unit:
+test-unit: test-doc
 	cargo test --all-features --lib -- $(PRIVILEGED_FILTERS)
 
 # Integration tests in tests/ manipulate live cgroups and need root.
 # They run inside the QEMU guests in CI; this target is for local runs.
-# Only the tests/ binaries run -- the library unit-test binary that --tests
-# also builds is filtered out by target kind in ci/run-root-tests.sh.
+# Select every integration-test target without also selecting the library
+# unit-test target; quote the glob so Cargo, rather than the shell, expands it.
 .PHONY: test-tests-compile
 test-tests-compile:
-	ci/run-root-tests.sh compile tests --all-features --tests
+	ci/run-root-tests.sh compile tests --all-features --test '*'
 
 .PHONY: test-integration
 test-integration: test-tests-compile
