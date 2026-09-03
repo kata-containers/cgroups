@@ -919,11 +919,13 @@ fn parse_cgroup_mountinfo_str(
             if mi.fs_type.0 != "cgroup" && mi.fs_type.0 != "cgroup2" {
                 continue;
             }
+            let mountpoint = mi
+                .mount_point
+                .to_str()
+                .expect("mount_point parsed from valid UTF-8 &str must be valid UTF-8");
             for opt in &mi.super_opts {
                 if paths.contains_key(opt) {
-                    if let Some(mountpoint) = mi.mount_point.to_str() {
-                        mounts.insert(opt.clone(), mountpoint.to_string());
-                    }
+                    mounts.insert(opt.clone(), mountpoint.to_string());
                 }
             }
         }
@@ -1561,6 +1563,42 @@ no separator here
         );
         assert_eq!(mounts.get("pids"), None);
         assert_eq!(mounts.len(), 3);
+    }
+
+    /// TODO: deferred `mounts()` contract defect.
+    ///
+    /// In cgroup v2 (unified hierarchy), `/proc/self/cgroup` contains `0::<path>`,
+    /// which `parse_cgroup_subsystems_str` parses into the key `""`.
+    /// However, a normal cgroup2 mount in `/proc/self/mountinfo`:
+    ///   `47 44 0:30 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:7 - cgroup2 cgroup2 rw,nsdelegate`
+    /// has super-options such as `rw,nsdelegate` (never `""`).
+    ///
+    /// Because `parse_cgroup_mountinfo_str` matches mount super-options against
+    /// keys in `paths` (`paths.contains_key(opt)`), it never matches the `""`
+    /// key. Therefore, `parse_cgroup_mountinfo_str` currently returns no mount
+    /// mapping for unified v2, even though `cgroup2` is explicitly recognized in
+    /// `mi.fs_type.0`.
+    ///
+    /// This characterization test pins the current counterintuitive behavior so
+    /// any future fix to the `mounts()` contract for cgroup v2 can flip this
+    /// expectation intentionally.
+    #[test]
+    fn test_parse_cgroup_mountinfo_str_cgroup2() {
+        let cgroup_data = "0::/user.slice/user-1000.slice/session-4.scope";
+        let paths = parse_cgroup_subsystems_str(cgroup_data);
+        assert_eq!(
+            paths.get(""),
+            Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
+        );
+
+        let mountinfo_data = "\
+47 44 0:30 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:7 - cgroup2 cgroup2 rw,nsdelegate
+";
+        let mounts = parse_cgroup_mountinfo_str(mountinfo_data, &paths);
+
+        // Counterintuitive branch: returns no mount mapping for unified v2.
+        assert_eq!(mounts.get(""), None);
+        assert!(mounts.is_empty());
     }
 
     /// Kernel-drift canary: read the real `/proc/self/mountinfo` and confirm
