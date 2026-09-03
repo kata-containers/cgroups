@@ -81,9 +81,9 @@ pub struct Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if let Some(cause) = &self.cause {
-            write!(f, "{} caused by: {:?}", &self.kind, cause)
+            write!(f, "{} caused by: {:?}", self.kind, cause)
         } else {
-            write!(f, "{}", &self.kind)
+            write!(f, "{}", self.kind)
         }
     }
 }

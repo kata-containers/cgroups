@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::discovery::mountinfo::{parse_mountinfo_line, MountRecord};
 use crate::fs::blkio::BlkIoController;
 use crate::fs::cpu::CpuController;
 use crate::fs::cpuacct::CpuAcctController;
@@ -42,36 +43,26 @@ pub struct Mountinfo {
     pub super_opts: Vec<String>,
 }
 
+impl From<MountRecord> for Mountinfo {
+    fn from(record: MountRecord) -> Self {
+        Mountinfo {
+            mount_root: record.mount_root,
+            mount_point: record.mount_point,
+            fs_type: record.fs_type,
+            super_opts: record.super_opts,
+        }
+    }
+}
+
+/// Parse a single mountinfo line, forwarding to the discovery parser.
+///
+/// Transitional shim over [`parse_mountinfo_line`]: the legacy
+/// `Option`-based contract cannot carry parse errors, so a malformed
+/// line degrades to `None` exactly as the previous hand-written parser
+/// skipped it. Escape decoding and strict field validation come from
+/// the discovery implementation.
 pub(crate) fn parse_mountinfo_for_line(line: &str) -> Option<Mountinfo> {
-    let s_values: Vec<_> = line.split(" - ").collect();
-    if s_values.len() != 2 {
-        return None;
-    }
-
-    let s0_values: Vec<_> = s_values[0].trim().split(' ').collect();
-    let s1_values: Vec<_> = s_values[1].trim().split(' ').collect();
-    if s0_values.len() < 6 || s1_values.len() < 3 {
-        return None;
-    }
-    let mount_point = PathBuf::from(s0_values[4]);
-    let mount_root = PathBuf::from(s0_values[3]);
-    let fs_type_values: Vec<_> = s1_values[0].trim().split('.').collect();
-    let fs_type = match fs_type_values.len() {
-        1 => (fs_type_values[0].to_string(), None),
-        2 => (
-            fs_type_values[0].to_string(),
-            Some(fs_type_values[1].to_string()),
-        ),
-        _ => return None,
-    };
-
-    let super_opts: Vec<String> = s1_values[2].trim().split(',').map(String::from).collect();
-    Some(Mountinfo {
-        mount_root,
-        mount_point,
-        fs_type,
-        super_opts,
-    })
+    parse_mountinfo_line(line, 1).ok().map(Mountinfo::from)
 }
 
 fn parse_v1_mountinfo_line(line: &str) -> Option<Mountinfo> {
@@ -485,25 +476,35 @@ mod tests {
         // unescaping and flip the expectations to the decoded form:
         //   - "/sys/fs/cgroup/my\\040dir" -> "/sys/fs/cgroup/my dir"
         //   - "/sys/fs/cgroup/tab\\011dir" -> "/sys/fs/cgroup/tab\tdir"
+
+        // --- fs_type with several dots: split on the first dot only, the
+        //     rest is the subtype (the old parser rejected these lines).
         Case {
-            name: "escaped: \\040 kept literal (known defect)",
-            line: "60 26 0:26 / /sys/fs/cgroup/my\\040dir rw,nosuid,nodev,noexec,relatime shared:20 - cgroup cgroup rw,memory",
-            expect: Some(("/", "/sys/fs/cgroup/my\\040dir", "cgroup", None, &["rw", "memory"])),
+            name: "fs_type: multiple dots split on the first only",
+            line: "82 26 0:26 / /sys/fs/cgroup rw,nosuid shared:23 - cgroup.v1.extra cgroup rw,memory",
+            expect: Some(("/", "/sys/fs/cgroup", "cgroup", Some("v1.extra"), &["rw", "memory"])),
         },
         Case {
-            name: "escaped: \\011 kept literal (known defect)",
+            name: "fs_type: cgroup2 subtype containing dots",
+            line: "86 26 0:27 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:26 - cgroup2.v2.extra cgroup2 rw",
+            expect: Some(("/", "/sys/fs/cgroup", "cgroup2", Some("v2.extra"), &["rw"])),
+        },
+        // --- escaped: \040/\011 are decoded per proc(5) now that the
+        //     line parser forwards to `discovery::mountinfo`.
+        Case {
+            name: "escaped: \\040 decodes to a space",
+            line: "60 26 0:26 / /sys/fs/cgroup/my\\040dir rw,nosuid,nodev,noexec,relatime shared:20 - cgroup cgroup rw,memory",
+            expect: Some(("/", "/sys/fs/cgroup/my dir", "cgroup", None, &["rw", "memory"])),
+        },
+        Case {
+            name: "escaped: \\011 decodes to a tab",
             line: "61 26 0:27 / /sys/fs/cgroup/tab\\011dir rw,nosuid,nodev,noexec,relatime shared:21 - cgroup cgroup rw,memory",
-            expect: Some(("/", "/sys/fs/cgroup/tab\\011dir", "cgroup", None, &["rw", "memory"])),
+            expect: Some(("/", "/sys/fs/cgroup/tab\tdir", "cgroup", None, &["rw", "memory"])),
         },
         // --- malformed: every line below is rejected by the line parser.
         Case {
             name: "malformed: no separator",
             line: "no separator here",
-            expect: None,
-        },
-        Case {
-            name: "malformed: fs_type with two dots",
-            line: "82 26 0:26 / /sys/fs/cgroup rw,nosuid shared:23 - cgroup.v1.extra cgroup rw,memory",
             expect: None,
         },
         Case {
@@ -519,11 +520,6 @@ mod tests {
         Case {
             name: "malformed: cgroup2 with fewer than 3 fields after separator",
             line: "85 26 0:27 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:25 - cgroup2 cgroup2",
-            expect: None,
-        },
-        Case {
-            name: "malformed: cgroup2 fs_type with two dots",
-            line: "86 26 0:27 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:26 - cgroup2.v2.extra cgroup2 rw",
             expect: None,
         },
     ];

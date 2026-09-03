@@ -24,6 +24,17 @@ pub enum CoreError {
         /// The operation that attempted to use the path.
         operation: &'static str,
     },
+
+    /// A kernel text format failed to parse.
+    #[error("Parse {kind:?} in {line}: {reason}")]
+    ParseError {
+        /// Which input format was being parsed.
+        kind: ParseSource,
+        /// 1-based line number in the input text.
+        line: usize,
+        /// Human-readable description of the malformation.
+        reason: String,
+    },
 }
 
 /// Reason a cgroup path was rejected by [`CoreError::InvalidPath`].
@@ -61,4 +72,20 @@ pub enum PathReason {
     /// required.
     #[error("input contains a `/` separator but a single component is required")]
     Separator,
+}
+
+/// Identifies which input format a [`CoreError::ParseError`] came from.
+///
+/// Pure parsers are handed text and know only its format; the concrete
+/// file the text was read from is supplied by the discovery layer when
+/// it performs the I/O.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ParseSource {
+    /// Mount-table records in `/proc/self/mountinfo` format.
+    #[error("mountinfo mount table")]
+    Mountinfo,
+    /// Membership records in `/proc/<pid>/cgroup` format.
+    #[error("cgroup membership records")]
+    Membership,
 }
