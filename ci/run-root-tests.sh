@@ -25,7 +25,11 @@
 
 set -euo pipefail
 
-target_dir="${CARGO_TARGET_DIR:-target}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+script_path="${script_dir}/$(basename -- "${BASH_SOURCE[0]}")"
+repo_root="$(cd -- "${script_dir}/.." && pwd)"
+
+target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
 
 cmd="${1:?usage: run-root-tests.sh <compile <lib|tests>|run <lib|tests>> ...}"
 shift
@@ -42,8 +46,26 @@ compile)
     mode="${1:?compile: want <lib|tests>}"
     shift
     case "${mode}" in
-        lib)   ;;
-        tests) ;;
+        lib)
+            has_target_flag=false
+            for arg in "$@"; do
+                [[ "${arg}" == "--lib" ]] && has_target_flag=true
+            done
+            target_flags=()
+            if ! ${has_target_flag}; then
+                target_flags+=(--lib)
+            fi
+            ;;
+        tests)
+            has_target_flag=false
+            for arg in "$@"; do
+                [[ "${arg}" == "--test" || "${arg}" == --test=* || "${arg}" == "--tests" ]] && has_target_flag=true
+            done
+            target_flags=()
+            if ! ${has_target_flag}; then
+                target_flags+=(--test '*')
+            fi
+            ;;
         *) echo "run-root-tests.sh: unknown mode '${mode}' (want 'lib' or 'tests')" >&2; exit 2 ;;
     esac
 
@@ -55,13 +77,25 @@ compile)
         echo "run-root-tests.sh: cargo did not report its host target" >&2
         exit 1
     fi
-    runner_env="CARGO_TARGET_${host^^}_RUNNER"
-    runner_env="${runner_env//-/_}"
+    # A runner passed as a bare string (CARGO_TARGET_<triple>_RUNNER or a
+    # config string) is split on whitespace without honoring quotes or
+    # backslashes, so a checkout path containing spaces can never survive it
+    # intact. Instead pass an array-valued target.<triple>.runner through
+    # --config, which Cargo keeps verbatim element by element; the path only
+    # needs TOML basic-string escaping (tab/CR/LF included, since raw control
+    # characters are invalid in TOML strings). --config overrides both the
+    # runner environment variable and any config-file runner.
+    runner_path=${script_path//\\/\\\\}
+    runner_path=${runner_path//\"/\\\"}
+    runner_path=${runner_path//$'\t'/\\t}
+    runner_path=${runner_path//$'\r'/\\r}
+    runner_path=${runner_path//$'\n'/\\n}
 
     (
-        export "${runner_env}=ci/run-root-tests.sh capture"
         export CGROUPS_ROOT_TEST_MANIFEST="${tmp_manifest}"
-        cargo test "$@"
+        cargo test \
+            --config "target.${host}.runner=[\"${runner_path}\", 'capture']" \
+            "${target_flags[@]}" "$@"
     )
     sort -u -o "${tmp_manifest}" "${tmp_manifest}"
 
@@ -69,6 +103,38 @@ compile)
         echo "run-root-tests.sh: no test executables matched mode '${mode}'" >&2
         exit 1
     fi
+
+    # Validate the captured executables against the repo's target layout so a
+    # runner misconfiguration or mode/target-flag mismatch fails here, instead
+    # of `run` sudo-executing wrong binaries later. No external JSON tooling:
+    # the lib target is named after the package (hyphens become underscores),
+    # and auto-discovered integration tests are named after tests/<name>.rs or
+    # tests/<name>/main.rs.
+    lib_target="$(sed -n '/^\[package\]/,/^\[/ s/^name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${repo_root}/Cargo.toml" | head -n 1)"
+    lib_target="${lib_target//-/_}"
+    if [[ -z "${lib_target}" ]]; then
+        echo "run-root-tests.sh: cannot determine the package name from ${repo_root}/Cargo.toml" >&2
+        exit 1
+    fi
+
+    while IFS= read -r exe; do
+        base="${exe##*/}"
+        target="${base%-*}"
+        case "${mode}" in
+            lib)
+                if [[ "${target}" != "${lib_target}" ]]; then
+                    echo "run-root-tests.sh: captured executable '${base}' does not match mode 'lib'" >&2
+                    exit 1
+                fi
+                ;;
+            tests)
+                if [[ ! -f "${repo_root}/tests/${target}.rs" && ! -f "${repo_root}/tests/${target}/main.rs" ]]; then
+                    echo "run-root-tests.sh: captured executable '${base}' does not match mode 'tests'" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+    done <"${tmp_manifest}"
 
     manifest="${target_dir}/.test-binaries-${mode}"
     mkdir -p "$(dirname "${manifest}")"

@@ -26,8 +26,9 @@ run_test() {
     echo "Running ${test_binary} $*"
 
     local result=0
+    # Do not let the test consume executable paths from the loop manifest.
     sudo -E "./${test_binary}" "$@" --color always --nocapture \
-        --test-threads=1 || result=$?
+        --test-threads=1 </dev/null || result=$?
     if ((result != 0)); then
         cleanup_failed_test
         exit "${result}"
@@ -46,6 +47,7 @@ library_test="${library_tests[0]}"
 run_test "${library_test}" systemd::dbus::client::tests
 run_test "${library_test}" manager::fs::tests
 run_test "${library_test}" manager::systemd::tests
+run_test "${library_test}" manager::fs::parse_tests::test_live_mountinfo_canary --exact
 
 while IFS= read -r test_binary; do
     [[ "${test_binary}" == "${library_test}" ]] && continue
