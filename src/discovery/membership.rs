@@ -116,6 +116,29 @@ pub(crate) fn parse_membership_line(line: &str, line_no: usize) -> CoreResult<Me
         }
         controllers
     };
+    // Semantic validation:
+    // - hierarchy ID 0 denotes unified hierarchy and must have an empty controller list
+    // - hierarchy ID > 0 denotes v1 hierarchy and must have a non-empty controller list
+    if hierarchy_id == 0 {
+        if !controllers.is_empty() {
+            return Err(membership_error(
+                line_no,
+                format!(
+                    "unified hierarchy (id 0) must have an empty controller list, got `{}`",
+                    fields[1]
+                ),
+            ));
+        }
+    } else if controllers.is_empty() {
+        return Err(membership_error(
+            line_no,
+            format!(
+                "v1 hierarchy (id {}) must have a non-empty controller list",
+                hierarchy_id
+            ),
+        ));
+    }
+
     let path = fields[2];
     if path.is_empty() {
         return Err(membership_error(
@@ -129,6 +152,13 @@ pub(crate) fn parse_membership_line(line: &str, line_no: usize) -> CoreResult<Me
             format!("cgroup path `{}` does not start with `/`", path),
         ));
     }
+
+    // Safety and structural validation using CgroupPath::from_proc_membership:
+    // rejects "..", ".", empty components ("//"), and NUL bytes.
+    crate::model::CgroupPath::from_proc_membership(path).map_err(|err| {
+        membership_error(line_no, format!("invalid cgroup path `{}`: {}", path, err))
+    })?;
+
     Ok(MembershipRecord {
         hierarchy_id,
         controllers,
@@ -234,6 +264,31 @@ mod tests {
         Case {
             name: "blank line",
             line: "",
+            expect: None,
+        },
+        Case {
+            name: "v2 with non-empty controller list",
+            line: "0:cpu:/x",
+            expect: None,
+        },
+        Case {
+            name: "v1 with empty controller list",
+            line: "5::/x",
+            expect: None,
+        },
+        Case {
+            name: "path contains parent traversal component",
+            line: "0::/a/../b",
+            expect: None,
+        },
+        Case {
+            name: "path contains current component",
+            line: "0::/./a",
+            expect: None,
+        },
+        Case {
+            name: "path contains empty component",
+            line: "0::/a//b",
             expect: None,
         },
     ];

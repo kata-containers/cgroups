@@ -712,12 +712,7 @@ fn cgroup_path_from_legacy_relative(path: &str) -> crate::error::CoreResult<Cgro
 /// Empty input represents the hierarchy root (`CgroupPath::root()`), while
 /// non-empty input is validated as a relative cgroup path.
 pub(crate) fn parse_cgroup_path<P: AsRef<Path>>(path: P) -> crate::error::CoreResult<CgroupPath> {
-    let p = path.as_ref();
-    if p.as_os_str().is_empty() {
-        CgroupPath::root()
-    } else {
-        CgroupPath::new(p)
-    }
+    CgroupPath::new(path)
 }
 
 pub const UNIFIED_MOUNTPOINT: &str = "/sys/fs/cgroup";

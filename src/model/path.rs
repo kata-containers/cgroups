@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 
 use crate::error::PathReason::{
-    Absolute, CurrentComponent, EmptyComponent, EmptyPath, NulByte, ParentComponent, Relative,
-    Root, Separator,
+    Absolute, CurrentComponent, EmptyComponent, NulByte, ParentComponent, Relative, Root, Separator,
 };
 use crate::error::{CoreError, PathReason};
 use std::ffi::{OsStr, OsString};
@@ -57,20 +56,16 @@ impl CgroupPath {
     /// Validate and construct a `CgroupPath` from any path-like input.
     ///
     /// Returns [`crate::error::CoreError::InvalidPath`] if the input is
-    /// empty, absolute, contains `..` or `.`, has empty components,
-    /// contains a NUL byte, or is the filesystem root. The hierarchy root
-    /// cannot be parsed; construct it explicitly with [`CgroupPath::root`].
+    /// absolute, contains `..` or `.`, has empty components,
+    /// contains a NUL byte, or is the filesystem root (`/`). An empty input
+    /// represents the hierarchy root and succeeds identically to [`CgroupPath::root`].
     pub fn new<P: AsRef<Path>>(p: P) -> CoreResult<Self> {
         let path = p.as_ref();
         let input = path.to_path_buf();
         let operation = "CgroupPath::new";
         let bytes = path.as_os_str().as_bytes();
         if bytes.is_empty() {
-            return Err(CoreError::InvalidPath {
-                input,
-                reason: EmptyPath,
-                operation,
-            });
+            return Self::root();
         }
         if bytes == b"/" {
             return Err(CoreError::InvalidPath {
@@ -375,6 +370,11 @@ mod tests {
         }
         const CASES: &[Case] = &[
             Case {
+                name: "empty string is root",
+                input: "",
+                expect: &[],
+            },
+            Case {
                 name: "single component",
                 input: "a",
                 expect: &["a"],
@@ -440,13 +440,9 @@ mod tests {
         assert!(root.is_root());
         assert!(!path("a").is_root());
         assert_ne!(root, path("a"));
-        assert!(matches!(
-            CgroupPath::new(""),
-            Err(CoreError::InvalidPath {
-                reason: PathReason::EmptyPath,
-                ..
-            })
-        ));
+        let empty = CgroupPath::new("").unwrap();
+        assert!(empty.is_root());
+        assert_eq!(root, empty);
     }
 
     #[test]
@@ -622,6 +618,7 @@ mod tests {
     #[test]
     fn test_new_as_path_roundtrip() {
         const INPUTS: &[&str] = &[
+            "",
             "a",
             "docker/kata/a1",
             "a:b/c",

@@ -213,6 +213,10 @@ impl Hierarchy for V2 {
     }
 
     fn subsystems(&self) -> Vec<Subsystem> {
+        if self.topology.version != CgroupVersion::V2 {
+            return vec![];
+        }
+
         let mut subs = vec![];
 
         let mut controller_list: Vec<&str> = self
@@ -369,8 +373,24 @@ impl V2 {
     }
 
     /// Build a cgroup v2 hierarchy from explicit host paths.
+    ///
+    /// Returns a [`CoreError::Discovery`] error if the host does not operate
+    /// in unified cgroup v2 mode.
     pub fn with_host_paths(host_paths: &HostPaths) -> CoreResult<V2> {
         let topology = discover(host_paths)?;
+        if topology.version != CgroupVersion::V2 {
+            return Err(crate::error::CoreError::Discovery {
+                step: "construct v2 hierarchy",
+                path: host_paths.procfs.join("self/mountinfo"),
+                cause: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "host operates in {:?} mode, not unified cgroup v2",
+                        topology.version
+                    ),
+                ),
+            });
+        }
         Ok(V2 { topology })
     }
 
@@ -378,13 +398,18 @@ impl V2 {
     ///
     /// # Panics
     ///
-    /// Panics if host discovery fails; use [`V2::with_topology`] with a
-    /// handled [`discover`](crate::discovery::discover) result to
-    /// control the failure instead.
+    /// Panics if host discovery fails or if the host does not operate in
+    /// unified cgroup v2 mode. Use [`auto`] or [`V2::with_host_paths`] to
+    /// handle non-v2 hosts cleanly.
     pub fn new() -> V2 {
-        V2 {
-            topology: discover(&HostPaths::default()).expect("cgroup discovery failed"),
+        let topology = discover(&HostPaths::default()).expect("cgroup discovery failed");
+        if topology.version != CgroupVersion::V2 {
+            panic!(
+                "cannot construct V2 hierarchy: host operates in {:?} mode, not unified cgroup v2",
+                topology.version
+            );
         }
+        V2 { topology }
     }
 }
 
@@ -838,5 +863,43 @@ mod tests {
         assert!(!is_cgroup2_unified_mode_with_paths(&v1_paths).unwrap());
         assert!(is_cgroup2_unified_mode_with_paths(&v2_paths).unwrap());
         assert!(!is_cgroup2_unified_mode_with_paths(&v1_paths).unwrap());
+    }
+
+    #[test]
+    fn test_v2_with_host_paths_rejects_v1_topology() {
+        struct TempGuard(PathBuf);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("v2-hier-reject-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _guard = TempGuard(temp_dir.clone());
+
+        let proc_self = temp_dir.join("proc/self");
+        std::fs::create_dir_all(&proc_self).unwrap();
+        std::fs::write(
+            proc_self.join("mountinfo"),
+            "43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory",
+        )
+        .unwrap();
+        std::fs::write(proc_self.join("cgroup"), "1:memory:/").unwrap();
+
+        let v1_paths = HostPaths {
+            procfs: temp_dir.join("proc"),
+            cgroupfs_override: Some(temp_dir.join("cgroupfs")),
+            hugepages: temp_dir.join("hugepages"),
+        };
+
+        // V2::with_host_paths must fail on v1 host
+        assert!(V2::with_host_paths(&v1_paths).is_err());
+
+        // And V2::subsystems must return empty if constructed with v1 topology
+        let topology = discover(&v1_paths).unwrap();
+        let v2 = V2::with_topology(topology);
+        assert!(v2.subsystems().is_empty());
     }
 }
