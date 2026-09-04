@@ -533,7 +533,47 @@ pub trait Hierarchy: std::fmt::Debug + Send + Sync {
     /// Return a handle to the parent control group in the hierarchy.
     fn parent_control_group(&self, path: &str) -> Cgroup;
 
+    /// Return a handle to the parent control group in the hierarchy from a `&Path`.
+    ///
+    /// Fails closed if the path represents the root control group, if the parent
+    /// contains invalid components, or if a legacy custom hierarchy receives
+    /// an invalid UTF-8 path.
+    fn parent_control_group_path(&self, path: &Path) -> Result<Cgroup> {
+        if path.as_os_str().is_empty() {
+            return Err(Error::with_cause(
+                ErrorKind::InvalidPath,
+                crate::error::CoreError::InvalidPath {
+                    input: path.to_path_buf(),
+                    reason: crate::error::PathReason::Root,
+                    operation: "parent_control_group_path",
+                },
+            ));
+        }
+        let str_slice = path.to_str().ok_or_else(|| {
+            Error::with_cause(
+                ErrorKind::InvalidPath,
+                crate::error::CoreError::InvalidPath {
+                    input: path.to_path_buf(),
+                    reason: crate::error::PathReason::ParentComponent,
+                    operation: "parent_control_group_path (non-utf8)",
+                },
+            )
+        })?;
+        Ok(self.parent_control_group(str_slice))
+    }
+
     fn v2(&self) -> bool;
+
+    /// The immutable topology snapshot this hierarchy was constructed
+    /// from, when the hierarchy is one of the discovery-built ones.
+    ///
+    /// Built-in hierarchies expose the snapshot to cgroup operations.
+    /// Custom implementations may keep the default (`None`); a
+    /// [`Cgroup`](crate::fs::Cgroup) still preserves the exact custom
+    /// hierarchy when cloned because the trait object itself is shared.
+    fn topology(&self) -> Option<std::sync::Arc<crate::discovery::CgroupTopology>> {
+        None
+    }
 }
 
 /// Resource limits for the memory subsystem.

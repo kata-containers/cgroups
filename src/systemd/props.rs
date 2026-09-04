@@ -112,7 +112,11 @@ impl PropertiesBuilder {
         self
     }
 
-    pub fn build(self) -> Vec<Property<'static>> {
+    /// Finalize the properties list using a known cgroup version indicator.
+    ///
+    /// This avoids re-discovering the cgroup layout when the cgroup
+    /// topology is already known.
+    pub fn build_with_v2(self, v2: bool) -> Vec<Property<'static>> {
         let mut props = vec![];
 
         if let Some(cpu_accounting) = self.cpu_accounting {
@@ -128,7 +132,7 @@ impl PropertiesBuilder {
         }
 
         if let Some(io_accounting) = self.io_accounting {
-            if hierarchies::is_cgroup2_unified_mode() {
+            if v2 {
                 props.push((IO_ACCOUNTING, ZbusValue::Bool(io_accounting)));
             } else {
                 props.push((BLOCK_IO_ACCOUNTING, ZbusValue::Bool(io_accounting)));
@@ -166,5 +170,28 @@ impl PropertiesBuilder {
         }
 
         props
+    }
+
+    /// Finalize the properties list, detecting the host cgroup mode.
+    pub fn build(self) -> Vec<Property<'static>> {
+        self.build_with_v2(hierarchies::is_cgroup2_unified_mode())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_properties_builder_build_with_v2() {
+        let v2_props =
+            PropertiesBuilder::default_cgroup("test.slice", "test.scope").build_with_v2(true);
+        assert!(v2_props.iter().any(|(k, _)| *k == IO_ACCOUNTING));
+        assert!(!v2_props.iter().any(|(k, _)| *k == BLOCK_IO_ACCOUNTING));
+
+        let v1_props =
+            PropertiesBuilder::default_cgroup("test.slice", "test.scope").build_with_v2(false);
+        assert!(v1_props.iter().any(|(k, _)| *k == BLOCK_IO_ACCOUNTING));
+        assert!(!v1_props.iter().any(|(k, _)| *k == IO_ACCOUNTING));
     }
 }
