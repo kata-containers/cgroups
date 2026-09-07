@@ -24,8 +24,8 @@ use crate::error::CoreResult;
 /// - The path must be relative (no leading `/`).
 /// - No component may be `..`, `.`, or empty.
 /// - No component may contain a NUL byte (`\0`).
-/// - The filesystem root (`/`) is rejected, as is empty input: the
-///   hierarchy root is constructed explicitly with [`CgroupPath::root`].
+/// - The filesystem root (`/`) is rejected; empty input represents the
+///   hierarchy root, equivalently to [`CgroupPath::root`].
 /// - Components may contain colons (`:`) and need not be valid UTF-8.
 ///
 /// The validated path is stored in canonical relative form and borrows as a
@@ -44,9 +44,9 @@ impl CgroupPath {
     /// Create the `CgroupPath` representing the hierarchy root.
     ///
     /// The root is the identity element of [`CgroupPath::join`] and renders
-    /// as an empty relative path. Root selection is always explicit:
-    /// [`CgroupPath::new`] rejects empty input, so an unset external value
-    /// can never silently become an operation on the root cgroup.
+    /// as an empty relative path. [`CgroupPath::new`] also accepts empty
+    /// input as the hierarchy root; this constructor expresses that intent
+    /// directly at call sites.
     pub fn root() -> CoreResult<Self> {
         Ok(Self {
             path: PathBuf::new(),
@@ -103,6 +103,10 @@ impl CgroupPath {
     /// components, or NUL bytes), so a second leading `/` (e.g. `//a`)
     /// leaves an empty component and is rejected. Whole membership lines
     /// (e.g. `0::/user.slice`) are not accepted; pass the path field only.
+    /// A kernel-reported path containing `..` (possible when observing a
+    /// process outside the reader's cgroup namespace) is intentionally not
+    /// convertible to a mutation-safe `CgroupPath`; keep that value as a
+    /// [`crate::discovery::MembershipRecord`] observation instead.
     pub fn from_proc_membership<S: AsRef<OsStr>>(s: S) -> CoreResult<Self> {
         let bytes = s.as_ref().as_bytes();
         let input = Path::new(s.as_ref()).to_path_buf();
@@ -170,9 +174,7 @@ impl CgroupPath {
     ///
     /// Both operands were validated at construction and are stored in
     /// canonical relative form, so appending one to the other satisfies
-    /// every invariant by construction: this method currently always
-    /// returns `Ok`. The `Result` signature is reserved for future
-    /// constraints such as a maximum path depth.
+    /// every invariant by construction and is infallible.
     ///
     /// The root path is an identity on both sides (`root.join(x) == x`
     /// and `x.join(root) == x`), and the operation is associative.

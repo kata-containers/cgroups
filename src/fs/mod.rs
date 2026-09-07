@@ -531,6 +531,14 @@ pub trait Hierarchy: std::fmt::Debug + Send + Sync {
     fn root_control_group(&self) -> Cgroup;
 
     /// Return a handle to the parent control group in the hierarchy.
+    ///
+    /// Implementations should panic rather than return the root control group
+    /// when `path` has no parent. New code should prefer the fallible
+    /// [`Hierarchy::parent_control_group_path`] method.
+    ///
+    /// # Panics
+    ///
+    /// May panic if `path` is the hierarchy root or cannot be resolved.
     fn parent_control_group(&self, path: &str) -> Cgroup;
 
     /// Return a handle to the parent control group in the hierarchy from a `&Path`.

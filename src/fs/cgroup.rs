@@ -506,10 +506,13 @@ impl Cgroup {
 
     /// Return a handle to the parent control group in the hierarchy.
     ///
-    /// For validated, fallible parent resolution, use [`Cgroup::parent`].
+    /// # Panics
+    ///
+    /// Panics if this is the hierarchy root or if parent resolution fails.
+    /// For fail-closed, fallible parent resolution, use [`Cgroup::parent`].
     pub fn parent_control_group(&self) -> Cgroup {
         self.parent()
-            .unwrap_or_else(|_| self.hier.root_control_group())
+            .expect("cannot resolve parent cgroup; use Cgroup::parent for fallible resolution")
     }
 
     /// Kill every process in the control group. Only supported for v2 cgroups and on
@@ -928,7 +931,7 @@ mod tests {
         ));
 
         // 3. Parent control group threads the same topology
-        let parent = cg.parent_control_group();
+        let parent = cg.parent().unwrap();
         assert_eq!(parent.as_path(), Path::new("a/b"));
         assert!(parent.topology().is_some());
         assert!(std::sync::Arc::ptr_eq(
@@ -937,7 +940,7 @@ mod tests {
         ));
 
         // 4. Root control group threads the same topology
-        let root = parent.parent_control_group().parent_control_group();
+        let root = parent.parent().unwrap().parent().unwrap();
         assert_eq!(root.as_path(), Path::new(""));
         assert!(root.topology().is_some());
         assert!(std::sync::Arc::ptr_eq(
@@ -1168,6 +1171,10 @@ mod tests {
         assert!(root
             .move_task_to_parent_by_tgid(CgroupPid::from(100))
             .is_err());
+
+        let legacy_parent =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.parent_control_group()));
+        assert!(legacy_parent.is_err());
     }
 
     #[test]
@@ -1217,14 +1224,14 @@ mod tests {
         let valid_file = temp_dir.join("cgroup_valid");
         fs::write(
             &valid_file,
-            "1:memory:/user.slice\n2:cpu,cpuacct:/test.slice:colon_path:scope\n0::/unified.slice\n",
+            "1:memory:/user.slice\n2:cpu,cpuacct:/test.slice:colon_path:scope\n0::/../sibling.slice\n",
         )
         .unwrap();
         let map = get_cgroups_relative_paths_by_path(&valid_file).unwrap();
         assert_eq!(map.get("memory").unwrap(), "/user.slice");
         assert_eq!(map.get("cpu").unwrap(), "/test.slice:colon_path:scope");
         assert_eq!(map.get("cpuacct").unwrap(), "/test.slice:colon_path:scope");
-        assert_eq!(map.get("").unwrap(), "/unified.slice");
+        assert_eq!(map.get("").unwrap(), "/../sibling.slice");
 
         let malformed_file = temp_dir.join("cgroup_malformed");
         fs::write(&malformed_file, "bad_line_without_colons\n").unwrap();

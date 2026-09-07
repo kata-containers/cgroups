@@ -222,23 +222,29 @@ fn read_proc_file(
 
 /// Determine the natural root of cgroup v1 mounts.
 ///
-/// If there is a single co-mounted hierarchy, its mount point is itself the natural root.
-/// If there are multiple mounts sharing a parent directory, that parent directory is the root.
+/// If a single mount point is named after all controllers on that hierarchy
+/// (including a `name=foo` hierarchy), its parent is the natural root. A
+/// single mount directly at the common cgroup root remains its own natural
+/// root. If there are multiple mounts sharing a parent directory, that parent
+/// directory is the root.
 fn determine_v1_natural_root(v1_mounts: &[&crate::discovery::mountinfo::MountRecord]) -> PathBuf {
     if v1_mounts.is_empty() {
         return PathBuf::from("/sys/fs/cgroup");
     }
     if v1_mounts.len() == 1 {
         let mount = v1_mounts[0];
-        let file_name = mount
+        let mount_name = mount
             .mount_point
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        let is_subsystem_dir = mount
-            .super_opts
-            .iter()
-            .any(|opt| opt == file_name || opt.split(',').any(|s| s == file_name));
+        let is_subsystem_dir = !mount_name.is_empty()
+            && mount_name.split(',').all(|name| {
+                mount
+                    .super_opts
+                    .iter()
+                    .any(|opt| opt == name || opt.strip_prefix("name=") == Some(name))
+            });
         if is_subsystem_dir {
             mount
                 .mount_point
@@ -315,15 +321,16 @@ fn assemble_topology(
             None => natural_root,
         };
 
-        // In hybrid hosts, cgroup v2 hierarchy is available only if there is a qualifying
-        // cgroup2 mount whose mount_root is "/" and passes statfs verification.
-        let v2_candidate = unified_mounts
-            .iter()
-            .find(|mount| mount.mount_root == Path::new("/"));
-        let v2_available = match v2_candidate {
+        // A cgroup namespace may expose a delegated cgroup2 subtree with a
+        // non-root mount_root. It is still the visible unified hierarchy and
+        // is subject to the same statfs verification as a pure-v2 layout.
+        let v2_available = match unified_candidate {
             Some(candidate) => match &host_paths.cgroupfs_override {
                 Some(_) => true,
-                None => verify_cgroup2_mount(&candidate.mount_point).is_ok(),
+                None => {
+                    verify_cgroup2_mount(&candidate.mount_point)?;
+                    true
+                }
             },
             None => false,
         };
@@ -726,10 +733,49 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_hybrid_rejects_non_root_cgroup2_mount() {
-        // cgroup2 mount is not rooted at "/", so it is not a qualifying unified hierarchy root
+    fn test_resolve_mount_point_single_controller_directory_override() {
+        const CASES: &[(&str, &str)] = &[
+            (
+                "30 26 0:26 / /sys/fs/cgroup/cpu,cpuacct rw - cgroup cgroup rw,cpu,cpuacct",
+                "cpu,cpuacct",
+            ),
+            (
+                "30 26 0:26 / /sys/fs/cgroup/systemd rw - cgroup cgroup rw,xattr,name=systemd",
+                "systemd",
+            ),
+        ];
+
+        for (index, (mountinfo, directory)) in CASES.iter().enumerate() {
+            let membership = if *directory == "systemd" {
+                "1:name=systemd:/user.slice"
+            } else {
+                "1:cpu,cpuacct:/user.slice"
+            };
+            let (root, host_paths) = fixture_host(
+                &format!("single-controller-{}", index),
+                mountinfo,
+                membership,
+            );
+            let custom_cgroupfs = root.join("custom_cgroupfs");
+            fs::create_dir_all(&custom_cgroupfs).unwrap();
+            let host_paths = HostPaths {
+                cgroupfs_override: Some(custom_cgroupfs.clone()),
+                ..host_paths
+            };
+
+            let topology = discover(&host_paths).unwrap();
+            let original = Path::new("/sys/fs/cgroup").join(directory);
+            assert_eq!(
+                topology.resolve_mount_point(&original),
+                custom_cgroupfs.join(directory)
+            );
+        }
+    }
+
+    #[test]
+    fn test_discover_hybrid_accepts_namespaced_cgroup2_mount() {
         const DELEGATED_CGROUP2: &str =
-            "34 33 0:29 /user.slice /sys/fs/cgroup/unified rw shared:10 - cgroup2 cgroup2 rw";
+            "34 33 0:29 /.. /sys/fs/cgroup/unified rw shared:10 - cgroup2 cgroup2 rw";
         let (root, host_paths) = fixture_host(
             "hybrid-delegated",
             &format!("{}\n{}", V1_MOUNTINFO, DELEGATED_CGROUP2),
@@ -740,13 +786,8 @@ mod tests {
             ..host_paths
         };
 
-        // Membership has 0:: but cgroup2 mount is not rooted at "/", so cross-check must fail
-        match discover(&host_paths) {
-            Err(CoreError::Discovery { step, cause, .. }) => {
-                assert_eq!(step, "cross-check membership");
-                assert!(cause.to_string().contains("0::"));
-            }
-            other => panic!("expected Discovery cross-check error, got `{:?}`", other),
-        }
+        let topology = discover(&host_paths).unwrap();
+        assert_eq!(topology.version, CgroupVersion::V1);
+        assert!(topology.v2_available);
     }
 }

@@ -188,7 +188,7 @@ impl Hierarchy for V1 {
 
     fn parent_control_group(&self, path: &str) -> Cgroup {
         self.parent_control_group_path(Path::new(path))
-            .unwrap_or_else(|_| self.root_control_group())
+            .expect("cannot resolve parent cgroup; use Hierarchy::parent_control_group_path")
     }
 
     fn parent_control_group_path(&self, path: &Path) -> Result<Cgroup> {
@@ -296,7 +296,7 @@ impl Hierarchy for V2 {
 
     fn parent_control_group(&self, path: &str) -> Cgroup {
         self.parent_control_group_path(Path::new(path))
-            .unwrap_or_else(|_| self.root_control_group())
+            .expect("cannot resolve parent cgroup; use Hierarchy::parent_control_group_path")
     }
 
     fn parent_control_group_path(&self, path: &Path) -> Result<Cgroup> {

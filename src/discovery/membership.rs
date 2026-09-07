@@ -20,8 +20,9 @@ pub struct MembershipRecord {
     pub controllers: Vec<String>,
     /// The process's cgroup path within that hierarchy, exactly as it
     /// appears in the record: it begins with `/` and may contain colons
-    /// (e.g. `session:c1.scope`). Convert it to a validated path with
-    /// [`crate::model::CgroupPath::from_proc_membership`].
+    /// (e.g. `session:c1.scope`). When the target process is outside the
+    /// reader's cgroup namespace, the path may begin with one or more `..`
+    /// components and must remain an observation rather than a mutation path.
     pub path: PathBuf,
 }
 
@@ -75,9 +76,12 @@ pub fn parse_membership(input: &str) -> CoreResult<Membership> {
 /// field is taken as the whole remainder. The hierarchy ID must parse as
 /// a [`u32`] (`0` denotes the unified hierarchy); the controller list is
 /// comma-split and may be empty; the path must be non-empty and start
-/// with `/`. The path is kept verbatim, without trimming, because it is
-/// the final field and the kernel does not escape trailing whitespace
-/// that a cgroup name may legitimately contain.
+/// with `/`. Empty and current-directory components are rejected, while
+/// parent components are retained because the kernel emits them when the
+/// target process is outside the reader's cgroup namespace. The path is
+/// kept verbatim, without trimming, because it is the final field and the
+/// kernel does not escape trailing whitespace that a cgroup name may
+/// legitimately contain.
 ///
 /// Crate-visible for the transitional manager shim; the stable public
 /// surface is [`parse_membership`].
@@ -153,17 +157,42 @@ pub(crate) fn parse_membership_line(line: &str, line_no: usize) -> CoreResult<Me
         ));
     }
 
-    // Safety and structural validation using CgroupPath::from_proc_membership:
-    // rejects "..", ".", empty components ("//"), and NUL bytes.
-    crate::model::CgroupPath::from_proc_membership(path).map_err(|err| {
-        membership_error(line_no, format!("invalid cgroup path `{}`: {}", path, err))
-    })?;
+    validate_membership_path(path, line_no)?;
 
     Ok(MembershipRecord {
         hierarchy_id,
         controllers,
         path: PathBuf::from(path),
     })
+}
+
+/// Validate the structure of an observed membership path without treating it
+/// as a path that is safe to join beneath a writable cgroupfs root.
+fn validate_membership_path(path: &str, line_no: usize) -> CoreResult<()> {
+    if path == "/" {
+        return Ok(());
+    }
+
+    for component in path[1..].split('/') {
+        let reason = if component.is_empty() {
+            Some("contains an empty component")
+        } else if component == "." {
+            Some("contains a current-directory component (`.`)")
+        } else if component.as_bytes().contains(&0) {
+            Some("contains a NUL byte")
+        } else {
+            None
+        };
+
+        if let Some(reason) = reason {
+            return Err(membership_error(
+                line_no,
+                format!("invalid cgroup path `{}`: {}", path, reason),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Build a membership parse error for `line_no`.
@@ -277,9 +306,14 @@ mod tests {
             expect: None,
         },
         Case {
-            name: "path contains parent traversal component",
+            name: "namespace-relative path retains parent component",
             line: "0::/a/../b",
-            expect: None,
+            expect: Some((0, &[], "/a/../b")),
+        },
+        Case {
+            name: "target outside cgroup namespace",
+            line: "0::/../../sibling.scope",
+            expect: Some((0, &[], "/../../sibling.scope")),
         },
         Case {
             name: "path contains current component",

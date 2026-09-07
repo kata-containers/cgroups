@@ -74,10 +74,6 @@ pub enum PathReason {
     /// carry (kernel path syscalls reject it).
     #[error("path contains a NUL byte")]
     NulByte,
-    /// The entire input is empty, distinct from an empty component between
-    /// separators (e.g. `a//b`); the root must be constructed explicitly.
-    #[error("path is empty")]
-    EmptyPath,
     /// The path is the filesystem root.
     #[error("path is the filesystem root")]
     Root,
