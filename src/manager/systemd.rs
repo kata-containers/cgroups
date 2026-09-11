@@ -350,7 +350,7 @@ mod tests {
     use crate::manager::systemd::*;
     use crate::manager::tests::{MEMORY_1G, MEMORY_2G, MEMORY_512M};
     use crate::tests::spawn_sleep_inf;
-    use crate::{skip_if_cgroups_v1, skip_if_cgroups_v2, skip_if_no_systemd};
+    use crate::{skip_if_cgroups_v1, skip_if_cgroups_v2, skip_if_no_systemd, skip_if_not_root};
 
     fn new_cgroups_path() -> (String, String, String) {
         let rand_string: String = rand::thread_rng()
@@ -428,17 +428,18 @@ mod tests {
 
     #[test]
     fn test_slice_and_unit() {
-        skip_if_no_systemd!();
-
         let (slice, scope_prefix, name) = new_cgroups_path();
-        let manager = SystemdManager::new(&format!("{}:{}:{}", slice, scope_prefix, name)).unwrap();
+        let (actual_slice, actual_unit) =
+            SystemdManager::parse_slice_and_unit(&format!("{}:{}:{}", slice, scope_prefix, name))
+                .unwrap();
 
-        assert_eq!(manager.slice(), "cgroupsrs-test.slice");
-        assert_eq!(manager.unit(), format!("{scope_prefix}-{name}.scope"));
+        assert_eq!(actual_slice, "cgroupsrs-test.slice");
+        assert_eq!(actual_unit, format!("{scope_prefix}-{name}.scope"));
     }
 
     #[test]
     fn test_destory() {
+        skip_if_not_root!();
         skip_if_no_systemd!();
 
         let (slice, scope_prefix, name) = new_cgroups_path();
@@ -489,6 +490,7 @@ mod tests {
 
     #[test]
     fn test_set_cpu() {
+        skip_if_not_root!();
         skip_if_no_systemd!();
 
         // 1024 shares, every 100ms allows to use 1 CPU
@@ -524,6 +526,7 @@ mod tests {
 
     #[test]
     fn test_set_memory_v2() {
+        skip_if_not_root!();
         skip_if_no_systemd!();
         skip_if_cgroups_v1!();
 
@@ -563,6 +566,7 @@ mod tests {
 
     #[test]
     fn test_set_memory_v1() {
+        skip_if_not_root!();
         skip_if_no_systemd!();
         skip_if_cgroups_v2!();
 

@@ -9,6 +9,8 @@ use cgroups_rs::fs::Cgroup;
 
 #[test]
 fn test_cfs_quota_and_periods() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("test_cfs_quota_and_periods")).unwrap();
 

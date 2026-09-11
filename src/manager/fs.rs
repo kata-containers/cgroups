@@ -1106,7 +1106,7 @@ mod tests {
     use crate::manager::fs::*;
     use crate::manager::tests::{MEMORY_1G, MEMORY_2G, MEMORY_512M};
     use crate::tests::spawn_sleep_inf;
-    use crate::{skip_if_cgroups_v1, skip_if_cgroups_v2};
+    use crate::{skip_if_cgroups_v1, skip_if_cgroups_v2, skip_if_not_root};
 
     const TEST_BASE: &str = "cgroupsrs/pod";
 
@@ -1233,6 +1233,8 @@ mod tests {
 
     #[test]
     fn test_paths_and_mounts() {
+        skip_if_not_root!();
+
         let mut manager = new_manager();
 
         for (subsystem, mountpoint) in manager.mounts() {
@@ -1246,6 +1248,8 @@ mod tests {
 
     #[test]
     fn test_destroy() {
+        skip_if_not_root!();
+
         let mut manager = new_manager();
         manager.create_cgroups().unwrap();
 
@@ -1264,6 +1268,8 @@ mod tests {
 
     #[test]
     fn test_set_cpu() {
+        skip_if_not_root!();
+
         // 1024 shares, every 100ms allows to use 1 CPU
         let linux_cpu = LinuxCpuBuilder::default()
             .shares(1024u64)
@@ -1297,6 +1303,7 @@ mod tests {
 
     #[test]
     fn test_set_memory_v2() {
+        skip_if_not_root!();
         skip_if_cgroups_v1!();
 
         // expected failure: swap < limit
@@ -1334,6 +1341,7 @@ mod tests {
 
     #[test]
     fn test_set_memory_v1() {
+        skip_if_not_root!();
         skip_if_cgroups_v2!();
 
         let linux_memory = LinuxMemoryBuilder::default()
@@ -1388,6 +1396,8 @@ mod tests {
 
     #[test]
     fn test_enable_cpus_topdown() {
+        skip_if_not_root!();
+
         let online_cpus = fs::read_to_string("/sys/devices/system/cpu/online").unwrap();
         let cpus = parse_cpu_list(&online_cpus);
 
@@ -1422,6 +1432,8 @@ mod tests {
 
     #[test]
     fn test_systemd() {
+        skip_if_not_root!();
+
         let mut manager = new_manager();
         assert!(!manager.systemd(), "FsManager should not be systemd");
         manager.destroy().unwrap();
@@ -1430,10 +1442,8 @@ mod tests {
 
 /// Host-independent parser tests for `parse_cgroup_subsystems_str`.
 ///
-/// Separate from `tests` so the privileged-suite skip filter
-/// (`manager::fs::tests`) does not exclude these non-privileged tests. Input
-/// and expectation are kept adjacent in inline tables so failures pin an exact
-/// (controller, path) pair instead of a vague "is_empty" / "contains_key".
+/// Input and expectation are kept adjacent in inline tables so failures pin an
+/// exact (controller, path) pair instead of a vague "is_empty" / "contains_key".
 #[cfg(test)]
 mod parse_tests {
     use super::{parse_cgroup_mountinfo_str, parse_cgroup_subsystems_str};
@@ -1615,6 +1625,7 @@ no separator here
     /// so it is legitimately empty on a unified v2 host; on v1/hybrid it must
     /// be non-empty. The line-parser canary covers both versions.
     #[test]
+    #[ignore = "requires a controlled cgroup hierarchy; run explicitly in QEMU"]
     fn test_live_mountinfo_canary() {
         let data = fs::read_to_string("/proc/self/mountinfo")
             .expect("canary: /proc/self/mountinfo must be readable");

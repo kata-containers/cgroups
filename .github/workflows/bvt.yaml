@@ -1,41 +1,139 @@
 name: BVT
 on: [pull_request]
+permissions:
+  contents: read
+concurrency:
+  group: bvt-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 env:
   RUST_VERSION: 1.90.0
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Cache Cargo
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ github.job }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ github.job }}-${{ env.RUST_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
       - run: rustup install ${{ env.RUST_VERSION }} && rustup default ${{ env.RUST_VERSION }}
       - run: make debug
+      - name: Verify release package
+        run: make release
+      - name: Check oci feature independently
+        run: cargo check --no-default-features --features oci
+      - name: Check serde feature independently
+        run: cargo check --no-default-features --features serde
 
   fmt:
     name: Format Check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - run: rustup install ${{ env.RUST_VERSION }} && rustup default ${{ env.RUST_VERSION }}
       - run: rustup component add rustfmt
       - run: make fmt
   clippy:
     name: Clippy Check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Cache Cargo
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ github.job }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ github.job }}-${{ env.RUST_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
       - run: rustup install ${{ env.RUST_VERSION }} && rustup default ${{ env.RUST_VERSION }}
       - run: rustup component add clippy
       - run: make clippy
   test-unit:
     name: Unprivileged Library Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Cache Cargo
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ github.job }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ github.job }}-${{ env.RUST_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
       - run: rustup install ${{ env.RUST_VERSION }} && rustup default ${{ env.RUST_VERSION }}
       - run: make test-unit
+  test-binaries:
+    name: Build Guest Test Binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Cache Cargo
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ github.job }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ github.job }}-${{ env.RUST_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils musl-tools
+
+      - name: Build static test executables
+        run: |
+          ci/qemu/build-static-test-binaries.sh \
+            "${RUNNER_TEMP}/cgroup-test-binaries"
+          tar -czf "${RUNNER_TEMP}/cgroup-test-binaries.tar.gz" \
+            -C "${RUNNER_TEMP}/cgroup-test-binaries" .
+
+      - name: Upload static test executables
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cgroup-test-binaries
+          path: ${{ runner.temp }}/cgroup-test-binaries.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
   test:
     name: Controlled Guest Tests / ${{ matrix.hierarchy }}
+    needs: test-binaries
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -56,29 +154,32 @@ jobs:
       UNEXPECTED_SKIP: ${{ matrix.unexpected_skip }}
       QEMU_ACCEL: tcg
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install "${RUST_VERSION}" --profile minimal
-          rustup default "${RUST_VERSION}"
-          rustup target add x86_64-unknown-linux-musl
-
-      - name: Install QEMU and build dependencies
+      - name: Install QEMU dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            binutils \
             cloud-image-utils \
-            jq \
-            musl-tools \
             ovmf \
             qemu-system-x86 \
             qemu-utils
 
+      - name: Download static test executables
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cgroup-test-binaries
+          path: ${{ runner.temp }}/cgroup-test-artifact
+
+      - name: Extract static test executables
+        run: |
+          mkdir -p "${RUNNER_TEMP}/cgroup-test-binaries"
+          tar -xzf "${RUNNER_TEMP}/cgroup-test-artifact/cgroup-test-binaries.tar.gz" \
+            -C "${RUNNER_TEMP}/cgroup-test-binaries"
+
       - name: Restore pinned Ubuntu cloud image
         id: image-cache
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ runner.temp }}/cgroup-image
           key: ubuntu-jammy-20260722-amd64
@@ -95,11 +196,6 @@ jobs:
         run: |
           echo "${CGROUP_IMAGE_SHA256}  ${RUNNER_TEMP}/cgroup-image/${CGROUP_IMAGE_NAME}" \
             | sha256sum --check -
-
-      - name: Build static test executables
-        run: |
-          ci/qemu/build-static-test-binaries.sh \
-            "${RUNNER_TEMP}/cgroup-test-binaries"
 
       - name: Create guest SSH key
         run: |
@@ -135,12 +231,14 @@ jobs:
 
       - name: Upload QEMU diagnostics
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cgroup-${{ matrix.hierarchy }}-qemu-diagnostics
           path: |
             ${{ runner.temp }}/cgroup-vm/console.log
             ${{ runner.temp }}/cgroup-vm/qemu.log
+            ${{ runner.temp }}/cgroup-vm/guest-journal.log
+            ${{ runner.temp }}/cgroup-tests.log
           if-no-files-found: ignore
 
       - name: Stop cgroup guest

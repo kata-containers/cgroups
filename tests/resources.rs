@@ -10,6 +10,8 @@ use cgroups_rs::fs::{Cgroup, MaxValue, PidResources, Resources};
 
 #[test]
 fn pid_resources() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("pid_resources")).unwrap();
     {

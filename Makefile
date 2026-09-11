@@ -11,6 +11,8 @@ debug:
 .PHONY: release
 release:
 	cargo build --release
+	cargo package --all-features
+	cargo publish --dry-run --all-features
 
 .PHONY: build
 build: debug
@@ -18,41 +20,29 @@ build: debug
 #
 # Tests and linters
 #
-PRIVILEGED_FILTERS = --skip systemd::dbus::client::tests --skip manager::fs::tests --skip manager::systemd::tests
-
-# Privileged targets build unprivileged with a recording Cargo runner and then
-# sudo only the finished test executable, via ci/run-root-tests.sh. Running
+# Root test targets discover executables through Cargo's recording runner while
+# building unprivileged, then sudo only the finished test executable via
+# ci/run-root-tests.sh. Running
 # cargo itself as root leaves root-owned files in target/ and the cargo registry,
 # which breaks the next unprivileged build (the .cargo-build-lock becomes
 # unwritable). `sudo env PATH=...` restores the user PATH that sudo's env_reset
 # strips, so the test binary still finds helper commands.
 # Run `make test` (not `sudo make test`): this file self-elevates for the
-# privileged targets, and sudo would strip the user PATH before make sees it.
+# root targets, and sudo would strip the user PATH before make sees it.
 .NOTPARALLEL: test
-test: test-systemd test-fs-manager test-systemd-manager test-integration test-unit
+test: test-doc test-library test-integration
 
-# The three privileged lib suites run the same library test binary, differing
-# only in the filter argument. Shared cargo flags are factored out here; each
-# suite sets its own PRIV_FILTER via a target-specific variable. The binary is
-# prepared once by test-lib-compile and reused by all three, so Cargo is invoked
-# once to prepare it, not three times.
-PRIV_LIB_CARGO = --all-features --package cgroups-rs --lib
-PRIV_TEST_ARGS = --color always --nocapture --test-threads=1
+ROOT_TEST_ARGS = --color always --nocapture --test-threads=1
 
 .PHONY: test-lib-compile
 test-lib-compile:
-	ci/run-root-tests.sh compile lib $(PRIV_LIB_CARGO)
+	ci/run-root-tests.sh compile lib --all-features --package cgroups-rs --lib
 
-# Privileged lib suites: talk to the real system D-Bus, write live cgroup
-# files, and drive real systemd transient units respectively. Need root and
-# serialization (`--test-threads=1`).
-test-systemd:         PRIV_FILTER = systemd::dbus::client::tests
-test-fs-manager:      PRIV_FILTER = manager::fs::tests
-test-systemd-manager: PRIV_FILTER = manager::systemd::tests
-
-.PHONY: test-systemd test-fs-manager test-systemd-manager
-test-systemd test-fs-manager test-systemd-manager: test-lib-compile
-	ci/run-root-tests.sh run lib -- $(PRIV_FILTER) $(PRIV_TEST_ARGS)
+# Run the complete library harness as root and serially. The live mountinfo
+# canary is ignored here because only the QEMU guests guarantee its environment.
+.PHONY: test-library
+test-library: test-lib-compile
+	ci/run-root-tests.sh run lib -- $(ROOT_TEST_ARGS)
 
 .PHONY: test-doc
 test-doc:
@@ -60,7 +50,7 @@ test-doc:
 
 .PHONY: test-unit
 test-unit: test-doc
-	cargo test --all-features --lib -- $(PRIVILEGED_FILTERS)
+	cargo test --all-features --lib
 
 # Integration tests in tests/ manipulate live cgroups and need root.
 # They run inside the QEMU guests in CI; this target is for local runs.
@@ -72,7 +62,7 @@ test-tests-compile:
 
 .PHONY: test-integration
 test-integration: test-tests-compile
-	ci/run-root-tests.sh run tests -- --color always --nocapture --test-threads=1
+	ci/run-root-tests.sh run tests -- $(ROOT_TEST_ARGS)
 
 .PHONY: check
 check: fmt clippy
@@ -85,4 +75,3 @@ fmt:
 .PHONY: clippy
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
-

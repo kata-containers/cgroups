@@ -8,7 +8,7 @@ Native Rust library for managing Linux control groups. Supports both cgroups v1 
 
 ### Create a control group using the builder pattern
 
-```rust
+```rust,no_run
 use cgroups_rs::*;
 use cgroups_rs::fs::cgroup_builder::*;
 use cgroups_rs::fs::*;

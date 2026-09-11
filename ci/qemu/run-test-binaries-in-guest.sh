@@ -8,14 +8,19 @@ readonly USAGE="usage: run-test-binaries-in-guest.sh TEST_DIR HIERARCHY"
 readonly TEST_DIR="${1:?${USAGE}}"
 readonly HIERARCHY="${2:?${USAGE}}"
 
+if ((EUID != 0)); then
+    echo "guest test runner must run as root; got EUID ${EUID}" >&2
+    exit 1
+fi
+
 cd "${TEST_DIR}"
 
 cleanup_failed_test() {
     # A failed test can leave a spawned helper holding the SSH channel open.
     # The VM is disposable, so terminate only the helper commands used by
     # this suite before returning.
-    sudo pkill -KILL -x sleep || true
-    sudo pkill -KILL -x yes || true
+    pkill -KILL -x sleep || true
+    pkill -KILL -x yes || true
 }
 
 run_test() {
@@ -27,7 +32,7 @@ run_test() {
 
     local result=0
     # Do not let the test consume executable paths from the loop manifest.
-    sudo -E "./${test_binary}" "$@" --color always --nocapture \
+    "./${test_binary}" "$@" --color always --nocapture \
         --test-threads=1 </dev/null || result=$?
     if ((result != 0)); then
         cleanup_failed_test
@@ -35,36 +40,69 @@ run_test() {
     fi
 }
 
-mapfile -t library_tests < <(grep -E '^cgroups_rs-' manifest || true)
+require_test() {
+    local test_binary="$1"
+    local test_name="$2"
+
+    if ! "./${test_binary}" --list --format terse | grep -Fqx "${test_name}: test"; then
+        echo "required test '${test_name}' not found in ${test_binary}" >&2
+        exit 1
+    fi
+}
+
+library_tests=()
+integration_tests=()
+environment_tests=()
+while IFS=$'\t' read -r target_kind target_name test_binary; do
+    case "${target_kind}" in
+        lib)
+            library_tests+=("${test_binary}")
+            ;;
+        test)
+            integration_tests+=("${test_binary}")
+            if [[ "${target_name}" == "environment" ]]; then
+                environment_tests+=("${test_binary}")
+            fi
+            ;;
+        *)
+            echo "unsupported test target kind '${target_kind}' for ${target_name}" >&2
+            exit 1
+            ;;
+    esac
+done < manifest
+
 if ((${#library_tests[@]} != 1)); then
     echo "expected exactly one library test executable" >&2
     exit 1
 fi
 library_test="${library_tests[0]}"
 
-# Match the phases in the Makefile: cgroup-manipulating suites are isolated
-# and sequential, followed by integration test binaries from manifest.
-run_test "${library_test}" systemd::dbus::client::tests
-run_test "${library_test}" manager::fs::tests
-run_test "${library_test}" manager::systemd::tests
-run_test "${library_test}" manager::fs::parse_tests::test_live_mountinfo_canary --exact
+# Run the complete library harness once. Privileged tests cannot silently skip
+# here because this script has already verified its effective UID.
+run_test "${library_test}"
 
-while IFS= read -r test_binary; do
-    [[ "${test_binary}" == "${library_test}" ]] && continue
+# This ignored canary depends on the guest's controlled cgroup hierarchy, not
+# on root privileges, so keep its environment requirement explicit.
+require_test "${library_test}" manager::fs::parse_tests::test_live_mountinfo_canary
+run_test "${library_test}" manager::fs::parse_tests::test_live_mountinfo_canary --exact --ignored
+
+for test_binary in "${integration_tests[@]}"; do
     run_test "${test_binary}"
-done < manifest
+done
 
 if [[ "${HIERARCHY}" == "unified-v2" ]]; then
-    mapfile -t environment_tests < <(grep -E '^environment-' manifest || true)
     if ((${#environment_tests[@]} != 1)); then
         echo "expected exactly one environment integration-test executable" >&2
         exit 1
     fi
     environment_test="${environment_tests[0]}"
 
+    require_test "${environment_test}" delegated_rootless_v2
+    require_test "${environment_test}" cgroup_namespace_nested_v2
+
     echo
     echo "Running delegated cgroup v2 test as the unprivileged runner user"
-    sudo systemd-run \
+    systemd-run \
         --quiet \
         --wait \
         --collect \
@@ -80,7 +118,7 @@ if [[ "${HIERARCHY}" == "unified-v2" ]]; then
 
     echo
     echo "Running nested cgroup v2 test in private cgroup and mount namespaces"
-    sudo systemd-run \
+    systemd-run \
         --quiet \
         --wait \
         --collect \
@@ -91,6 +129,10 @@ if [[ "${HIERARCHY}" == "unified-v2" ]]; then
         /usr/bin/unshare --cgroup --mount --fork \
         /bin/bash -c '
             set -euo pipefail
+            if ((EUID != 0)); then
+                echo "namespace test launcher must run as root; got EUID ${EUID}" >&2
+                exit 1
+            fi
             mount --make-rprivate /
             umount /sys/fs/cgroup
             mount -t cgroup2 none /sys/fs/cgroup

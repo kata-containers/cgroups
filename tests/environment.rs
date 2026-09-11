@@ -8,7 +8,7 @@ use std::process::Command;
 
 use cgroups_rs::fs::hierarchies;
 use cgroups_rs::fs::pid::PidController;
-use cgroups_rs::fs::{Cgroup, Hierarchy, Subsystem};
+use cgroups_rs::fs::{Cgroup, Hierarchy, MaxValue, Subsystem};
 use cgroups_rs::CgroupPid;
 
 #[derive(Clone, Debug)]
@@ -58,22 +58,61 @@ fn current_v2_path() -> String {
         .to_string()
 }
 
-/// Move the test harness out of the delegated root before using that root as
-/// an inner node. The transient systemd unit removes this manager leaf after
-/// the test process exits.
-fn move_self_to_manager_leaf(root: &Path) {
+/// Prepare a delegated parent to distribute the pids controller to children.
+///
+/// Move every process out of the parent to satisfy cgroup v2's no-internal-
+/// process constraint. This includes both the test harness and, in the cgroup
+/// namespace scenario, the waiting parent created by `unshare --fork`. The
+/// transient systemd unit removes the manager leaf after those processes exit.
+fn prepare_parent_for_pids(root: &Path) -> Vec<String> {
+    let controllers =
+        fs::read_to_string(root.join("cgroup.controllers")).expect("read parent controllers");
+    assert!(
+        controllers.split_whitespace().any(|name| name == "pids"),
+        "pids controller must be available in {}: {:?}",
+        root.display(),
+        controllers
+    );
+
     let pid = std::process::id().to_string();
     let manager_leaf = root.join(format!("cgroups-rs-manager-{}", pid));
     fs::create_dir(&manager_leaf).expect("create a manager leaf cgroup");
-    fs::write(manager_leaf.join("cgroup.procs"), pid.as_bytes())
-        .expect("move the test harness into the manager leaf cgroup");
 
     let root_procs =
         fs::read_to_string(root.join("cgroup.procs")).expect("read delegated root cgroup.procs");
+    let root_pids: Vec<_> = root_procs.lines().map(str::to_string).collect();
     assert!(
-        !root_procs.lines().any(|line| line == pid.as_str()),
-        "the delegated root must not directly contain the test process"
+        root_pids.iter().any(|root_pid| root_pid == &pid),
+        "the delegated root must initially contain the test process"
     );
+
+    for root_pid in &root_pids {
+        fs::write(manager_leaf.join("cgroup.procs"), root_pid.as_bytes())
+            .unwrap_or_else(|error| panic!("move PID {} into manager leaf: {}", root_pid, error));
+    }
+
+    let remaining =
+        fs::read_to_string(root.join("cgroup.procs")).expect("re-read delegated root cgroup.procs");
+    assert!(
+        remaining.trim().is_empty(),
+        "parent cgroup must have no internal processes before enabling controllers: {:?}",
+        remaining
+    );
+
+    fs::write(root.join("cgroup.subtree_control"), b"+pids")
+        .expect("enable pids controller for child cgroups");
+    let subtree_control = fs::read_to_string(root.join("cgroup.subtree_control"))
+        .expect("read parent cgroup.subtree_control");
+    assert!(
+        subtree_control
+            .split_whitespace()
+            .any(|name| name == "pids"),
+        "pids controller must be enabled for children of {}: {:?}",
+        root.display(),
+        subtree_control
+    );
+
+    root_pids
 }
 
 fn exercise_v2_hierarchy(hierarchy: Box<dyn Hierarchy>, root: &Path) {
@@ -86,6 +125,17 @@ fn exercise_v2_hierarchy(hierarchy: Box<dyn Hierarchy>, root: &Path) {
         cgroup_type.trim(),
         "domain",
         "new child cgroup must be a valid domain"
+    );
+
+    let pids: &PidController = cgroup
+        .controller_of()
+        .expect("child cgroup must expose the pids controller");
+    let limit = MaxValue::Value(16);
+    pids.set_pid_max(limit).expect("set child cgroup pids.max");
+    assert_eq!(
+        pids.get_pid_max().expect("read child cgroup pids.max"),
+        limit,
+        "child cgroup must preserve its configured pids.max"
     );
 
     let mut child = Command::new("sleep")
@@ -152,7 +202,7 @@ fn delegated_rootless_v2() {
         delegated_root.display()
     );
 
-    move_self_to_manager_leaf(&delegated_root);
+    prepare_parent_for_pids(&delegated_root);
     exercise_v2_hierarchy(
         Box::new(DelegatedV2Hierarchy::new(delegated_root.clone())),
         &delegated_root,
@@ -162,6 +212,8 @@ fn delegated_rootless_v2() {
 #[test]
 #[ignore]
 fn cgroup_namespace_nested_v2() {
+    cgroups_rs::skip_if_not_root!();
+
     assert_eq!(
         current_v2_path(),
         "/",
@@ -176,6 +228,11 @@ fn cgroup_namespace_nested_v2() {
     assert_eq!(mount_root, PathBuf::from("/"));
     assert_eq!(mount_point, PathBuf::from("/sys/fs/cgroup"));
 
-    move_self_to_manager_leaf(Path::new("/sys/fs/cgroup"));
+    let root_pids = prepare_parent_for_pids(Path::new("/sys/fs/cgroup"));
+    let test_pid = std::process::id().to_string();
+    assert!(
+        root_pids.iter().any(|pid| pid != &test_pid),
+        "the unshare --fork waiting parent must be moved out of the namespace root"
+    );
     exercise_v2_hierarchy(hierarchies::auto(), Path::new("/sys/fs/cgroup"));
 }

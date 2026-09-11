@@ -251,6 +251,7 @@ pub mod tests {
     use rand::Rng;
 
     use crate::fs::hierarchies;
+    use crate::skip_if_not_root;
     use crate::systemd::dbus::client::*;
     use crate::systemd::dbus::error::Error;
     use crate::systemd::props::PropertiesBuilder;
@@ -333,6 +334,7 @@ pub mod tests {
 
     #[test]
     fn test_start() {
+        skip_if_not_root!();
         skip_if_no_systemd!();
 
         let v2 = hierarchies::is_cgroup2_unified_mode();
@@ -465,6 +467,7 @@ pub mod tests {
 
     #[test]
     fn test_stop() {
+        skip_if_not_root!();
         skip_if_no_systemd!();
 
         let unit = test_unit();
@@ -492,6 +495,7 @@ pub mod tests {
 
     #[test]
     fn test_set_properties() {
+        skip_if_not_root!();
         skip_if_no_systemd!();
 
         let unit = test_unit();
@@ -531,6 +535,7 @@ pub mod tests {
 
     #[test]
     fn test_freeze_and_thaw() {
+        skip_if_not_root!();
         skip_if_no_systemd!();
 
         let v2 = hierarchies::is_cgroup2_unified_mode();
@@ -583,6 +588,7 @@ pub mod tests {
 
     #[test]
     fn test_exists() {
+        skip_if_not_root!();
         skip_if_no_systemd!();
 
         let unit = test_unit();
@@ -597,6 +603,7 @@ pub mod tests {
 
     #[test]
     fn test_add_process() {
+        skip_if_not_root!();
         skip_if_no_systemd!();
 
         let v2 = hierarchies::is_cgroup2_unified_mode();

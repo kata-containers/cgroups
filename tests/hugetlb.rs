@@ -11,10 +11,8 @@ use std::fs;
 
 #[test]
 fn test_hugetlb_sizes() {
-    // now only v2
-    if cgroups_rs::fs::hierarchies::is_cgroup2_unified_mode() {
-        return;
-    }
+    cgroups_rs::skip_if_not_root!();
+    cgroups_rs::skip_if_cgroups_v2!();
 
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("test_hugetlb_sizes")).unwrap();
