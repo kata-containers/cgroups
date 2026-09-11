@@ -13,6 +13,8 @@ use nix::unistd::{fork, ForkResult};
 
 #[test]
 fn create_and_delete_cgroup() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("create_and_delete_cgroup")).unwrap();
     {
@@ -27,6 +29,8 @@ fn create_and_delete_cgroup() {
 
 #[test]
 fn test_pids_current_is_zero() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("test_pids_current_is_zero")).unwrap();
     {
@@ -39,6 +43,8 @@ fn test_pids_current_is_zero() {
 
 #[test]
 fn test_pids_events_is_zero() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("test_pids_events_is_zero")).unwrap();
     {
@@ -52,6 +58,8 @@ fn test_pids_events_is_zero() {
 
 #[test]
 fn test_pid_events_is_not_zero() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("test_pid_events_is_not_zero")).unwrap();
     {

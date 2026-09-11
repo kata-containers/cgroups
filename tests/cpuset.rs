@@ -12,6 +12,8 @@ use cgroups_rs::CgroupPid;
 
 #[test]
 fn test_cpuset_memory_pressure_root_cg() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("test_cpuset_memory_pressure_root_cg")).unwrap();
     {
@@ -26,6 +28,8 @@ fn test_cpuset_memory_pressure_root_cg() {
 
 #[test]
 fn test_cpuset_set_cpus() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("test_cpuset_set_cpus")).unwrap();
     {
@@ -63,6 +67,8 @@ fn test_cpuset_set_cpus() {
 
 #[test]
 fn test_cpuset_set_cpus_add_task() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("test_cpuset_set_cpus_add_task/sub-dir")).unwrap();
 

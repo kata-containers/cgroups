@@ -20,6 +20,8 @@ use cgroups_rs::CgroupPid;
 
 #[test]
 fn test_procs_iterator_cgroup() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let pid = libc::pid_t::from(nix::unistd::getpid()) as u64;
     let cg = Cgroup::new(h, String::from("test_procs_iterator_cgroup")).unwrap();
@@ -44,9 +46,9 @@ fn test_procs_iterator_cgroup() {
 
 #[test]
 fn test_tasks_iterator_cgroup_v1() {
-    if cgroups_rs::fs::hierarchies::is_cgroup2_unified_mode() {
-        return;
-    }
+    cgroups_rs::skip_if_not_root!();
+    cgroups_rs::skip_if_cgroups_v2!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let pid = libc::pid_t::from(nix::unistd::getpid()) as u64;
     let cg = Cgroup::new(h, String::from("test_tasks_iterator_cgroup_v1")).unwrap();
@@ -71,9 +73,9 @@ fn test_tasks_iterator_cgroup_v1() {
 
 #[test]
 fn test_tasks_iterator_cgroup_threaded_mode() {
-    if !cgroups_rs::fs::hierarchies::is_cgroup2_unified_mode() {
-        return;
-    }
+    cgroups_rs::skip_if_not_root!();
+    cgroups_rs::skip_if_cgroups_v1!();
+
     let pid = libc::pid_t::from(nix::unistd::getpid()) as u64;
     let cg = Cgroup::new(
         cgroups_rs::fs::hierarchies::auto(),
@@ -165,9 +167,9 @@ fn test_tasks_iterator_cgroup_threaded_mode() {
 
 #[test]
 fn test_kill_cgroup() {
-    if !cgroups_rs::fs::hierarchies::is_cgroup2_unified_mode() {
-        return;
-    }
+    cgroups_rs::skip_if_not_root!();
+    cgroups_rs::skip_if_cgroups_v1!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("test_kill_cgroup")).unwrap();
     {
@@ -208,9 +210,9 @@ fn test_kill_cgroup() {
 
 #[test]
 fn test_cgroup_with_relative_paths() {
-    if cgroups_rs::fs::hierarchies::is_cgroup2_unified_mode() {
-        return;
-    }
+    cgroups_rs::skip_if_not_root!();
+    cgroups_rs::skip_if_cgroups_v2!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cgroup_root = h.root();
     let cgroup_name = "test_cgroup_with_relative_paths";
@@ -249,9 +251,9 @@ fn test_cgroup_with_relative_paths() {
 
 #[test]
 fn test_cgroup_v2() {
-    if !cgroups_rs::fs::hierarchies::is_cgroup2_unified_mode() {
-        return;
-    }
+    cgroups_rs::skip_if_not_root!();
+    cgroups_rs::skip_if_cgroups_v1!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("test_v2")).unwrap();
 

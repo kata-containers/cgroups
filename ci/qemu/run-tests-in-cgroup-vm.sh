@@ -74,6 +74,24 @@ ssh_options=(
     -o UserKnownHostsFile=/dev/null
 )
 
+collect_guest_journal() {
+    local output="${STATE_DIR}/guest-journal.log"
+    echo "Collecting guest journal: ${output}" >&2
+    ssh "${ssh_options[@]}" "${SSH_USER}@127.0.0.1" \
+        'sudo journalctl --boot --no-pager --output=short-precise' \
+        >"${output}" 2>&1 || true
+}
+
+on_exit() {
+    local result=$?
+    trap - EXIT
+    # Collect on success too: the workflow can subsequently turn an unexpected
+    # hierarchy skip into a failure after this script has exited successfully.
+    collect_guest_journal
+    exit "${result}"
+}
+trap on_exit EXIT
+
 echo "Guest hierarchy:"
 ssh "${ssh_options[@]}" "${SSH_USER}@127.0.0.1" \
     'set -e;
@@ -95,4 +113,4 @@ tar -czf - \
         'tar -xzf - -C /tmp/cgroups-rs-tests'
 
 ssh "${ssh_options[@]}" "${SSH_USER}@127.0.0.1" \
-    "bash /tmp/cgroups-rs-tests/run-test-binaries-in-guest.sh /tmp/cgroups-rs-tests ${HIERARCHY}"
+    "sudo bash /tmp/cgroups-rs-tests/run-test-binaries-in-guest.sh /tmp/cgroups-rs-tests ${HIERARCHY}"

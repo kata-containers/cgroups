@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
+#![doc = include_str!("../README.md")]
+
 pub mod fs;
 #[cfg(feature = "oci")]
 pub mod manager;
@@ -12,6 +14,46 @@ pub use manager::{FsManager, Manager, SystemdManager};
 pub mod stats;
 pub use stats::CgroupStats;
 pub mod systemd;
+
+/// Return early from a test that requires effective root privileges.
+///
+/// This is exported so integration tests can share the same privilege check.
+/// CI runners must independently verify that privilege elevation succeeded,
+/// because an early return is reported by Rust's test harness as a pass.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! skip_if_not_root {
+    () => {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping test: requires effective UID 0 (root)");
+            return;
+        }
+    };
+}
+
+/// Return early from a test that does not support a cgroup v1 hierarchy.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! skip_if_cgroups_v1 {
+    () => {
+        if !$crate::fs::hierarchies::is_cgroup2_unified_mode() {
+            eprintln!("Skipping test in cgroups v1 mode");
+            return;
+        }
+    };
+}
+
+/// Return early from a test that does not support a cgroup v2 hierarchy.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! skip_if_cgroups_v2 {
+    () => {
+        if $crate::fs::hierarchies::is_cgroup2_unified_mode() {
+            eprintln!("Skipping test in cgroups v2 mode");
+            return;
+        }
+    };
+}
 
 /// The maximum value for CPU shares in cgroups v1
 pub const CPU_SHARES_V1_MAX: u64 = 262144;

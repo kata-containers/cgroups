@@ -9,11 +9,12 @@ See `qemu/README.md` for the mechanics of the QEMU guest scripts.
 
 ## Test classification
 
-The host suite is **unprivileged**. It contains the current library tests for
-parsers and resource conversions, plus tests which use ordinary temporary
-files and Linux inotify. In particular, the `fs::events` tests exercise the
-real filesystem and inotify APIs, but do not read or modify the host's cgroup
-hierarchy.
+The host suite is **unprivileged**. It runs the complete library harness, but
+tests which require root call `skip_if_not_root!()` before touching the live
+system. It therefore includes parser and resource-conversion tests, plus tests
+which use ordinary temporary files and Linux inotify. In particular, the
+`fs::events` tests exercise the real filesystem and inotify APIs, but do not
+read or modify the host's cgroup hierarchy.
 
 The controlled-guest suite contains tests which depend on a specific live
 cgroup layout or need elevated privileges:
@@ -31,24 +32,34 @@ intentional hierarchy layout. Validated-path, recording-I/O contract,
 capability, and systematic error-propagation tests are planned for later
 refactoring phases; they are not part of the current host suite.
 
-The privileged suites are listed once in the Makefile as
-`PRIVILEGED_FILTERS` and are skipped by every plain `cargo test` run.
-New privileged tests must live in a dedicated `mod tests` so the substring
-filter keeps working.
+Each root requirement lives beside the test that needs it instead of being
+inferred from a module name. The macro checks the effective UID and prints a
+clear skip reason. Because Rust reports its early return as a passed test, both
+root runners verify EUID 0 before starting any test executable. The live
+mountinfo canary is ignored by default and runs explicitly in each controlled
+QEMU guest because its requirement is the guest environment rather than root.
 
 ## Where tests run
 
 | Tier | What runs | Where | Privileges |
 | --- | --- | --- | --- |
-| Unprivileged library | `make test-unit` (lib tests with `$(PRIVILEGED_FILTERS)` skips) | GitHub runner directly | none |
-| Controlled guest | three serialized lib suites, the `tests/` integration binaries, and live environment scenarios | QEMU guest | guest root, plus a delegated non-root service |
+| Unprivileged library | `make test-unit` (complete lib harness; root-gated tests return early) | GitHub runner directly | none |
+| Controlled guest | complete serialized lib harness, every `tests/` integration binary, the live canary, and dedicated environment scenarios | QEMU guest | guest root, plus a delegated non-root service |
 
-The QEMU job in `.github/workflows/bvt.yaml` therefore runs only the
-controlled-guest suites, while the separate `test-unit` job covers the
-unprivileged library tests on the GitHub runner. `make test` still runs the
-three serialized suites and the integration tests on a local machine under
-`sudo` for convenience, but CI never relies on privileges or cgroup layout
-provided by the GitHub runner host.
+The `test-binaries` job in `.github/workflows/bvt.yaml` compiles the static test
+executables once and publishes them as one artifact. All three QEMU hierarchy
+jobs consume that artifact, run the complete library harness as root with
+`--test-threads=1`, and then run every integration test binary. The separate
+`test-unit` job covers tests that can run on the unprivileged GitHub runner.
+`make test` follows the root execution model locally for convenience, but
+compilation remains unprivileged and CI never relies on privileges or cgroup
+layout provided by the GitHub runner host.
+
+Workflow-level concurrency cancels superseded runs for the same pull request,
+and Cargo registry, Git, and target directories are cached per job and Rust
+version. All jobs have explicit timeouts and the workflow token is limited to
+read-only repository contents. Third-party actions are pinned to full commit
+SHAs with their release major documented in comments.
 
 ## Backend and version matrix
 
@@ -62,9 +73,11 @@ Every guest runs both the cgroupfs and the systemd backend:
 
 Guests are selected with explicit systemd cgroup-hierarchy kernel arguments.
 Each guest must pass an exact mount-layout check before tests start, because
-several existing tests return early when their expected cgroup version is
-unavailable. A test that silently skips on the wrong hierarchy is detected by
-the `UNEXPECTED_SKIP` check in `bvt.yaml` and fails the job.
+version-specific tests use `skip_if_cgroups_v1!()` or
+`skip_if_cgroups_v2!()` when their supported hierarchy is unavailable. These
+macros emit a standard skip message. The `UNEXPECTED_SKIP` check in `bvt.yaml`
+rejects the opposite message for each guest, so a test expected to run cannot
+silently pass after detecting the wrong hierarchy.
 
 ## Guest environments and hierarchy checks
 
@@ -81,15 +94,24 @@ controlled environments:
 
 - A transient system service with `Delegate=yes` and `User=runner` executes
   the cgroupfs test as a non-root user. The test first moves itself into a
-  manager leaf, then creates a workload cgroup inside the delegated subtree,
-  attaches its own child process, and removes the workload cgroup.
+  manager leaf, enables the delegated `pids` controller, then creates a
+  workload cgroup, sets and reads back `pids.max`, attaches a child process,
+  and removes the workload cgroup.
 - A delegated root service unshares its cgroup and mount namespaces, replaces
   `/sys/fs/cgroup` with a namespace-rooted cgroup2 mount, and executes the
-  nested-layout test. The test verifies the namespace-relative membership and
-  mount root before creating and using a child cgroup.
+  nested-layout test. The test moves both itself and the waiting
+  `unshare --fork` parent out of the namespace root before enabling `pids`,
+  then performs the same limit and child-cgroup checks.
 
 These scenarios use kernel and systemd primitives directly; they do not infer
-or depend on a container runtime.
+or depend on a container runtime. Before starting either launcher, the guest
+runner checks the test harness's exact `--list` output so renaming one of these
+tests cannot silently remove its coverage.
+
+On a failed guest job, the diagnostics artifact contains the test harness log,
+the complete guest boot journal, the serial console log, and the QEMU log. The
+journal is collected after every guest run so it is also available when the
+workflow detects an unexpected hierarchy skip after the runner exits.
 
 ## Image pinning
 
@@ -101,7 +123,8 @@ The guest base image is pinned by URL, filename, and SHA-256 checksum in
 
 | Script | Responsibility |
 | --- | --- |
-| `qemu/build-static-test-binaries.sh` | Cross-compile portable test harnesses |
+| `discover-test-executables.sh` | Compile with Cargo's recording runner and record target kinds, names, and executable paths |
+| `qemu/build-static-test-binaries.sh` | Cross-compile and package the discovered portable test harnesses |
 | `qemu/boot-cgroup-test-vm.sh` | Configure, boot, and verify the requested QEMU cgroup layout |
 | `qemu/run-tests-in-cgroup-vm.sh` | Transfer tests and coordinate execution over SSH |
 | `qemu/run-test-binaries-in-guest.sh` | Execute controlled-guest test harnesses and environment scenarios |

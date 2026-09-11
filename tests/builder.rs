@@ -17,6 +17,8 @@ use cgroups_rs::fs::*;
 
 #[test]
 pub fn test_cpu_res_build() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg: Cgroup = CgroupBuilder::new("test_cpu_res_build")
         .cpu()
@@ -36,6 +38,8 @@ pub fn test_cpu_res_build() {
 
 #[test]
 pub fn test_memory_res_build() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg: Cgroup = CgroupBuilder::new("test_memory_res_build")
         .memory()
@@ -61,6 +65,8 @@ pub fn test_memory_res_build() {
 
 #[test]
 pub fn test_pid_res_build() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg: Cgroup = CgroupBuilder::new("test_pid_res_build")
         .pid()
@@ -81,6 +87,8 @@ pub fn test_pid_res_build() {
 #[test]
 #[ignore] // ignore this test for now, not sure why my kernel doesn't like it
 pub fn test_devices_res_build() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg: Cgroup = CgroupBuilder::new("test_devices_res_build")
         .devices()
@@ -108,11 +116,10 @@ pub fn test_devices_res_build() {
 
 #[test]
 pub fn test_network_res_build() {
+    cgroups_rs::skip_if_not_root!();
+    cgroups_rs::skip_if_cgroups_v2!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
-    if h.v2() {
-        // FIXME add cases for v2
-        return;
-    }
     let cg: Cgroup = CgroupBuilder::new("test_network_res_build")
         .network()
         .class_id(1337)
@@ -130,11 +137,10 @@ pub fn test_network_res_build() {
 
 #[test]
 pub fn test_hugepages_res_build() {
+    cgroups_rs::skip_if_not_root!();
+    cgroups_rs::skip_if_cgroups_v2!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
-    if h.v2() {
-        // FIXME add cases for v2
-        return;
-    }
     let cg: Cgroup = CgroupBuilder::new("test_hugepages_res_build")
         .hugepages()
         .limit("2MB".to_string(), 4 * 2 * 1024 * 1024)
@@ -153,6 +159,8 @@ pub fn test_hugepages_res_build() {
 #[test]
 #[ignore] // high version kernel not support `blkio.weight`
 pub fn test_blkio_res_build() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg: Cgroup = CgroupBuilder::new("test_blkio_res_build")
         .blkio()

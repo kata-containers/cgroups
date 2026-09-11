@@ -9,6 +9,8 @@ use cgroups_rs::fs::{Cgroup, Controller, MaxValue};
 
 #[test]
 fn test_disable_oom_killer() {
+    cgroups_rs::skip_if_not_root!();
+
     let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("test_disable_oom_killer")).unwrap();
     {
@@ -34,11 +36,10 @@ fn test_disable_oom_killer() {
 
 #[test]
 fn set_kmem_limit_v1() {
-    let h = cgroups_rs::fs::hierarchies::auto();
-    if h.v2() {
-        return;
-    }
+    cgroups_rs::skip_if_not_root!();
+    cgroups_rs::skip_if_cgroups_v2!();
 
+    let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("set_kmem_limit_v1")).unwrap();
     {
         let mem_controller: &MemController = cg.controller_of().unwrap();
@@ -49,11 +50,10 @@ fn set_kmem_limit_v1() {
 
 #[test]
 fn set_mem_v2() {
-    let h = cgroups_rs::fs::hierarchies::auto();
-    if !h.v2() {
-        return;
-    }
+    cgroups_rs::skip_if_not_root!();
+    cgroups_rs::skip_if_cgroups_v1!();
 
+    let h = cgroups_rs::fs::hierarchies::auto();
     let cg = Cgroup::new(h, String::from("set_mem_v2")).unwrap();
     {
         let mem_controller: &MemController = cg.controller_of().unwrap();
