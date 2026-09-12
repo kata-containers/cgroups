@@ -123,7 +123,7 @@ The guest base image is pinned by URL, filename, and SHA-256 checksum in
 
 | Script | Responsibility |
 | --- | --- |
-| `discover-test-executables.sh` | Compile with Cargo's recording runner and record target kinds, names, and executable paths |
+| `discover-test-executables.sh` | Compile without running tests and record Cargo-reported target kinds, names, and executable paths |
 | `qemu/build-static-test-binaries.sh` | Cross-compile and package the discovered portable test harnesses |
 | `qemu/boot-cgroup-test-vm.sh` | Configure, boot, and verify the requested QEMU cgroup layout |
 | `qemu/run-tests-in-cgroup-vm.sh` | Transfer tests and coordinate execution over SSH |

@@ -7,8 +7,6 @@
 //! This module represents the various control group hierarchies the Linux kernel supports.
 
 use std::fs;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::fs::blkio::BlkIoController;
@@ -80,32 +78,15 @@ fn parse_v1_mountinfo_line(line: &str) -> Option<Mountinfo> {
     parse_mountinfo_for_line(line).filter(|mount| mount.fs_type.0 == "cgroup")
 }
 
-/// Parse v1 cgroup mount lines from `/proc/self/mountinfo` fixture content.
-#[cfg(test)]
-pub(crate) fn mountinfo_file_str(input: &str) -> Vec<Mountinfo> {
+/// Parse v1 cgroup mount lines from `/proc/self/mountinfo` content.
+fn mountinfo_file_str(input: &str) -> Vec<Mountinfo> {
     input.lines().filter_map(parse_v1_mountinfo_line).collect()
-}
-
-/// Parses the provided mountinfo file.
-fn mountinfo_file(file: &mut File) -> Vec<Mountinfo> {
-    let mut mounts = Vec::new();
-    for line in BufReader::new(file).lines() {
-        match line {
-            Ok(line) => {
-                if let Some(mount) = parse_v1_mountinfo_line(&line) {
-                    mounts.push(mount);
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    mounts
 }
 
 /// Returns mounts information for the current process.
 pub fn mountinfo_self() -> Vec<Mountinfo> {
-    match File::open("/proc/self/mountinfo") {
-        Ok(mut file) => mountinfo_file(&mut file),
+    match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(data) => mountinfo_file_str(&data),
         Err(_) => vec![],
     }
 }
@@ -588,11 +569,8 @@ mod tests {
         }
     }
 
-    /// Whole-file scanner behavior: `mountinfo_file_str` keeps only lines
-    /// whose `fs_type` main type is `cgroup`, dropping `cgroup2`, `tmpfs`,
-    /// and anything else. This is the filtering the fixture headers used to
-    /// describe in prose but no test exercised, because the old scanner took
-    /// `&mut File` and could not be fed fixture text.
+    /// Keeps only lines whose filesystem type is cgroup v1, dropping cgroup2
+    /// and unrelated filesystems.
     #[test]
     fn test_mountinfo_file_str_filter() {
         let hybrid = "\

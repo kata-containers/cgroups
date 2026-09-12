@@ -5,12 +5,12 @@
 # `sudo cargo test` runs cargo itself as root, which leaves root-owned files in
 # target/ and ~/.cargo/registry; the next unprivileged build then fails with
 # "Permission denied" on target/debug/.cargo-build-lock. Discovering binaries
-# with Cargo's recording runner as the invoking user and sudo'ing only the
-# finished executable avoids that. The shared discovery script does not need
-# to parse test metadata from a separate JSON tool.
+# from Cargo's JSON artifact messages as the invoking user and sudo'ing only
+# the finished executable avoids that. Cargo's target metadata also lets us
+# reject selection flags that build the wrong kind.
 #
 # The compile and run phases are split so Cargo always runs unprivileged. The
-# shared recording runner writes each kind's manifest
+# shared discovery script writes each kind's manifest
 # (target/.test-binaries-<kind>), so concurrent lib/tests runs (e.g. `make -j`)
 # never clobber each other.
 #
