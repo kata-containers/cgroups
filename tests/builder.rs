@@ -5,6 +5,7 @@
 //
 
 //! Some simple tests covering the builder pattern for control groups.
+#![allow(deprecated)]
 use cgroups_rs::fs::blkio::*;
 use cgroups_rs::fs::cgroup_builder::*;
 use cgroups_rs::fs::cpu::*;

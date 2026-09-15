@@ -154,6 +154,14 @@ impl FsManager {
         Ok(controller)
     }
 
+    fn has_controller<'a, T>(&'a self) -> bool
+    where
+        &'a T: From<&'a Subsystem>,
+        T: Controller + ControllIdentifier + 'a,
+    {
+        self.cgroup.controller_of::<T>().is_some()
+    }
+
     fn set_cpuset(&self, linux_cpu: &LinuxCpu) -> Result<()> {
         let controller: &CpuSetController = self.controller()?;
 
@@ -212,7 +220,7 @@ impl FsManager {
         }
 
         if limit != 0 && swap_limit != 0 {
-            let memory = controller.memory_stat();
+            let memory = controller.try_memory_stat().map_err(Error::Cgroupfs)?;
             let limit_actual = memory.limit_in_bytes;
 
             // When update memory limit, we should adapt the write sequence
@@ -281,7 +289,7 @@ impl FsManager {
             return Ok(());
         }
 
-        let memory_stat = controller.memory_stat();
+        let memory_stat = controller.try_memory_stat().map_err(Error::Cgroupfs)?;
         let usage_actual = memory_stat.usage_in_bytes;
 
         // Rejecting: memory+swap limit <= usage
@@ -521,41 +529,57 @@ impl FsManager {
         Ok(())
     }
 
-    fn cpu_acct_stats(&self) -> Result<CpuAcctStats> {
-        let controller: &CpuAcctController = self.controller()?;
-        let cpu_acct = controller.cpuacct();
-
+    fn cpu_acct_stats_from(cpu_acct: &crate::fs::cpuacct::CpuAcct) -> CpuAcctStats {
         let user_usage = parse_value_from_tuples(&cpu_acct.stat, "user").unwrap_or_default();
-
         let system_usage = parse_value_from_tuples(&cpu_acct.stat, "system").unwrap_or_default();
-
-        let usage_percpu: Vec<u64> = cpu_acct
+        let usage_percpu = cpu_acct
             .usage_percpu
             .lines()
             .filter_map(|line| line.parse::<u64>().ok())
             .collect();
 
-        Ok(CpuAcctStats {
+        CpuAcctStats {
             user_usage,
             system_usage,
             total_usage: cpu_acct.usage,
             usage_percpu,
-        })
+        }
     }
 
+    #[allow(deprecated)]
+    fn cpu_acct_stats(&self) -> Result<CpuAcctStats> {
+        let controller: &CpuAcctController = self.controller()?;
+        Ok(Self::cpu_acct_stats_from(&controller.cpuacct()))
+    }
+
+    fn try_cpu_acct_stats(&self) -> Result<CpuAcctStats> {
+        let controller: &CpuAcctController = self.controller()?;
+        let cpu_acct = controller.try_cpuacct().map_err(Error::Cgroupfs)?;
+        Ok(Self::cpu_acct_stats_from(&cpu_acct))
+    }
+
+    #[allow(deprecated)]
     fn cpu_throttling_stats(&self) -> Result<CpuThrottlingStats> {
         let controller: &CpuController = self.controller()?;
-        let stats = controller.cpu().stat;
+        Ok(Self::cpu_throttling_stats_from(&controller.cpu().stat))
+    }
 
-        let periods = parse_value_from_tuples(&stats, "nr_periods").unwrap_or_default();
-        let throttled_periods = parse_value_from_tuples(&stats, "nr_throttled").unwrap_or_default();
-        let throttled_time = parse_value_from_tuples(&stats, "throttled_time").unwrap_or_default();
+    fn cpu_throttling_stats_from(stats: &str) -> CpuThrottlingStats {
+        let periods = parse_value_from_tuples(stats, "nr_periods").unwrap_or_default();
+        let throttled_periods = parse_value_from_tuples(stats, "nr_throttled").unwrap_or_default();
+        let throttled_time = parse_value_from_tuples(stats, "throttled_time").unwrap_or_default();
 
-        Ok(CpuThrottlingStats {
+        CpuThrottlingStats {
             periods,
             throttled_periods,
             throttled_time,
-        })
+        }
+    }
+
+    fn try_cpu_throttling_stats(&self) -> Result<CpuThrottlingStats> {
+        let controller: &CpuController = self.controller()?;
+        let cpu = controller.try_cpu().map_err(Error::Cgroupfs)?;
+        Ok(Self::cpu_throttling_stats_from(&cpu.stat))
     }
 
     fn cpu_cgroup_stats(&self) -> CpuCgroupStats {
@@ -565,100 +589,175 @@ impl FsManager {
         }
     }
 
+    fn try_cpu_cgroup_stats(&self) -> Result<CpuCgroupStats> {
+        Ok(CpuCgroupStats {
+            cpu_acct: if self.has_controller::<CpuAcctController>() {
+                Some(self.try_cpu_acct_stats()?)
+            } else {
+                None
+            },
+            cpu_throttling: if self.has_controller::<CpuController>() {
+                Some(self.try_cpu_throttling_stats()?)
+            } else {
+                None
+            },
+        })
+    }
+
+    fn memory_stats_from(usage: u64, max_usage: u64, limit: i64, fail_cnt: u64) -> MemoryStats {
+        MemoryStats {
+            usage,
+            max_usage,
+            limit,
+            fail_cnt,
+        }
+    }
+
+    #[allow(deprecated)]
     fn memory_stats(&self) -> Result<MemoryStats> {
         let controller: &MemController = self.controller()?;
         let memory_stats = controller.memory_stat();
 
-        Ok(MemoryStats {
-            usage: memory_stats.usage_in_bytes,
-            max_usage: memory_stats.max_usage_in_bytes,
-            limit: memory_stats.limit_in_bytes,
-            fail_cnt: memory_stats.fail_cnt,
-        })
+        Ok(Self::memory_stats_from(
+            memory_stats.usage_in_bytes,
+            memory_stats.max_usage_in_bytes,
+            memory_stats.limit_in_bytes,
+            memory_stats.fail_cnt,
+        ))
     }
 
+    #[allow(deprecated)]
     fn memory_swap_stats(&self) -> Result<MemoryStats> {
         let controller: &MemController = self.controller()?;
         let memory_swap_stats = controller.memswap();
 
-        Ok(MemoryStats {
-            usage: memory_swap_stats.usage_in_bytes,
-            max_usage: memory_swap_stats.max_usage_in_bytes,
-            limit: memory_swap_stats.limit_in_bytes,
-            fail_cnt: memory_swap_stats.fail_cnt,
-        })
+        Ok(Self::memory_stats_from(
+            memory_swap_stats.usage_in_bytes,
+            memory_swap_stats.max_usage_in_bytes,
+            memory_swap_stats.limit_in_bytes,
+            memory_swap_stats.fail_cnt,
+        ))
     }
 
+    #[allow(deprecated)]
     fn kernel_memory_stats(&self) -> Result<MemoryStats> {
         let controller: &MemController = self.controller()?;
         let kmem_stats = controller.kmem_stat();
 
-        Ok(MemoryStats {
-            usage: kmem_stats.usage_in_bytes,
-            max_usage: kmem_stats.max_usage_in_bytes,
-            limit: kmem_stats.limit_in_bytes,
-            fail_cnt: kmem_stats.fail_cnt,
-        })
+        Ok(Self::memory_stats_from(
+            kmem_stats.usage_in_bytes,
+            kmem_stats.max_usage_in_bytes,
+            kmem_stats.limit_in_bytes,
+            kmem_stats.fail_cnt,
+        ))
     }
 
-    fn memory_cgroup_stats(&self) -> MemoryCgroupStats {
-        let memory = self.memory_stats().ok();
-        let memory_swap = self.memory_swap_stats().ok();
-        let kernel_memory = self.kernel_memory_stats().ok();
+    fn populate_memory_details(
+        memory: &mut MemoryCgroupStats,
+        memstats: &crate::fs::memory::Memory,
+    ) {
+        memory.use_hierarchy = memstats.use_hierarchy == 1;
+        memory.cache = memstats.stat.cache;
+        memory.rss = memstats.stat.rss;
+        memory.rss_huge = memstats.stat.rss_huge;
+        memory.shmem = memstats.stat.shmem;
+        memory.mapped_file = memstats.stat.mapped_file;
+        memory.dirty = memstats.stat.dirty;
+        memory.writeback = memstats.stat.writeback;
+        memory.swap = memstats.stat.swap;
+        memory.pgpgin = memstats.stat.pgpgin;
+        memory.pgpgout = memstats.stat.pgpgout;
+        memory.pgfault = memstats.stat.pgfault;
+        memory.pgmajfault = memstats.stat.pgmajfault;
+        memory.inactive_anon = memstats.stat.inactive_anon;
+        memory.active_anon = memstats.stat.active_anon;
+        memory.inactive_file = memstats.stat.inactive_file;
+        memory.active_file = memstats.stat.active_file;
+        memory.unevictable = memstats.stat.unevictable;
+        memory.hierarchical_memory_limit = memstats.stat.hierarchical_memory_limit;
+        memory.hierarchical_memsw_limit = memstats.stat.hierarchical_memsw_limit;
+        memory.total_cache = memstats.stat.total_cache;
+        memory.total_rss = memstats.stat.total_rss;
+        memory.total_rss_huge = memstats.stat.total_rss_huge;
+        memory.total_shmem = memstats.stat.total_shmem;
+        memory.total_mapped_file = memstats.stat.total_mapped_file;
+        memory.total_dirty = memstats.stat.total_dirty;
+        memory.total_writeback = memstats.stat.total_writeback;
+        memory.total_swap = memstats.stat.total_swap;
+        memory.total_pgpgin = memstats.stat.total_pgpgin;
+        memory.total_pgpgout = memstats.stat.total_pgpgout;
+        memory.total_pgfault = memstats.stat.total_pgfault;
+        memory.total_pgmajfault = memstats.stat.total_pgmajfault;
+        memory.total_inactive_anon = memstats.stat.total_inactive_anon;
+        memory.total_active_anon = memstats.stat.total_active_anon;
+        memory.total_inactive_file = memstats.stat.total_inactive_file;
+        memory.total_active_file = memstats.stat.total_active_file;
+        memory.total_unevictable = memstats.stat.total_unevictable;
+    }
 
+    #[allow(deprecated)]
+    fn memory_cgroup_stats(&self) -> MemoryCgroupStats {
         let mut memory = MemoryCgroupStats {
-            memory,
+            memory: self.memory_stats().ok(),
+            memory_swap: self.memory_swap_stats().ok(),
+            kernel_memory: self.kernel_memory_stats().ok(),
+            ..Default::default()
+        };
+
+        if let Some(memstats) = self
+            .controller::<MemController>()
+            .ok()
+            .map(|controller| controller.memory_stat())
+        {
+            Self::populate_memory_details(&mut memory, &memstats);
+        }
+        memory
+    }
+
+    fn try_memory_cgroup_stats(&self) -> Result<MemoryCgroupStats> {
+        if !self.has_controller::<MemController>() {
+            return Ok(MemoryCgroupStats::default());
+        }
+
+        let controller: &MemController = self.controller()?;
+        let memstats = controller.try_memory_stat().map_err(Error::Cgroupfs)?;
+        let memory_swap = match controller.try_memswap() {
+            Ok(stats) => Some(Self::memory_stats_from(
+                stats.usage_in_bytes,
+                stats.max_usage_in_bytes,
+                stats.limit_in_bytes,
+                stats.fail_cnt,
+            )),
+            Err(error) if error.is_not_found() => None,
+            Err(error) => return Err(Error::Cgroupfs(error)),
+        };
+        let kernel_memory = if self.v2() {
+            None
+        } else {
+            match controller.try_kmem_stat() {
+                Ok(stats) => Some(Self::memory_stats_from(
+                    stats.usage_in_bytes,
+                    stats.max_usage_in_bytes,
+                    stats.limit_in_bytes,
+                    stats.fail_cnt,
+                )),
+                Err(error) if error.is_not_found() => None,
+                Err(error) => return Err(Error::Cgroupfs(error)),
+            }
+        };
+        let mut memory = MemoryCgroupStats {
+            memory: Some(Self::memory_stats_from(
+                memstats.usage_in_bytes,
+                memstats.max_usage_in_bytes,
+                memstats.limit_in_bytes,
+                memstats.fail_cnt,
+            )),
             memory_swap,
             kernel_memory,
             ..Default::default()
         };
-
-        let memory_stats = self
-            .controller::<MemController>()
-            .map(|c| c.memory_stat())
-            .ok();
-        if let Some(memstats) = &memory_stats {
-            memory.use_hierarchy = memstats.use_hierarchy == 1;
-            // Copy items from memstats.stat
-            memory.cache = memstats.stat.cache;
-            memory.rss = memstats.stat.rss;
-            memory.rss_huge = memstats.stat.rss_huge;
-            memory.shmem = memstats.stat.shmem;
-            memory.mapped_file = memstats.stat.mapped_file;
-            memory.dirty = memstats.stat.dirty;
-            memory.writeback = memstats.stat.writeback;
-            memory.swap = memstats.stat.swap;
-            memory.pgpgin = memstats.stat.pgpgin;
-            memory.pgpgout = memstats.stat.pgpgout;
-            memory.pgfault = memstats.stat.pgfault;
-            memory.pgmajfault = memstats.stat.pgmajfault;
-            memory.inactive_anon = memstats.stat.inactive_anon;
-            memory.active_anon = memstats.stat.active_anon;
-            memory.inactive_file = memstats.stat.inactive_file;
-            memory.active_file = memstats.stat.active_file;
-            memory.unevictable = memstats.stat.unevictable;
-            memory.hierarchical_memory_limit = memstats.stat.hierarchical_memory_limit;
-            memory.hierarchical_memsw_limit = memstats.stat.hierarchical_memsw_limit;
-            memory.total_cache = memstats.stat.total_cache;
-            memory.total_rss = memstats.stat.total_rss;
-            memory.total_rss_huge = memstats.stat.total_rss_huge;
-            memory.total_shmem = memstats.stat.total_shmem;
-            memory.total_mapped_file = memstats.stat.total_mapped_file;
-            memory.total_dirty = memstats.stat.total_dirty;
-            memory.total_writeback = memstats.stat.total_writeback;
-            memory.total_swap = memstats.stat.total_swap;
-            memory.total_pgpgin = memstats.stat.total_pgpgin;
-            memory.total_pgpgout = memstats.stat.total_pgpgout;
-            memory.total_pgfault = memstats.stat.total_pgfault;
-            memory.total_pgmajfault = memstats.stat.total_pgmajfault;
-            memory.total_inactive_anon = memstats.stat.total_inactive_anon;
-            memory.total_active_anon = memstats.stat.total_active_anon;
-            memory.total_inactive_file = memstats.stat.total_inactive_file;
-            memory.total_active_file = memstats.stat.total_active_file;
-            memory.total_unevictable = memstats.stat.total_unevictable;
-        }
-
-        memory
+        Self::populate_memory_details(&mut memory, &memstats);
+        Ok(memory)
     }
 
     fn pids_cgroup_stats(&self) -> PidsCgroupStats {
@@ -678,20 +777,30 @@ impl FsManager {
         PidsCgroupStats { current, limit }
     }
 
-    fn blkio_stats_v1(&self) -> Result<BlkioCgroupStats> {
-        let controller: &BlkIoController = self.controller()?;
-        let blkio = controller.blkio();
+    fn try_pids_cgroup_stats(&self) -> Result<PidsCgroupStats> {
+        if !self.has_controller::<PidController>() {
+            return Ok(PidsCgroupStats::default());
+        }
+        let controller: &PidController = self.controller()?;
+        let current = controller.get_pid_current().map_err(Error::Cgroupfs)?;
+        let limit = match controller.get_pid_max().map_err(Error::Cgroupfs)? {
+            MaxValue::Value(limit) => limit,
+            MaxValue::Max => 0,
+        };
+        Ok(PidsCgroupStats { current, limit })
+    }
 
+    fn blkio_stats_v1_from(blkio: &crate::fs::blkio::BlkIo) -> BlkioCgroupStats {
         if blkio.io_serviced_recursive.is_empty() {
-            Ok(BlkioCgroupStats {
+            BlkioCgroupStats {
                 io_service_bytes_recursive: BlkioStat::from_io_services(
                     &blkio.throttle.io_service_bytes,
                 ),
                 io_serviced_recursive: BlkioStat::from_io_services(&blkio.throttle.io_serviced),
                 ..Default::default()
-            })
+            }
         } else {
-            Ok(BlkioCgroupStats {
+            BlkioCgroupStats {
                 io_service_bytes_recursive: BlkioStat::from_io_services(
                     &blkio.io_service_bytes_recursive,
                 ),
@@ -704,18 +813,39 @@ impl FsManager {
                 io_merged_recursive: BlkioStat::from_io_services(&blkio.io_merged_recursive),
                 io_time_recursive: BlkioStat::from_blk_io_data(&blkio.time_recursive),
                 sectors_recursive: BlkioStat::from_blk_io_data(&blkio.sectors_recursive),
-            })
+            }
         }
     }
 
-    fn blkio_stats_v2(&self) -> Result<BlkioCgroupStats> {
-        let controller: &BlkIoController = self.controller()?;
-        let blkio = controller.blkio();
-
-        Ok(BlkioCgroupStats {
+    fn blkio_stats_v2_from(blkio: &crate::fs::blkio::BlkIo) -> BlkioCgroupStats {
+        BlkioCgroupStats {
             io_service_bytes_recursive: BlkioStat::from_io_stats(&blkio.io_stat),
             ..Default::default()
-        })
+        }
+    }
+
+    #[allow(deprecated)]
+    fn blkio_stats_v1(&self) -> Result<BlkioCgroupStats> {
+        let controller: &BlkIoController = self.controller()?;
+        Ok(Self::blkio_stats_v1_from(&controller.blkio()))
+    }
+
+    #[allow(deprecated)]
+    fn blkio_stats_v2(&self) -> Result<BlkioCgroupStats> {
+        let controller: &BlkIoController = self.controller()?;
+        Ok(Self::blkio_stats_v2_from(&controller.blkio()))
+    }
+
+    fn try_blkio_stats_v1(&self) -> Result<BlkioCgroupStats> {
+        let controller: &BlkIoController = self.controller()?;
+        let blkio = controller.try_blkio().map_err(Error::Cgroupfs)?;
+        Ok(Self::blkio_stats_v1_from(&blkio))
+    }
+
+    fn try_blkio_stats_v2(&self) -> Result<BlkioCgroupStats> {
+        let controller: &BlkIoController = self.controller()?;
+        let blkio = controller.try_blkio().map_err(Error::Cgroupfs)?;
+        Ok(Self::blkio_stats_v2_from(&blkio))
     }
 
     fn blkio_cgroup_stats(&self) -> BlkioCgroupStats {
@@ -725,6 +855,17 @@ impl FsManager {
             self.blkio_stats_v1()
         }
         .unwrap_or_default()
+    }
+
+    fn try_blkio_cgroup_stats(&self) -> Result<BlkioCgroupStats> {
+        if !self.has_controller::<BlkIoController>() {
+            return Ok(BlkioCgroupStats::default());
+        }
+        if self.v2() {
+            self.try_blkio_stats_v2()
+        } else {
+            self.try_blkio_stats_v1()
+        }
     }
 
     fn huge_tlb_cgroup_stats(&self) -> HugeTlbCgroupStats {
@@ -748,6 +889,27 @@ impl FsManager {
                 };
 
                 (s.to_string(), stat)
+            })
+            .collect()
+    }
+
+    fn try_huge_tlb_cgroup_stats(&self) -> Result<HugeTlbCgroupStats> {
+        if !self.has_controller::<HugeTlbController>() {
+            return Ok(HugeTlbCgroupStats::default());
+        }
+        let controller: &HugeTlbController = self.controller()?;
+        controller
+            .get_sizes()
+            .iter()
+            .map(|size| {
+                let stat = HugeTlbStat {
+                    usage: controller.usage_in_bytes(size).map_err(Error::Cgroupfs)?,
+                    max_usage: controller
+                        .max_usage_in_bytes(size)
+                        .map_err(Error::Cgroupfs)?,
+                    fail_cnt: controller.failcnt(size).map_err(Error::Cgroupfs)?,
+                };
+                Ok((size.to_string(), stat))
             })
             .collect()
     }
@@ -775,10 +937,10 @@ impl Manager for FsManager {
     }
 
     fn pids(&self) -> Result<Vec<CgroupPid>> {
-        Ok(self
-            .controller::<MemController>()
+        self.controller::<MemController>()
             .map_err(Error::Cgroupfs)?
-            .tasks())
+            .try_tasks()
+            .map_err(Error::Cgroupfs)
     }
 
     fn freeze(&self, state: FreezerState) -> Result<()> {
@@ -802,12 +964,14 @@ impl Manager for FsManager {
         // cgroup to the root cgroup. Otherwise, we'll have a "Device or
         // resource busy" error.
         if self.v2() {
-            for tgid in self.cgroup.procs() {
-                // Ignore all errors as long as the cgroup is deleted.
-                let _ = self.cgroup.remove_task_by_tgid(tgid);
+            if let Ok(procs) = self.cgroup.try_procs() {
+                for tgid in procs {
+                    // Ignore all errors as long as the cgroup is deleted.
+                    let _ = self.cgroup.remove_task_by_tgid(tgid);
+                }
             }
-        } else {
-            for pid in self.cgroup.tasks() {
+        } else if let Ok(tasks) = self.cgroup.try_tasks() {
+            for pid in tasks {
                 // Ditto.
                 let _ = self.cgroup.remove_task(pid);
             }
@@ -888,6 +1052,16 @@ impl Manager for FsManager {
             blkio: self.blkio_cgroup_stats(),
             hugetlb: self.huge_tlb_cgroup_stats(),
         }
+    }
+
+    fn try_stats(&self) -> Result<CgroupStats> {
+        Ok(CgroupStats {
+            cpu: self.try_cpu_cgroup_stats()?,
+            memory: self.try_memory_cgroup_stats()?,
+            pids: self.try_pids_cgroup_stats()?,
+            blkio: self.try_blkio_cgroup_stats()?,
+            hugetlb: self.try_huge_tlb_cgroup_stats()?,
+        })
     }
 
     fn paths(&self) -> &HashMap<String, String> {
@@ -1410,8 +1584,8 @@ mod tests {
             .unwrap();
         run_set_resources(linux_resources, |manager| {
             let controller: &MemController = manager.controller().unwrap();
-            let memory_stat = controller.memory_stat();
-            let memory_swap_stat = controller.memswap();
+            let memory_stat = controller.try_memory_stat().unwrap();
+            let memory_swap_stat = controller.try_memswap().unwrap();
 
             assert_eq!(memory_stat.limit_in_bytes, MEMORY_512M);
             assert_eq!(memory_swap_stat.limit_in_bytes, MEMORY_512M);
@@ -1438,8 +1612,8 @@ mod tests {
             .unwrap();
         run_set_resources(linux_resources, |manager| {
             let controller: &MemController = manager.controller().unwrap();
-            let memory_stat = controller.memory_stat();
-            let memory_swap_stat = controller.memswap();
+            let memory_stat = controller.try_memory_stat().unwrap();
+            let memory_swap_stat = controller.try_memswap().unwrap();
 
             assert_eq!(memory_stat.limit_in_bytes, MEMORY_512M);
             assert_eq!(memory_swap_stat.limit_in_bytes, MEMORY_512M);

@@ -16,9 +16,10 @@ use std::path::PathBuf;
 use crate::fs::error::ErrorKind::*;
 use crate::fs::error::*;
 
-use crate::fs::{read_string_from, read_u64_from};
+use crate::fs::{optional_read, read_string_from, read_u64_from};
 use crate::fs::{
     ControllIdentifier, ControllerInternal, Controllers, CpuResources, Resources, Subsystem,
+    UpdateTracker,
 };
 
 /// A controller that allows controlling the `cpuset` subsystem of a Cgroup.
@@ -33,6 +34,7 @@ pub struct CpuSetController {
 }
 
 /// The current state of the `cpuset` controller for this control group.
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CpuSet {
     /// If true, no other control groups can share the CPUs listed in the `cpus` field.
@@ -110,9 +112,10 @@ impl ControllerInternal for CpuSetController {
     fn apply(&self, res: &Resources) -> Result<()> {
         // get the resources that apply to this controller
         let res: &CpuResources = &res.cpu;
+        let mut tracker = UpdateTracker::new();
 
-        update!(self, set_cpus, res.cpus.as_ref());
-        update!(self, set_mems, res.mems.as_ref());
+        tracker.step_opt("cpuset.cpus", res.cpus.as_ref(), |cpus| self.set_cpus(cpus))?;
+        tracker.step_opt("cpuset.mems", res.mems.as_ref(), |mems| self.set_mems(mems))?;
 
         Ok(())
     }
@@ -264,91 +267,176 @@ impl CpuSetController {
 
     /// Returns the statistics gathered by the kernel for this control group. See the struct for
     /// more information on what information this entails.
+    #[deprecated(note = "use `try_cpuset` instead")]
     pub fn cpuset(&self) -> CpuSet {
         CpuSet {
+            cpu_exclusive: self
+                .open_path("cpuset.cpu_exclusive", false)
+                .and_then(read_u64_from)
+                .map(|x| x == 1)
+                .unwrap_or(false),
+            cpus: self
+                .open_path("cpuset.cpus", false)
+                .and_then(read_string_from)
+                .and_then(parse_range)
+                .unwrap_or_default(),
+            effective_cpus: self
+                .open_path("cpuset.effective_cpus", false)
+                .and_then(read_string_from)
+                .and_then(parse_range)
+                .unwrap_or_default(),
+            effective_mems: self
+                .open_path("cpuset.effective_mems", false)
+                .and_then(read_string_from)
+                .and_then(parse_range)
+                .unwrap_or_default(),
+            mem_exclusive: self
+                .open_path("cpuset.mem_exclusive", false)
+                .and_then(read_u64_from)
+                .map(|x| x == 1)
+                .unwrap_or(false),
+            mem_hardwall: self
+                .open_path("cpuset.mem_hardwall", false)
+                .and_then(read_u64_from)
+                .map(|x| x == 1)
+                .unwrap_or(false),
+            memory_migrate: self
+                .open_path("cpuset.memory_migrate", false)
+                .and_then(read_u64_from)
+                .map(|x| x == 1)
+                .unwrap_or(false),
+            memory_pressure: self
+                .open_path("cpuset.memory_pressure", false)
+                .and_then(read_u64_from)
+                .unwrap_or(0),
+            memory_pressure_enabled: self
+                .open_path("cpuset.memory_pressure_enabled", false)
+                .and_then(read_u64_from)
+                .map(|x| x == 1)
+                .ok(),
+            memory_spread_page: self
+                .open_path("cpuset.memory_spread_page", false)
+                .and_then(read_u64_from)
+                .map(|x| x == 1)
+                .unwrap_or(false),
+            memory_spread_slab: self
+                .open_path("cpuset.memory_spread_slab", false)
+                .and_then(read_u64_from)
+                .map(|x| x == 1)
+                .unwrap_or(false),
+            mems: self
+                .open_path("cpuset.mems", false)
+                .and_then(read_string_from)
+                .and_then(parse_range)
+                .unwrap_or_default(),
+            sched_load_balance: self
+                .open_path("cpuset.sched_load_balance", false)
+                .and_then(read_u64_from)
+                .map(|x| x == 1)
+                .unwrap_or(false),
+            sched_relax_domain_level: self
+                .open_path("cpuset.sched_relax_domain_level", false)
+                .and_then(read_u64_from)
+                .unwrap_or(0),
+        }
+    }
+
+    /// Returns the statistics gathered by the kernel for this control group, or an error if reading failed.
+    pub fn try_cpuset(&self) -> Result<CpuSet> {
+        Ok(CpuSet {
             cpu_exclusive: {
-                self.open_path("cpuset.cpu_exclusive", false)
-                    .and_then(read_u64_from)
-                    .map(|x| x == 1)
-                    .unwrap_or(false)
+                optional_read(
+                    self.open_path("cpuset.cpu_exclusive", false)
+                        .and_then(read_u64_from)
+                        .map(|x| x == 1),
+                )?
             },
             cpus: {
                 self.open_path("cpuset.cpus", false)
                     .and_then(read_string_from)
-                    .and_then(parse_range)
-                    .unwrap_or_default()
+                    .and_then(parse_range)?
             },
             effective_cpus: {
-                self.open_path("cpuset.effective_cpus", false)
-                    .and_then(read_string_from)
-                    .and_then(parse_range)
-                    .unwrap_or_default()
+                optional_read(
+                    self.open_path("cpuset.effective_cpus", false)
+                        .and_then(read_string_from)
+                        .and_then(parse_range),
+                )?
             },
             effective_mems: {
-                self.open_path("cpuset.effective_mems", false)
-                    .and_then(read_string_from)
-                    .and_then(parse_range)
-                    .unwrap_or_default()
+                optional_read(
+                    self.open_path("cpuset.effective_mems", false)
+                        .and_then(read_string_from)
+                        .and_then(parse_range),
+                )?
             },
             mem_exclusive: {
-                self.open_path("cpuset.mem_exclusive", false)
-                    .and_then(read_u64_from)
-                    .map(|x| x == 1)
-                    .unwrap_or(false)
+                optional_read(
+                    self.open_path("cpuset.mem_exclusive", false)
+                        .and_then(read_u64_from)
+                        .map(|x| x == 1),
+                )?
             },
             mem_hardwall: {
-                self.open_path("cpuset.mem_hardwall", false)
-                    .and_then(read_u64_from)
-                    .map(|x| x == 1)
-                    .unwrap_or(false)
+                optional_read(
+                    self.open_path("cpuset.mem_hardwall", false)
+                        .and_then(read_u64_from)
+                        .map(|x| x == 1),
+                )?
             },
             memory_migrate: {
-                self.open_path("cpuset.memory_migrate", false)
-                    .and_then(read_u64_from)
-                    .map(|x| x == 1)
-                    .unwrap_or(false)
+                optional_read(
+                    self.open_path("cpuset.memory_migrate", false)
+                        .and_then(read_u64_from)
+                        .map(|x| x == 1),
+                )?
             },
             memory_pressure: {
-                self.open_path("cpuset.memory_pressure", false)
-                    .and_then(read_u64_from)
-                    .unwrap_or(0)
+                optional_read(
+                    self.open_path("cpuset.memory_pressure", false)
+                        .and_then(read_u64_from),
+                )?
             },
             memory_pressure_enabled: {
-                self.open_path("cpuset.memory_pressure_enabled", false)
-                    .and_then(read_u64_from)
-                    .map(|x| x == 1)
-                    .ok()
+                optional_read(
+                    self.open_path("cpuset.memory_pressure_enabled", false)
+                        .and_then(read_u64_from)
+                        .map(|x| Some(x == 1)),
+                )?
             },
             memory_spread_page: {
-                self.open_path("cpuset.memory_spread_page", false)
-                    .and_then(read_u64_from)
-                    .map(|x| x == 1)
-                    .unwrap_or(false)
+                optional_read(
+                    self.open_path("cpuset.memory_spread_page", false)
+                        .and_then(read_u64_from)
+                        .map(|x| x == 1),
+                )?
             },
             memory_spread_slab: {
-                self.open_path("cpuset.memory_spread_slab", false)
-                    .and_then(read_u64_from)
-                    .map(|x| x == 1)
-                    .unwrap_or(false)
+                optional_read(
+                    self.open_path("cpuset.memory_spread_slab", false)
+                        .and_then(read_u64_from)
+                        .map(|x| x == 1),
+                )?
             },
             mems: {
                 self.open_path("cpuset.mems", false)
                     .and_then(read_string_from)
-                    .and_then(parse_range)
-                    .unwrap_or_default()
+                    .and_then(parse_range)?
             },
             sched_load_balance: {
-                self.open_path("cpuset.sched_load_balance", false)
-                    .and_then(read_u64_from)
-                    .map(|x| x == 1)
-                    .unwrap_or(false)
+                optional_read(
+                    self.open_path("cpuset.sched_load_balance", false)
+                        .and_then(read_u64_from)
+                        .map(|x| x == 1),
+                )?
             },
             sched_relax_domain_level: {
-                self.open_path("cpuset.sched_relax_domain_level", false)
-                    .and_then(read_u64_from)
-                    .unwrap_or(0)
+                optional_read(
+                    self.open_path("cpuset.sched_relax_domain_level", false)
+                        .and_then(read_u64_from),
+                )?
             },
-        }
+        })
     }
 
     /// Control whether the CPUs selected via `set_cpus()` should be exclusive to this control
@@ -591,7 +679,10 @@ impl CpuSetController {
 
 #[cfg(test)]
 mod tests {
-    use crate::fs::cpuset;
+    use crate::fs::cpuset::{self, CpuSetController};
+    use crate::fs::error::ErrorKind;
+    use std::fs;
+    use std::path::PathBuf;
     #[test]
     fn test_parse_range() {
         let test_cases = vec![
@@ -617,5 +708,30 @@ mod tests {
             assert!(range.is_ok());
             assert_eq!(range.unwrap(), expecteds[i]);
         }
+    }
+
+    #[test]
+    fn test_try_cpuset_defaults_only_missing_optional_files() {
+        let path = std::env::temp_dir().join(format!(
+            "cgroups-cpuset-try-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("cpuset.cpus"), "0-1\n").unwrap();
+        fs::write(path.join("cpuset.mems"), "0\n").unwrap();
+        let controller = CpuSetController::new(path.clone(), PathBuf::new(), true);
+
+        let stats = controller.try_cpuset().unwrap();
+        assert_eq!(stats.cpus, vec![(0, 1)]);
+        assert!(!stats.cpu_exclusive);
+
+        fs::write(path.join("cpuset.cpu_exclusive"), "invalid\n").unwrap();
+        assert_eq!(
+            controller.try_cpuset().unwrap_err().kind(),
+            &ErrorKind::ParseError
+        );
+
+        fs::remove_dir_all(path).unwrap();
     }
 }

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use crate::fs::error::ErrorKind::*;
 use crate::fs::error::*;
 
-use crate::fs::{read_string_from, read_u64_from};
+use crate::fs::{optional_read, read_string_from, read_u64_from};
 use crate::fs::{ControllIdentifier, ControllerInternal, Controllers, Resources, Subsystem};
 
 /// A controller that allows controlling the `cpuacct` subsystem of a Cgroup.
@@ -27,6 +27,7 @@ pub struct CpuAcctController {
 }
 
 /// Represents the statistics retrieved from the control group.
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CpuAcct {
     /// Divides the time used by the tasks into `user` time and `system` time.
@@ -108,6 +109,7 @@ impl CpuAcctController {
     }
 
     /// Gathers the statistics that are available in the control group into a `CpuAcct` structure.
+    #[deprecated(note = "use `try_cpuacct` instead")]
     pub fn cpuacct(&self) -> CpuAcct {
         CpuAcct {
             stat: self
@@ -145,6 +147,41 @@ impl CpuAcctController {
         }
     }
 
+    /// Gathers the statistics that are available in the control group into a `CpuAcct` structure, or an error if reading failed.
+    pub fn try_cpuacct(&self) -> Result<CpuAcct> {
+        Ok(CpuAcct {
+            stat: self
+                .open_path("cpuacct.stat", false)
+                .and_then(read_string_from)?,
+            usage: self
+                .open_path("cpuacct.usage", false)
+                .and_then(read_u64_from)?,
+            usage_all: optional_read(
+                self.open_path("cpuacct.usage_all", false)
+                    .and_then(read_string_from),
+            )?,
+            usage_percpu: self
+                .open_path("cpuacct.usage_percpu", false)
+                .and_then(read_string_from)?,
+            usage_percpu_sys: optional_read(
+                self.open_path("cpuacct.usage_percpu_sys", false)
+                    .and_then(read_string_from),
+            )?,
+            usage_percpu_user: optional_read(
+                self.open_path("cpuacct.usage_percpu_user", false)
+                    .and_then(read_string_from),
+            )?,
+            usage_sys: optional_read(
+                self.open_path("cpuacct.usage_sys", false)
+                    .and_then(read_u64_from),
+            )?,
+            usage_user: optional_read(
+                self.open_path("cpuacct.usage_user", false)
+                    .and_then(read_u64_from),
+            )?,
+        })
+    }
+
     /// Reset the statistics the kernel has gathered about the control group.
     pub fn reset(&self) -> Result<()> {
         self.open_path("cpuacct.usage", true).and_then(|mut file| {
@@ -152,5 +189,51 @@ impl CpuAcctController {
                 Error::with_cause(WriteFailed("cpuacct.usage".to_string(), "0".to_string()), e)
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "cgroups-cpuacct-try-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_try_cpuacct_defaults_only_missing_optional_files() {
+        let dir = TestDir::new();
+        fs::write(dir.0.join("cpuacct.stat"), "user 1\nsystem 2\n").unwrap();
+        fs::write(dir.0.join("cpuacct.usage"), "3\n").unwrap();
+        fs::write(dir.0.join("cpuacct.usage_percpu"), "1 2\n").unwrap();
+        let controller = CpuAcctController::new(dir.0.clone(), dir.0.clone());
+
+        let stats = controller.try_cpuacct().unwrap();
+        assert_eq!(stats.usage, 3);
+        assert_eq!(stats.usage_sys, 0);
+        assert!(stats.usage_all.is_empty());
+
+        fs::write(dir.0.join("cpuacct.usage_sys"), "not-a-number\n").unwrap();
+        assert_eq!(
+            controller.try_cpuacct().unwrap_err().kind(),
+            &ErrorKind::ParseError
+        );
     }
 }

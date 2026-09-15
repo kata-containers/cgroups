@@ -68,6 +68,14 @@ pub trait Manager: Send + Sync {
     /// Get cgroup stats.
     fn stats(&self) -> CgroupStats;
 
+    /// Get cgroup stats while preserving controller read failures.
+    ///
+    /// The default keeps existing third-party `Manager` implementations
+    /// source-compatible. Built-in managers override it with fallible reads.
+    fn try_stats(&self) -> Result<CgroupStats> {
+        Ok(self.stats())
+    }
+
     /// Get the mappings of subsystems to their relative path. The full
     /// path would be something like "{mountpoint}/{relative_path}". The
     /// mappings of mountpoints see "mounts()".

@@ -428,9 +428,17 @@ impl Cgroup {
 
     /// Apply a set of resource limits to the control group.
     pub fn apply(&self, res: &Resources) -> Result<()> {
-        self.subsystems
-            .iter()
-            .try_fold((), |_, e| e.to_controller().apply(res))
+        let mut all_succeeded = Vec::new();
+        for subsystem in &self.subsystems {
+            let ctrl = subsystem.to_controller();
+            if let Err(e) = ctrl.apply(res) {
+                all_succeeded.extend(e.succeeded().iter().cloned());
+                return Err(e.with_succeeded(all_succeeded));
+            }
+            let ctrl_name = format!("{:?}", ctrl.control_type());
+            all_succeeded.push(ctrl_name);
+        }
+        Ok(())
     }
 
     /// Retrieve a container based on type inference.
@@ -631,58 +639,104 @@ impl Cgroup {
             .try_for_each(|sub| sub.to_controller().set_release_agent(path))
     }
 
-    /// Returns an Iterator that can be used to iterate over the procs that are currently in the
-    /// control group.
+    /// Returns the procs that are currently in the control group.
+    #[deprecated(note = "use `try_procs` instead")]
+    #[allow(deprecated)]
     pub fn procs(&self) -> Vec<CgroupPid> {
+        let mut v = if self.v2() {
+            let subsystems = self.subsystems();
+            if !subsystems.is_empty() {
+                subsystems[0].to_controller().procs()
+            } else {
+                vec![]
+            }
+        } else {
+            self.subsystems()
+                .iter()
+                .map(|subsystem| subsystem.to_controller().procs())
+                .fold(vec![], |mut acc, mut pids| {
+                    acc.append(&mut pids);
+                    acc
+                })
+        };
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Returns the procs that are currently in the control group, or an error if reading failed.
+    pub fn try_procs(&self) -> Result<Vec<CgroupPid>> {
         // Collect the procs from all subsystems
         let mut v = if self.v2() {
             let subsystems = self.subsystems();
             if !subsystems.is_empty() {
                 let c = subsystems[0].to_controller();
-                c.procs()
+                c.try_procs()?
+            } else {
+                vec![]
+            }
+        } else {
+            let mut acc = Vec::new();
+            for x in self.subsystems() {
+                let mut pids = x.to_controller().try_procs()?;
+                acc.append(&mut pids);
+            }
+            acc
+        };
+
+        v.sort();
+        v.dedup();
+        Ok(v)
+    }
+
+    /// Returns the tasks that are currently in the control group.
+    #[deprecated(note = "use `try_tasks` instead")]
+    #[allow(deprecated)]
+    pub fn tasks(&self) -> Vec<CgroupPid> {
+        let mut v = if self.v2() {
+            let subsystems = self.subsystems();
+            if !subsystems.is_empty() {
+                subsystems[0].to_controller().tasks()
             } else {
                 vec![]
             }
         } else {
             self.subsystems()
                 .iter()
-                .map(|x| x.to_controller().procs())
-                .fold(vec![], |mut acc, mut x| {
-                    acc.append(&mut x);
+                .map(|subsystem| subsystem.to_controller().tasks())
+                .fold(vec![], |mut acc, mut pids| {
+                    acc.append(&mut pids);
                     acc
                 })
         };
-
-        v.sort();
+        v.sort_unstable();
         v.dedup();
         v
     }
 
-    /// Returns an Iterator that can be used to iterate over the tasks that are currently in the
-    /// control group.
-    pub fn tasks(&self) -> Vec<CgroupPid> {
+    /// Returns the tasks that are currently in the control group, or an error if reading failed.
+    pub fn try_tasks(&self) -> Result<Vec<CgroupPid>> {
         // Collect the tasks from all subsystems
         let mut v = if self.v2() {
             let subsystems = self.subsystems();
             if !subsystems.is_empty() {
                 let c = subsystems[0].to_controller();
-                c.tasks()
+                c.try_tasks()?
             } else {
                 vec![]
             }
         } else {
-            self.subsystems()
-                .iter()
-                .map(|x| x.to_controller().tasks())
-                .fold(vec![], |mut acc, mut x| {
-                    acc.append(&mut x);
-                    acc
-                })
+            let mut acc = Vec::new();
+            for x in self.subsystems() {
+                let mut pids = x.to_controller().try_tasks()?;
+                acc.append(&mut pids);
+            }
+            acc
         };
 
         v.sort();
         v.dedup();
-        v
+        Ok(v)
     }
 
     /// Checks if the cgroup exists.
@@ -720,12 +774,15 @@ pub(crate) fn parse_cgroup_path<P: AsRef<Path>>(path: P) -> crate::error::CoreRe
 
 pub const UNIFIED_MOUNTPOINT: &str = "/sys/fs/cgroup";
 
-fn enable_controllers(controllers: &[String], path: &Path) {
+fn enable_controllers(controllers: &[String], path: &Path) -> Result<()> {
     let f = path.join("cgroup.subtree_control");
     for c in controllers {
         let body = format!("+{}", c);
-        let _rest = fs::write(f.as_path(), body.as_bytes());
+        fs::write(f.as_path(), body.as_bytes()).map_err(|e| {
+            Error::with_cause(ErrorKind::WriteFailed(f.display().to_string(), body), e)
+        })?;
     }
+    Ok(())
 }
 
 fn supported_controllers_at(root: &Path) -> Result<Vec<String>> {
@@ -766,7 +823,7 @@ fn create_v2_cgroup(
     let mut fp = root;
 
     // enable for root
-    enable_controllers(&controllers, &fp);
+    enable_controllers(&controllers, &fp)?;
 
     let components: Vec<_> = path.as_path().components().collect();
     let last_index = components.len().saturating_sub(1);
@@ -778,7 +835,7 @@ fn create_v2_cgroup(
 
         if i < last_index {
             // enable controllers for subtree
-            enable_controllers(&controllers, &fp);
+            enable_controllers(&controllers, &fp)?;
         }
     }
 
