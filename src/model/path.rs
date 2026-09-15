@@ -215,6 +215,27 @@ impl CgroupPath {
     pub fn as_path(&self) -> &Path {
         &self.path
     }
+
+    /// Convert this path into a systemd-compatible subgroup representation.
+    ///
+    /// Systemd encodes cgroup hierarchy positions using its own naming
+    /// conventions (`.slice` / `.scope` suffixes, dash-escaped path
+    /// components). This method will translate a validated `CgroupPath`
+    /// into that representation for use with the systemd D-Bus manager
+    /// interface.
+    ///
+    /// # Phase 2
+    ///
+    /// This is a placeholder for the systemd D-Bus integration rework.
+    /// The translation rules depend on design decisions in Phase 2
+    /// (slice nesting, scope naming, unit-name escaping) that have not
+    /// been finalized yet.
+    pub fn to_systemd_subgroup(&self) -> CoreResult<String> {
+        unimplemented!(
+            "CgroupPath::to_systemd_subgroup is a Phase 2 placeholder; \
+             systemd unit-name translation is not yet implemented"
+        )
+    }
 }
 
 impl AsRef<Path> for CgroupPath {

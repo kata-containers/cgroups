@@ -18,6 +18,9 @@ pub enum Error {
     #[error("invalid linux resource")]
     InvalidLinuxResource,
 
+    #[error("attachment error: {0}")]
+    Attachment(String),
+
     #[error("cgroupfs error: {0}")]
     Cgroupfs(#[from] CgroupfsError),
 
@@ -29,4 +32,10 @@ pub enum Error {
 
     #[error("core error: {0}")]
     Core(#[from] CoreError),
+
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
