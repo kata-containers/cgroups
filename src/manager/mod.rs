@@ -15,7 +15,11 @@ mod conv;
 
 use oci_spec::runtime::LinuxResources;
 
-pub use crate::model::AttachDestination;
+pub use crate::model::{
+    AttachDestination, BlkIoPatch, BlockDeviceThrottle, BlockDeviceWeight, CpuPatch, CpuSetPatch,
+    DevicePatch, DeviceRule, HugePageLimit, HugePagePatch, InterfacePriority, MemoryPatch,
+    NetworkPatch, PidsPatch, ResourcePatch, Update,
+};
 use crate::systemd::SLICE_SUFFIX;
 use crate::{CgroupPid, CgroupStats, FreezerState};
 
@@ -48,8 +52,17 @@ pub trait Manager: Send + Sync {
     /// Remove the cgroups.
     fn destroy(&mut self) -> Result<()>;
 
-    /// Set the resources to the cgroups.
-    fn set(&mut self, resources: &LinuxResources) -> Result<()>;
+    /// Set the resources to the cgroups using a cgroup-native [`ResourcePatch`].
+    fn set_resources(&mut self, resources: &ResourcePatch) -> Result<()>;
+
+    /// Set the resources to the cgroups using OCI [`LinuxResources`].
+    ///
+    /// This is an adapter method that translates OCI specification resources
+    /// into a cgroup-native [`ResourcePatch`] before applying.
+    fn set(&mut self, resources: &LinuxResources) -> Result<()> {
+        let patch = conv::oci_to_resource_patch(resources, self.v2())?;
+        self.set_resources(&patch)
+    }
 
     /// Get the cgroup path.
     ///

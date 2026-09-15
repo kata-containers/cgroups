@@ -9,10 +9,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use oci_spec::runtime::LinuxResources;
-use oci_spec::runtime::{
-    LinuxBlockIo, LinuxCpu, LinuxDeviceCgroup, LinuxHugepageLimit, LinuxMemory, LinuxNetwork,
-    LinuxPids,
-};
 
 use crate::discovery::membership::{parse_membership, Membership};
 use crate::discovery::topology::{discover, CgroupTopology, HostPaths};
@@ -31,7 +27,10 @@ use crate::fs::pid::PidController;
 use crate::fs::{hierarchies, Cgroup, ControllIdentifier, Controller, MaxValue, Subsystem};
 use crate::manager::error::Error;
 use crate::manager::{conv, Manager, Result};
-use crate::model::{AttachDestination, CgroupPath};
+use crate::model::{
+    AttachDestination, BlkIoPatch, CgroupPath, CpuPatch, CpuSetPatch, DevicePatch, HugePagePatch,
+    MemoryPatch, NetworkPatch, PidsPatch, ResourcePatch, Update,
+};
 use crate::stats::{
     BlkioCgroupStats, BlkioStat, CpuAcctStats, CpuCgroupStats, CpuThrottlingStats,
     HugeTlbCgroupStats, HugeTlbStat, MemoryCgroupStats, MemoryStats, PidsCgroupStats,
@@ -448,64 +447,10 @@ impl FsManager {
         self.cgroup.controller_of::<T>().is_some()
     }
 
-    fn set_cpuset(&self, linux_cpu: &LinuxCpu) -> Result<()> {
-        let controller: &CpuSetController = self.controller()?;
-
-        if let Some(cpus) = linux_cpu.cpus() {
-            controller.set_cpus(cpus)?;
-        }
-
-        if let Some(mems) = linux_cpu.mems() {
-            controller.set_mems(mems)?;
-        }
-
-        Ok(())
-    }
-
-    fn set_cpu(&self, linux_cpu: &LinuxCpu) -> Result<()> {
-        let controller: &CpuController = self.controller()?;
-
-        if let Some(shares) = linux_cpu.shares() {
-            let shares = if self.v2() {
-                conv::cpu_shares_to_cgroup_v2(shares)
-            } else {
-                shares
-            };
-            if shares != 0 {
-                controller.set_shares(shares)?;
-            }
-        }
-
-        if let Some(quota) = linux_cpu.quota() {
-            controller.set_cfs_quota(quota)?;
-        }
-
-        if let Some(period) = linux_cpu.period() {
-            controller.set_cfs_period(period)?;
-        }
-
-        if let Some(rt_runtime) = linux_cpu.realtime_runtime() {
-            controller.set_rt_runtime(rt_runtime)?;
-        }
-
-        if let Some(rt_period) = linux_cpu.realtime_period() {
-            controller.set_rt_period_us(rt_period)?;
-        }
-
-        Ok(())
-    }
-
-    fn set_mem_and_memswap_v1(&self, limit: i64, mut swap_limit: i64) -> Result<()> {
+    fn set_mem_and_memswap_v1(&self, limit: Option<i64>, swap_limit: Option<i64>) -> Result<()> {
         let controller: &MemController = self.controller()?;
 
-        // If the memory update is set to -1 and the swap is not set
-        // explicitly, we should also set swap to -1, it means
-        // unlimited memory.
-        if limit == -1 && swap_limit == 0 {
-            swap_limit = -1;
-        }
-
-        if limit != 0 && swap_limit != 0 {
+        if let (Some(limit), Some(swap_limit)) = (limit, swap_limit) {
             let memory = controller.try_memory_stat().map_err(Error::Cgroupfs)?;
             let limit_actual = memory.limit_in_bytes;
 
@@ -520,243 +465,361 @@ impl FsManager {
             }
         }
 
-        if limit != 0 {
+        if let Some(limit) = limit {
             controller.set_limit(limit)?;
         }
-        if swap_limit != 0 {
+        if let Some(swap_limit) = swap_limit {
             controller.set_memswap_limit(swap_limit)?;
         }
 
         Ok(())
     }
 
-    fn set_memory_v1(&self, linux_memory: &LinuxMemory) -> Result<()> {
-        let controller: &MemController = self.controller()?;
-
-        let mem_limit = linux_memory.limit().unwrap_or(0);
-        let memswap_limit = linux_memory.swap().unwrap_or(0);
-
-        self.set_mem_and_memswap_v1(mem_limit, memswap_limit)?;
-
-        if let Some(reservation) = linux_memory.reservation() {
-            controller.set_soft_limit(reservation)?;
+    fn set_cpuset_patch(&self, patch: &CpuSetPatch) -> Result<()> {
+        if matches!(&patch.cpus, Update::Max) || matches!(&patch.mems, Update::Max) {
+            return Err(Error::Unsupported(
+                "cpuset values do not support Update::Max".to_string(),
+            ));
         }
-
-        if linux_memory.disable_oom_killer().unwrap_or_default() {
-            controller.disable_oom_killer()?;
+        if patch.cpus.is_unchanged() && patch.mems.is_unchanged() {
+            return Ok(());
         }
-
-        if let Some(swappiness) = linux_memory.swappiness() {
-            if swappiness <= 100 {
-                controller.set_swappiness(swappiness)?;
-            } else {
-                return Err(Error::InvalidLinuxResource);
-            };
+        let controller: &CpuSetController = self.controller()?;
+        if let Update::Set(cpus) = &patch.cpus {
+            controller.set_cpus(cpus)?;
         }
-
+        if let Update::Set(mems) = &patch.mems {
+            controller.set_mems(mems)?;
+        }
         Ok(())
     }
 
-    fn set_memory_v2(&self, linux_memory: &LinuxMemory) -> Result<()> {
-        let controller: &MemController = self.controller()?;
-
-        if linux_memory.reservation().is_none()
-            && linux_memory.limit().is_none()
-            && linux_memory.swap().is_none()
+    fn set_cpu_patch(&self, patch: &CpuPatch) -> Result<()> {
+        if matches!(patch.shares, Update::Max)
+            || matches!(patch.period, Update::Max)
+            || matches!(patch.realtime_period, Update::Max)
+        {
+            return Err(Error::Unsupported(
+                "cpu shares, period, and realtime period do not support Update::Max".to_string(),
+            ));
+        }
+        if patch.shares.is_unchanged()
+            && patch.quota.is_unchanged()
+            && patch.period.is_unchanged()
+            && patch.realtime_runtime.is_unchanged()
+            && patch.realtime_period.is_unchanged()
         {
             return Ok(());
         }
+        let controller: &CpuController = self.controller()?;
+        if let Update::Set(shares) = patch.shares {
+            let shares = if self.v2() {
+                conv::cpu_shares_to_cgroup_v2(shares)
+            } else {
+                shares
+            };
+            controller.set_shares(shares)?;
+        }
+        match patch.quota {
+            Update::Set(quota) => controller.set_cfs_quota(quota)?,
+            Update::Max => controller.set_cfs_quota(-1)?,
+            Update::Unchanged => {}
+        }
+        if let Update::Set(period) = patch.period {
+            controller.set_cfs_period(period)?;
+        }
+        match patch.realtime_runtime {
+            Update::Set(rt_runtime) => controller.set_rt_runtime(rt_runtime)?,
+            Update::Max => controller.set_rt_runtime(-1)?,
+            Update::Unchanged => {}
+        }
+        if let Update::Set(rt_period) = patch.realtime_period {
+            controller.set_rt_period_us(rt_period)?;
+        }
+        Ok(())
+    }
 
-        let mem_limit = linux_memory.limit().unwrap_or(0);
-        let memswap_limit = linux_memory.swap().unwrap_or(0);
-
-        // Check memory usage
-        if mem_limit <= 0 && memswap_limit <= 0 {
+    fn set_memory_patch(&self, patch: &MemoryPatch) -> Result<()> {
+        if patch.limit.is_unchanged()
+            && patch.soft_limit.is_unchanged()
+            && patch.swap.is_unchanged()
+            && patch.kernel.is_unchanged()
+            && patch.kernel_tcp.is_unchanged()
+            && patch.swappiness.is_unchanged()
+            && patch.disable_oom_killer.is_unchanged()
+        {
             return Ok(());
         }
-
-        let memory_stat = controller.try_memory_stat().map_err(Error::Cgroupfs)?;
-        let usage_actual = memory_stat.usage_in_bytes;
-
-        // Rejecting: memory+swap limit <= usage
-        if memswap_limit > 0 && memswap_limit as u64 <= usage_actual {
-            return Err(Error::InvalidLinuxResource);
+        if [
+            patch.limit,
+            patch.soft_limit,
+            patch.swap,
+            patch.kernel,
+            patch.kernel_tcp,
+        ]
+        .iter()
+        .any(|update| matches!(update, Update::Set(value) if *value < 0))
+        {
+            return Err(Error::InvalidArgument);
         }
-
-        // Rejecting: memory limit <= usage
-        if mem_limit > 0 && mem_limit as u64 <= usage_actual {
-            return Err(Error::InvalidLinuxResource);
-        }
-
-        let swap_limit = conv::memory_swap_to_cgroup_v2(memswap_limit, mem_limit)?;
-        controller.set_memswap_limit(swap_limit)?;
-
-        if mem_limit != 0 {
-            controller.set_limit(mem_limit)?;
-        }
-
-        if let Some(reservation) = linux_memory.reservation() {
-            controller.set_soft_limit(reservation)?;
-        }
-
-        Ok(())
-    }
-
-    /// Set memory resources.
-    ///
-    /// Ignore kernel memory and kernel memory TCP, as runc does, see [1].
-    ///
-    /// 1: https://github.com/opencontainers/cgroups/blob/d36d371fe756a30d2e21d83c6b42e86af77bf4a2/fs/memory.go#L36
-    fn set_memory(&self, linux_memory: &LinuxMemory) -> Result<()> {
         if self.v2() {
-            self.set_memory_v2(linux_memory)?;
+            self.set_memory_v2_patch(patch)
         } else {
-            self.set_memory_v1(linux_memory)?;
+            self.set_memory_v1_patch(patch)
         }
+    }
 
+    fn set_memory_v1_patch(&self, patch: &MemoryPatch) -> Result<()> {
+        if matches!(patch.swappiness, Update::Max)
+            || matches!(patch.disable_oom_killer, Update::Max)
+        {
+            return Err(Error::Unsupported(
+                "memory swappiness and OOM-killer state do not support Update::Max".to_string(),
+            ));
+        }
+        if matches!(patch.swappiness, Update::Set(swappiness) if swappiness > 100) {
+            return Err(Error::InvalidArgument);
+        }
+        let controller: &MemController = self.controller()?;
+        let mem_limit = match patch.limit {
+            Update::Set(v) => Some(v),
+            Update::Max => Some(-1),
+            Update::Unchanged => None,
+        };
+        let memswap_limit = match patch.swap {
+            Update::Set(v) => Some(v),
+            Update::Max => Some(-1),
+            Update::Unchanged => None,
+        };
+        self.set_mem_and_memswap_v1(mem_limit, memswap_limit)?;
+
+        match patch.soft_limit {
+            Update::Set(reservation) => controller.set_soft_limit(reservation)?,
+            Update::Max => controller.set_soft_limit(-1)?,
+            Update::Unchanged => {}
+        }
+        match patch.kernel {
+            Update::Set(kernel) => controller.set_kmem_limit(kernel)?,
+            Update::Max => controller.set_kmem_limit(-1)?,
+            Update::Unchanged => {}
+        }
+        match patch.kernel_tcp {
+            Update::Set(kernel_tcp) => controller.set_tcp_limit(kernel_tcp)?,
+            Update::Max => controller.set_tcp_limit(-1)?,
+            Update::Unchanged => {}
+        }
+        if let Update::Set(swappiness) = patch.swappiness {
+            controller.set_swappiness(swappiness)?;
+        }
+        if let Update::Set(disabled) = patch.disable_oom_killer {
+            controller.set_oom_killer_disabled(disabled)?;
+        }
         Ok(())
     }
 
-    fn set_pids(&self, pids: &LinuxPids) -> Result<()> {
+    fn set_memory_v2_patch(&self, patch: &MemoryPatch) -> Result<()> {
+        if !patch.kernel.is_unchanged()
+            || !patch.kernel_tcp.is_unchanged()
+            || !patch.swappiness.is_unchanged()
+            || !patch.disable_oom_killer.is_unchanged()
+        {
+            return Err(Error::Unsupported(
+                "kernel/tcp/swappiness/OOM-killer memory settings are unavailable on cgroup v2"
+                    .to_string(),
+            ));
+        }
+        if matches!(patch.soft_limit, Update::Max) {
+            return Err(Error::Unsupported(
+                "memory.low does not support Update::Max through this backend".to_string(),
+            ));
+        }
+        let controller: &MemController = self.controller()?;
+        match patch.limit {
+            Update::Set(limit) => controller.set_limit(limit)?,
+            Update::Max => controller.set_limit(-1)?,
+            Update::Unchanged => {}
+        }
+        match patch.swap {
+            Update::Set(swap) => controller.set_memswap_limit(swap)?,
+            Update::Max => controller.set_memswap_limit(-1)?,
+            Update::Unchanged => {}
+        }
+        if let Update::Set(soft_limit) = patch.soft_limit {
+            controller.set_soft_limit(soft_limit)?;
+        }
+        Ok(())
+    }
+
+    fn set_pids_patch(&self, patch: &PidsPatch) -> Result<()> {
+        if patch.limit.is_unchanged() {
+            return Ok(());
+        }
         let controller: &PidController = self.controller()?;
-        let value = if pids.limit() > 0 {
-            MaxValue::Value(pids.limit())
-        } else {
-            MaxValue::Max
+        let value = match patch.limit {
+            Update::Set(limit) if limit >= 0 => MaxValue::Value(limit),
+            Update::Set(_) => return Err(Error::InvalidArgument),
+            Update::Max => MaxValue::Max,
+            Update::Unchanged => return Ok(()),
         };
         controller.set_pid_max(value)?;
-
         Ok(())
     }
 
-    fn set_blkio(&self, blkio: &LinuxBlockIo) -> Result<()> {
+    fn set_blkio_patch(&self, patch: &BlkIoPatch) -> Result<()> {
+        if patch.weight.is_unchanged()
+            && patch.leaf_weight.is_unchanged()
+            && patch.weight_device.is_empty()
+            && patch.throttle_read_bps_device.is_empty()
+            && patch.throttle_write_bps_device.is_empty()
+            && patch.throttle_read_iops_device.is_empty()
+            && patch.throttle_write_iops_device.is_empty()
+        {
+            return Ok(());
+        }
+        if matches!(patch.weight, Update::Max) || matches!(patch.leaf_weight, Update::Max) {
+            return Err(Error::Unsupported(
+                "blkio weight values do not support Update::Max".to_string(),
+            ));
+        }
+        if self.v2()
+            && (!patch.leaf_weight.is_unchanged()
+                || patch
+                    .weight_device
+                    .iter()
+                    .any(|device| device.leaf_weight.is_some()))
+        {
+            return Err(Error::Unsupported(
+                "blkio leaf_weight is only available on cgroup v1".to_string(),
+            ));
+        }
         let controller: &BlkIoController = self.controller()?;
-
-        if let Some(weight) = blkio.weight() {
+        if let Update::Set(weight) = patch.weight {
             controller.set_weight(weight as u64)?;
         }
-
-        if let Some(leaf_weight) = blkio.leaf_weight() {
+        if let Update::Set(leaf_weight) = patch.leaf_weight {
             controller.set_leaf_weight(leaf_weight as u64)?;
         }
-
-        if let Some(devices) = blkio.weight_device() {
-            for device in devices.iter() {
-                let major = device.major() as u64;
-                let minor = device.minor() as u64;
-                if let Some(weight) = device.weight() {
-                    controller.set_weight_for_device(major, minor, weight as u64)?;
-                }
-                if let Some(leaf_weight) = device.leaf_weight() {
-                    controller.set_leaf_weight_for_device(major, minor, leaf_weight as u64)?;
-                }
+        for dev in &patch.weight_device {
+            let major = dev.major;
+            let minor = dev.minor;
+            if let Some(w) = dev.weight {
+                controller.set_weight_for_device(major, minor, w as u64)?;
+            }
+            if let Some(lw) = dev.leaf_weight {
+                controller.set_leaf_weight_for_device(major, minor, lw as u64)?;
             }
         }
-
-        if let Some(devices) = blkio.throttle_read_bps_device() {
-            for device in devices.iter() {
-                let major = device.major() as u64;
-                let minor = device.minor() as u64;
-                let rate = device.rate();
-                controller.throttle_read_bps_for_device(major, minor, rate)?;
-            }
+        for dev in &patch.throttle_read_bps_device {
+            controller.throttle_read_bps_for_device(dev.major, dev.minor, dev.rate)?;
         }
-
-        if let Some(devices) = blkio.throttle_write_bps_device() {
-            for device in devices.iter() {
-                let major = device.major() as u64;
-                let minor = device.minor() as u64;
-                let rate = device.rate();
-                controller.throttle_write_bps_for_device(major, minor, rate)?;
-            }
+        for dev in &patch.throttle_write_bps_device {
+            controller.throttle_write_bps_for_device(dev.major, dev.minor, dev.rate)?;
         }
-
-        if let Some(devices) = blkio.throttle_read_iops_device() {
-            for device in devices.iter() {
-                let major = device.major() as u64;
-                let minor = device.minor() as u64;
-                let rate = device.rate();
-                controller.throttle_read_iops_for_device(major, minor, rate)?;
-            }
+        for dev in &patch.throttle_read_iops_device {
+            controller.throttle_read_iops_for_device(dev.major, dev.minor, dev.rate)?;
         }
-
-        if let Some(devices) = blkio.throttle_write_iops_device() {
-            for device in devices.iter() {
-                let major = device.major() as u64;
-                let minor = device.minor() as u64;
-                let rate = device.rate();
-                controller.throttle_write_iops_for_device(major, minor, rate)?;
-            }
+        for dev in &patch.throttle_write_iops_device {
+            controller.throttle_write_iops_for_device(dev.major, dev.minor, dev.rate)?;
         }
-
         Ok(())
     }
 
-    fn set_hugepages(&self, hugepage_limits: &[LinuxHugepageLimit]) -> Result<()> {
+    fn set_hugepages_patch(&self, patch: &HugePagePatch) -> Result<()> {
+        if patch.limits.is_empty() {
+            return Ok(());
+        }
         let controller: &HugeTlbController = self.controller()?;
-
-        for limit in hugepage_limits.iter() {
-            // ignore not supported page size
-            if !controller.size_supported(limit.page_size()) {
-                continue;
+        for limit in &patch.limits {
+            if !controller.size_supported(&limit.page_size) {
+                return Err(Error::Unsupported(format!(
+                    "hugetlb page size {} is not supported",
+                    limit.page_size
+                )));
             }
-            let page_size = limit.page_size();
-            let limit = limit.limit() as u64;
-            controller.set_limit_in_bytes(page_size, limit)?;
+            controller.set_limit_in_bytes(&limit.page_size, limit.limit)?;
         }
-
         Ok(())
     }
 
-    fn set_network(&self, network: &LinuxNetwork) -> Result<()> {
-        if let Some(class_id) = network.class_id() {
+    fn set_network_patch(&self, patch: &NetworkPatch) -> Result<()> {
+        if matches!(patch.class_id, Update::Max) {
+            return Err(Error::Unsupported(
+                "network class_id does not support Update::Max".to_string(),
+            ));
+        }
+        if patch.class_id.is_unchanged() && patch.priorities.is_empty() {
+            return Ok(());
+        }
+        if let Update::Set(class_id) = patch.class_id {
             let controller: &NetClsController = self.controller()?;
-            controller.set_class(class_id as u64)?;
+            controller.set_class(class_id)?;
         }
-
-        if let Some(priorities) = network.priorities() {
+        if !patch.priorities.is_empty() {
             let controller: &NetPrioController = self.controller()?;
-            for priority in priorities.iter() {
-                let eif = priority.name();
-                let prio = priority.priority() as u64;
-                controller.set_if_prio(eif, prio)?;
+            for prio in &patch.priorities {
+                controller.set_if_prio(&prio.name, prio.priority)?;
             }
         }
-
         Ok(())
     }
 
-    fn set_devices(&self, devices: &[LinuxDeviceCgroup]) -> Result<()> {
+    fn set_devices_patch(&self, patch: &DevicePatch) -> Result<()> {
+        if patch.rules.is_empty() {
+            return Ok(());
+        }
         let controller: &DevicesController = self.controller()?;
-
-        for device in devices.iter() {
-            let devtype =
-                DeviceType::from_char(device.typ().unwrap_or_default().as_str().chars().next())
-                    .ok_or(Error::InvalidLinuxResource)?;
+        for device in &patch.rules {
+            let devtype = DeviceType::from_char(device.dev_type).ok_or(Error::InvalidArgument)?;
 
             let perm = device
-                .access()
-                .as_ref()
-                .unwrap_or(&String::new())
+                .access
                 .chars()
-                .filter_map(|perm| match perm {
-                    'r' => Some(DevicePermissions::Read),
-                    'w' => Some(DevicePermissions::Write),
-                    'm' => Some(DevicePermissions::MkNod),
-                    _ => None,
+                .map(|p| match p {
+                    'r' => Ok(DevicePermissions::Read),
+                    'w' => Ok(DevicePermissions::Write),
+                    'm' => Ok(DevicePermissions::MkNod),
+                    _ => Err(Error::InvalidArgument),
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
+            if perm.is_empty() {
+                return Err(Error::InvalidArgument);
+            }
 
-            let major = device.major().unwrap_or(0);
-            let minor = device.minor().unwrap_or(0);
+            let major = device.major.unwrap_or(-1);
+            let minor = device.minor.unwrap_or(-1);
 
-            if device.allow() {
+            if device.allow {
                 controller.allow_device(devtype, major, minor, &perm)?;
             } else {
                 controller.deny_device(devtype, major, minor, &perm)?;
             }
         }
+        Ok(())
+    }
 
+    fn set_custom_attributes(&self, attrs: &HashMap<String, String>) -> Result<()> {
+        if attrs.is_empty() {
+            return Ok(());
+        }
+        if !self.v2() {
+            return Err(Error::Unsupported(
+                "custom attributes (unified) are only supported on cgroup v2".to_string(),
+            ));
+        }
+        for (k, v) in attrs {
+            crate::model::validate_attribute_name(k, "set_custom_attributes")?;
+            let path = self
+                .topology
+                .cgroupfs_root
+                .join(self.base.as_path())
+                .join(k);
+            std::fs::write(&path, v.as_bytes()).map_err(|e| {
+                Error::Cgroupfs(FsError::with_cause(
+                    FsErrorKind::WriteFailed(path.display().to_string(), v.clone()),
+                    e,
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -1304,37 +1367,22 @@ impl Manager for FsManager {
         Ok(())
     }
 
-    fn set(&mut self, resources: &LinuxResources) -> Result<()> {
-        if let Some(cpu) = resources.cpu() {
-            self.set_cpuset(cpu)?;
-            self.set_cpu(cpu)?;
-        }
-
-        if let Some(memory) = resources.memory() {
-            self.set_memory(memory)?;
-        }
-
-        if let Some(pid) = resources.pids() {
-            self.set_pids(pid)?;
-        }
-
-        if let Some(blkio) = resources.block_io() {
-            self.set_blkio(blkio)?;
-        }
-
-        if let Some(hugepage_limits) = resources.hugepage_limits() {
-            self.set_hugepages(hugepage_limits)?;
-        }
-
-        if let Some(network) = resources.network() {
-            self.set_network(network)?;
-        }
-
-        if let Some(devices) = resources.devices() {
-            self.set_devices(devices)?;
-        }
-
+    fn set_resources(&mut self, resources: &ResourcePatch) -> Result<()> {
+        self.set_cpuset_patch(&resources.cpuset)?;
+        self.set_cpu_patch(&resources.cpu)?;
+        self.set_memory_patch(&resources.memory)?;
+        self.set_pids_patch(&resources.pids)?;
+        self.set_blkio_patch(&resources.blkio)?;
+        self.set_hugepages_patch(&resources.hugepages)?;
+        self.set_network_patch(&resources.network)?;
+        self.set_devices_patch(&resources.devices)?;
+        self.set_custom_attributes(&resources.custom_attributes)?;
         Ok(())
+    }
+
+    fn set(&mut self, resources: &LinuxResources) -> Result<()> {
+        let patch = conv::oci_to_cgroupfs_resource_patch(resources, self.v2())?;
+        self.set_resources(&patch)
     }
 
     fn cgroup_path(&self, subsystem: Option<&str>) -> Result<String> {
@@ -2728,5 +2776,579 @@ mod attachment_tests {
         );
         assert!(!cgroupfs_root.join("cgroup.subtree_control").exists());
         assert!(!managed_dir.join("cgroup.subtree_control").exists());
+    }
+}
+
+#[cfg(all(test, feature = "oci"))]
+mod resource_tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::discovery::{CgroupTopology, CgroupVersion, ControllerSet, HostPaths, MountTable};
+    use crate::manager::{FsManager, Manager};
+    use crate::model::{CpuPatch, MemoryPatch, PidsPatch, ResourcePatch, Update};
+    use crate::stats::{BlkioCgroupStats, CpuThrottlingStats, HugeTlbCgroupStats};
+    use oci_spec::runtime::{LinuxCpuBuilder, LinuxPidsBuilder, LinuxResourcesBuilder};
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            let rand_id: u64 = rand::random();
+            let path = std::env::temp_dir().join(format!("cgroup_res_test_{}_{}", prefix, rand_id));
+            fs::create_dir_all(&path).expect("failed to create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &PathBuf {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn make_test_topology_v2(cgroupfs_root: PathBuf) -> Arc<CgroupTopology> {
+        let controllers: ControllerSet = vec![
+            "cpu".to_string(),
+            "memory".to_string(),
+            "pids".to_string(),
+            "cpuset".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        Arc::new(CgroupTopology {
+            version: CgroupVersion::V2,
+            v2_available: true,
+            mounts: MountTable::default(),
+            membership: Default::default(),
+            controllers,
+            cgroupfs_root,
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        })
+    }
+
+    fn make_test_topology_v1_memory(cgroupfs_root: PathBuf) -> Arc<CgroupTopology> {
+        let mounts = crate::discovery::parse_mountinfo(
+            "43 33 0:38 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime \
+             shared:20 - cgroup cgroup rw,memory",
+        )
+        .unwrap();
+        let membership = crate::discovery::parse_membership("1:memory:/").unwrap();
+
+        Arc::new(CgroupTopology {
+            version: CgroupVersion::V1,
+            v2_available: false,
+            mounts,
+            membership,
+            controllers: ControllerSet::default(),
+            cgroupfs_root,
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        })
+    }
+
+    #[test]
+    fn test_set_resources_native_patch_v2() {
+        let fixture = TestDir::new("set_native");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let cgroup_dir = cgroupfs_root.join("test_slice.slice");
+        fs::create_dir_all(&cgroup_dir).unwrap();
+
+        // Seed mock controller pseudo-files
+        fs::write(cgroup_dir.join("cgroup.procs"), "").unwrap();
+        fs::write(cgroup_dir.join("cpu.max"), "max 100000\n").unwrap();
+        fs::write(cgroup_dir.join("cpu.weight"), "100\n").unwrap();
+        fs::write(cgroup_dir.join("memory.max"), "max\n").unwrap();
+        fs::write(cgroup_dir.join("memory.low"), "0\n").unwrap();
+        fs::write(cgroup_dir.join("memory.swap.max"), "max\n").unwrap();
+        fs::write(cgroup_dir.join("pids.max"), "max\n").unwrap();
+
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let mut manager =
+            FsManager::with_topology_and_host_paths("test_slice.slice", topo, host_paths).unwrap();
+
+        // 1. Apply concrete limits via pure native ResourcePatch
+        let patch = ResourcePatch {
+            cpu: CpuPatch {
+                shares: Update::Set(2000),
+                quota: Update::Set(50000),
+                period: Update::Set(100000),
+                ..Default::default()
+            },
+            memory: MemoryPatch {
+                limit: Update::Set(1024 * 1024 * 1024),     // 1 GiB
+                soft_limit: Update::Set(512 * 1024 * 1024), // 512 MiB
+                // Native v2 patches describe memory.swap.max directly.
+                swap: Update::Set(2 * 1024 * 1024 * 1024), // 2 GiB swap
+                ..Default::default()
+            },
+            pids: PidsPatch {
+                limit: Update::Set(256),
+            },
+            ..Default::default()
+        };
+
+        manager.set_resources(&patch).expect("set_resources failed");
+
+        // Verify values written to cgroup pseudo-files
+        let cpu_max = fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap();
+        assert_eq!(cpu_max.trim(), "50000 100000");
+
+        let cpu_weight = fs::read_to_string(cgroup_dir.join("cpu.weight")).unwrap();
+        assert_eq!(cpu_weight.trim(), "77"); // 1 + ((2000 - 2) * 9999) / 262142 = 77
+
+        let mem_max = fs::read_to_string(cgroup_dir.join("memory.max")).unwrap();
+        assert_eq!(mem_max.trim(), "1073741824");
+
+        let mem_low = fs::read_to_string(cgroup_dir.join("memory.low")).unwrap();
+        assert_eq!(mem_low.trim(), "536870912");
+
+        let mem_swap = fs::read_to_string(cgroup_dir.join("memory.swap.max")).unwrap();
+        assert_eq!(mem_swap.trim(), "2147483648");
+
+        let pids_max = fs::read_to_string(cgroup_dir.join("pids.max")).unwrap();
+        assert_eq!(pids_max.trim(), "256");
+
+        // Set(0) is an explicit native update, not the OCI "unspecified"
+        // sentinel, so every zero must reach the corresponding control file.
+        let zero_patch = ResourcePatch {
+            memory: MemoryPatch {
+                limit: Update::Set(0),
+                soft_limit: Update::Set(0),
+                swap: Update::Set(0),
+                ..Default::default()
+            },
+            pids: PidsPatch {
+                limit: Update::Set(0),
+            },
+            ..Default::default()
+        };
+        manager
+            .set_resources(&zero_patch)
+            .expect("explicit zero patch failed");
+        assert_eq!(
+            fs::read_to_string(cgroup_dir.join("memory.max"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
+        assert_eq!(
+            fs::read_to_string(cgroup_dir.join("memory.low"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
+        assert_eq!(
+            fs::read_to_string(cgroup_dir.join("memory.swap.max"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
+        assert_eq!(
+            fs::read_to_string(cgroup_dir.join("pids.max"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
+
+        // A swap-only native patch is valid on v2 and must not require a
+        // memory limit for OCI combined-limit arithmetic.
+        let mut swap_only = ResourcePatch::default();
+        swap_only.memory.swap = Update::Set(4096);
+        manager
+            .set_resources(&swap_only)
+            .expect("native swap-only patch failed");
+        assert_eq!(
+            fs::read_to_string(cgroup_dir.join("memory.swap.max"))
+                .unwrap()
+                .trim(),
+            "4096"
+        );
+
+        // 2. Reset limits to Max
+        let reset_patch = ResourcePatch {
+            cpu: CpuPatch {
+                quota: Update::Max,
+                period: Update::Set(100000),
+                ..Default::default()
+            },
+            memory: MemoryPatch {
+                limit: Update::Max,
+                swap: Update::Max,
+                ..Default::default()
+            },
+            pids: PidsPatch { limit: Update::Max },
+            ..Default::default()
+        };
+
+        manager
+            .set_resources(&reset_patch)
+            .expect("reset patch failed");
+
+        let cpu_max = fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap();
+        assert_eq!(cpu_max.trim(), "max 100000");
+
+        let mem_max = fs::read_to_string(cgroup_dir.join("memory.max")).unwrap();
+        assert_eq!(mem_max.trim(), "max");
+
+        let mem_swap = fs::read_to_string(cgroup_dir.join("memory.swap.max")).unwrap();
+        assert_eq!(mem_swap.trim(), "max");
+
+        let pids_max = fs::read_to_string(cgroup_dir.join("pids.max")).unwrap();
+        assert_eq!(pids_max.trim(), "max");
+    }
+
+    #[test]
+    fn test_set_oci_delegates_to_set_resources() {
+        let fixture = TestDir::new("set_oci");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let cgroup_dir = cgroupfs_root.join("oci_slice.slice");
+        fs::create_dir_all(&cgroup_dir).unwrap();
+
+        fs::write(cgroup_dir.join("cgroup.procs"), "").unwrap();
+        fs::write(cgroup_dir.join("cpu.max"), "max 100000\n").unwrap();
+        fs::write(cgroup_dir.join("cpu.weight"), "100\n").unwrap();
+        fs::write(cgroup_dir.join("memory.max"), "max\n").unwrap();
+        fs::write(cgroup_dir.join("memory.low"), "0\n").unwrap();
+        fs::write(cgroup_dir.join("memory.swap.max"), "max\n").unwrap();
+        fs::write(cgroup_dir.join("pids.max"), "max\n").unwrap();
+
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let mut manager =
+            FsManager::with_topology_and_host_paths("oci_slice.slice", topo, host_paths).unwrap();
+
+        let oci_cpu = LinuxCpuBuilder::default()
+            .shares(1024u64)
+            .quota(20000i64)
+            .period(50000u64)
+            .build()
+            .unwrap();
+
+        let oci_pids = LinuxPidsBuilder::default().limit(64i64).build().unwrap();
+
+        let oci_res = LinuxResourcesBuilder::default()
+            .cpu(oci_cpu)
+            .pids(oci_pids)
+            .build()
+            .unwrap();
+
+        // Call legacy manager.set(&LinuxResources) -> should translate and write via set_resources
+        manager.set(&oci_res).expect("manager.set failed");
+
+        let cpu_max = fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap();
+        assert_eq!(cpu_max.trim(), "20000 50000");
+
+        let pids_max = fs::read_to_string(cgroup_dir.join("pids.max")).unwrap();
+        assert_eq!(pids_max.trim(), "64");
+    }
+
+    #[test]
+    fn test_set_custom_attributes_security() {
+        let fixture = TestDir::new("custom_attrs_sec");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let cgroup_dir = cgroupfs_root.join("sec_slice.slice");
+        fs::create_dir_all(&cgroup_dir).unwrap();
+
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+        let topo = make_test_topology_v2(cgroupfs_root.clone());
+        let mut manager =
+            FsManager::with_topology_and_host_paths("sec_slice.slice", topo, host_paths).unwrap();
+
+        let invalid_keys = vec![
+            "/tmp/escaped_file",
+            "../../escaped_file",
+            "subdir/file",
+            ".",
+            "..",
+            "",
+            "bad\0name",
+        ];
+
+        for key in invalid_keys {
+            let mut patch = ResourcePatch::default();
+            patch
+                .custom_attributes
+                .insert(key.to_string(), "malicious_payload".to_string());
+            let err = manager
+                .set_resources(&patch)
+                .expect_err(&format!("key `{}` must be rejected", key));
+            assert!(
+                matches!(
+                    err,
+                    crate::manager::error::Error::Core(crate::error::CoreError::InvalidPath { .. })
+                ),
+                "key `{}` must produce InvalidPath, got: {:?}",
+                key,
+                err
+            );
+        }
+
+        // Valid attribute name succeeds and writes strictly inside cgroup_dir
+        let mut valid_patch = ResourcePatch::default();
+        valid_patch
+            .custom_attributes
+            .insert("memory.custom_file".to_string(), "valid_data".to_string());
+        manager
+            .set_resources(&valid_patch)
+            .expect("valid custom attribute should succeed");
+
+        let written = fs::read_to_string(cgroup_dir.join("memory.custom_file")).unwrap();
+        assert_eq!(written, "valid_data");
+    }
+
+    #[test]
+    fn test_set_custom_attributes_rejects_v1() {
+        let fixture = TestDir::new("custom_attrs_v1");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+        let topo_v1 = Arc::new(CgroupTopology {
+            version: CgroupVersion::V1,
+            v2_available: false,
+            mounts: MountTable::default(),
+            membership: Default::default(),
+            controllers: ControllerSet::default(),
+            cgroupfs_root,
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        });
+
+        let mut manager =
+            FsManager::with_topology_and_host_paths("v1_slice.slice", topo_v1, host_paths).unwrap();
+
+        let mut patch = ResourcePatch::default();
+        patch
+            .custom_attributes
+            .insert("memory.high".to_string(), "1000".to_string());
+        let err = manager
+            .set_resources(&patch)
+            .expect_err("v1 must reject custom_attributes");
+        assert!(
+            matches!(err, crate::manager::error::Error::Unsupported(_)),
+            "expected Unsupported on v1, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_with_topology_zero_io_with_invalid_host_paths() {
+        // Points to an entirely non-existent procfs path that would error if accessed
+        let invalid_host_paths = HostPaths {
+            procfs: PathBuf::from("/proc/definitely_does_not_exist_12345"),
+            cgroupfs_override: Some(PathBuf::from(
+                "/sys/fs/cgroup/definitely_does_not_exist_12345",
+            )),
+            hugepages: PathBuf::from("/nonexistent/hugepages"),
+        };
+        let topo = make_test_topology_v2(PathBuf::from("/sys/fs/cgroup/mock"));
+
+        // Must succeed without performing I/O or attempting to discover against the invalid procfs path
+        let mgr = FsManager::with_topology_and_host_paths("test.slice", topo, invalid_host_paths);
+        assert!(
+            mgr.is_ok(),
+            "with_topology_and_host_paths must not perform host I/O"
+        );
+    }
+
+    #[test]
+    fn test_native_patch_rejects_unrepresentable_updates() {
+        let fixture = TestDir::new("native_memory_validation");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let topo = make_test_topology_v2(cgroupfs_root.clone());
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+        let mut manager =
+            FsManager::with_topology_and_host_paths("test.slice", topo, host_paths).unwrap();
+
+        let mut patch = ResourcePatch::default();
+        patch.memory.limit = Update::Set(-1);
+        assert!(matches!(
+            manager.set_resources(&patch),
+            Err(crate::manager::error::Error::InvalidArgument)
+        ));
+
+        let mut patch = ResourcePatch::default();
+        patch.memory.kernel = Update::Set(1);
+        assert!(matches!(
+            manager.set_resources(&patch),
+            Err(crate::manager::error::Error::Unsupported(_))
+        ));
+
+        let mut patch = ResourcePatch::default();
+        patch.memory.soft_limit = Update::Max;
+        assert!(matches!(
+            manager.set_resources(&patch),
+            Err(crate::manager::error::Error::Unsupported(_))
+        ));
+
+        let mut patch = ResourcePatch::default();
+        patch.blkio.leaf_weight = Update::Set(300);
+        assert!(matches!(
+            manager.set_resources(&patch),
+            Err(crate::manager::error::Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn test_v1_memory_patch_validates_swappiness_before_writes() {
+        let fixture = TestDir::new("v1_memory_preflight");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let cgroup_dir = cgroupfs_root.join("memory/test.slice");
+        fs::create_dir_all(&cgroup_dir).unwrap();
+        let limit_path = cgroup_dir.join("memory.limit_in_bytes");
+        fs::write(&limit_path, "4096\n").unwrap();
+
+        let topology = make_test_topology_v1_memory(cgroupfs_root.clone());
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+        let mut manager =
+            FsManager::with_topology_and_host_paths("test.slice", topology, host_paths).unwrap();
+        let patch = ResourcePatch {
+            memory: MemoryPatch {
+                limit: Update::Set(1024),
+                swappiness: Update::Set(101),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            manager.set_resources(&patch),
+            Err(crate::manager::error::Error::InvalidArgument)
+        ));
+        assert_eq!(fs::read_to_string(limit_path).unwrap(), "4096\n");
+    }
+
+    #[test]
+    fn test_try_stats_reports_controller_failures() {
+        let fixture = TestDir::new("try_stats_error");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let cgroup_dir = cgroupfs_root.join("stats.slice");
+        fs::create_dir_all(&cgroup_dir).unwrap();
+        let topo = make_test_topology_v2(cgroupfs_root.clone());
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+        let manager =
+            FsManager::with_topology_and_host_paths("stats.slice", topo, host_paths).unwrap();
+
+        // Legacy stats remain a best-effort compatibility view.
+        let legacy_stats = manager.stats();
+        assert!(legacy_stats.memory.memory.is_some());
+        assert!(legacy_stats.memory.memory_swap.is_some());
+        // The fallible API preserves missing-file errors for controllers that
+        // are present, while controllers absent from the discovered topology
+        // are represented by their empty/default statistics.
+        assert!(manager.try_stats().is_err());
+        assert!(manager.try_cpu_cgroup_stats().is_err());
+        assert!(manager.try_memory_cgroup_stats().is_err());
+        assert!(manager.try_pids_cgroup_stats().is_err());
+        let blkio: BlkioCgroupStats = manager.try_blkio_cgroup_stats().unwrap();
+        assert!(blkio.io_service_bytes_recursive.is_empty());
+        let hugetlb: HugeTlbCgroupStats = manager.try_huge_tlb_cgroup_stats().unwrap();
+        assert!(hugetlb.is_empty());
+        let legacy = manager.pids_cgroup_stats();
+        assert_eq!(legacy.current, 0);
+        assert_eq!(legacy.limit, 0);
+    }
+
+    #[test]
+    fn test_try_cpu_stats_v2_does_not_require_cpuacct_controller() {
+        let fixture = TestDir::new("try_cpu_stats_v2");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let cgroup_dir = cgroupfs_root.join("stats.slice");
+        fs::create_dir_all(&cgroup_dir).unwrap();
+        fs::write(
+            cgroup_dir.join("cpu.stat"),
+            "nr_periods 3\nnr_throttled 1\nthrottled_time 7\n",
+        )
+        .unwrap();
+        let topo = make_test_topology_v2(cgroupfs_root.clone());
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+        let manager =
+            FsManager::with_topology_and_host_paths("stats.slice", topo, host_paths).unwrap();
+
+        let stats = manager.try_cpu_cgroup_stats().unwrap();
+        assert!(stats.cpu_acct.is_none());
+        let throttling: CpuThrottlingStats = stats.cpu_throttling.unwrap();
+        assert_eq!(throttling.periods, 3);
+        assert_eq!(throttling.throttled_periods, 1);
+        assert_eq!(throttling.throttled_time, 7);
+    }
+
+    #[test]
+    fn test_try_stats_v2_reads_only_discovered_controllers() {
+        let fixture = TestDir::new("try_stats_v2_subset");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let cgroup_dir = cgroupfs_root.join("stats.slice");
+        fs::create_dir_all(&cgroup_dir).unwrap();
+        for (file, value) in [
+            ("cpu.stat", "nr_periods 3\nnr_throttled 1\n"),
+            ("memory.high", "max\n"),
+            ("memory.low", "0\n"),
+            ("memory.max", "max\n"),
+            ("memory.min", "0\n"),
+            ("memory.current", "42\n"),
+            ("memory.stat", "anon 42\n"),
+            ("memory.swap.max", "max\n"),
+            ("memory.swap.current", "0\n"),
+            ("pids.current", "2\n"),
+            ("pids.max", "10\n"),
+        ] {
+            fs::write(cgroup_dir.join(file), value).unwrap();
+        }
+        let topo = make_test_topology_v2(cgroupfs_root.clone());
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+        let manager =
+            FsManager::with_topology_and_host_paths("stats.slice", topo, host_paths).unwrap();
+
+        let stats = manager.try_stats().unwrap();
+        assert!(stats.cpu.cpu_acct.is_none());
+        assert_eq!(stats.memory.memory.unwrap().usage, 42);
+        assert_eq!(stats.memory.memory_swap.unwrap().limit, -1);
+        assert_eq!(stats.pids.current, 2);
+        assert!(stats.blkio.io_service_bytes_recursive.is_empty());
+        assert!(stats.hugetlb.is_empty());
     }
 }

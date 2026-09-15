@@ -3,7 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
+use oci_spec::runtime::LinuxResources;
+
 use crate::manager::error::{Error, Result};
+use crate::model::resources::{
+    BlockDeviceThrottle, BlockDeviceWeight, HugePageLimit, ResourcePatch, Update,
+};
 use crate::{CPU_SHARES_V1_MAX, CPU_WEIGHT_V2_MAX};
 
 // Converts CPU shares, used by cgroup v1, to CPU weight, used by cgroup
@@ -68,9 +73,240 @@ pub(crate) fn memory_swap_to_cgroup_v2(memswap_limit: i64, mem_limit: i64) -> Re
     Ok(memswap_limit - mem_limit)
 }
 
+/// Convert an OCI [`LinuxResources`] specification into a cgroup-native
+/// [`ResourcePatch`] for the selected hierarchy.
+///
+/// OCI defines `memory.swap` as a memory+swap combined limit, while cgroup v2
+/// exposes swap alone in `memory.swap.max`.  That policy conversion belongs at
+/// this boundary; native backends must apply the resulting patch literally.
+pub fn oci_to_resource_patch(resources: &LinuxResources, v2: bool) -> Result<ResourcePatch> {
+    let mut patch = ResourcePatch::default();
+
+    if let Some(cpu) = resources.cpu() {
+        if let Some(cpus) = cpu.cpus() {
+            patch.cpuset.cpus = Update::Set(cpus.clone());
+        }
+        if let Some(mems) = cpu.mems() {
+            patch.cpuset.mems = Update::Set(mems.clone());
+        }
+        if let Some(shares) = cpu.shares() {
+            patch.cpu.shares = Update::Set(shares);
+        }
+        if let Some(quota) = cpu.quota() {
+            patch.cpu.quota = if quota == -1 {
+                Update::Max
+            } else {
+                Update::Set(quota)
+            };
+        }
+        if let Some(period) = cpu.period() {
+            patch.cpu.period = Update::Set(period);
+        }
+        if let Some(rt_runtime) = cpu.realtime_runtime() {
+            patch.cpu.realtime_runtime = Update::Set(rt_runtime);
+        }
+        if let Some(rt_period) = cpu.realtime_period() {
+            patch.cpu.realtime_period = Update::Set(rt_period);
+        }
+    }
+
+    if let Some(memory) = resources.memory() {
+        let memory_limit = memory.limit().unwrap_or(0);
+        if let Some(limit) = memory.limit() {
+            patch.memory.limit = match limit {
+                -1 => Update::Max,
+                // Preserve the legacy OCI contract in which zero meant
+                // "unspecified". Native callers can still request Set(0).
+                0 => Update::Unchanged,
+                value => Update::Set(value),
+            };
+        }
+        if let Some(reservation) = memory.reservation() {
+            patch.memory.soft_limit = if reservation == -1 {
+                Update::Max
+            } else {
+                Update::Set(reservation)
+            };
+        }
+        if let Some(swap) = memory.swap() {
+            let swap = if v2 {
+                memory_swap_to_cgroup_v2(swap, memory_limit)?
+            } else {
+                swap
+            };
+            patch.memory.swap = match swap {
+                -1 => Update::Max,
+                0 => Update::Unchanged,
+                value => Update::Set(value),
+            };
+        } else if v2 && memory_limit == -1 {
+            // cgroup v2 exposes swap separately, so unlimited memory with no
+            // OCI swap limit also means an unlimited memory.swap.max.
+            patch.memory.swap = Update::Max;
+        }
+        if let Some(kernel) = memory.kernel() {
+            patch.memory.kernel = if kernel == -1 {
+                Update::Max
+            } else {
+                Update::Set(kernel)
+            };
+        }
+        if let Some(kernel_tcp) = memory.kernel_tcp() {
+            patch.memory.kernel_tcp = if kernel_tcp == -1 {
+                Update::Max
+            } else {
+                Update::Set(kernel_tcp)
+            };
+        }
+        if let Some(swappiness) = memory.swappiness() {
+            patch.memory.swappiness = Update::Set(swappiness);
+        }
+        if let Some(disable_oom_killer) = memory.disable_oom_killer() {
+            patch.memory.disable_oom_killer = Update::Set(disable_oom_killer);
+        }
+    }
+
+    if let Some(pids) = resources.pids() {
+        patch.pids.limit = if pids.limit() > 0 {
+            Update::Set(pids.limit())
+        } else {
+            Update::Max
+        };
+    }
+
+    if let Some(blkio) = resources.block_io() {
+        if let Some(weight) = blkio.weight() {
+            patch.blkio.weight = Update::Set(weight);
+        }
+        if let Some(leaf_weight) = blkio.leaf_weight() {
+            patch.blkio.leaf_weight = Update::Set(leaf_weight);
+        }
+        if let Some(weights) = blkio.weight_device() {
+            patch.blkio.weight_device = weights
+                .iter()
+                .map(|w| BlockDeviceWeight {
+                    major: w.major() as u64,
+                    minor: w.minor() as u64,
+                    weight: w.weight(),
+                    leaf_weight: w.leaf_weight(),
+                })
+                .collect();
+        }
+        if let Some(throttles) = blkio.throttle_read_bps_device() {
+            patch.blkio.throttle_read_bps_device = throttles
+                .iter()
+                .map(|t| BlockDeviceThrottle {
+                    major: t.major() as u64,
+                    minor: t.minor() as u64,
+                    rate: t.rate(),
+                })
+                .collect();
+        }
+        if let Some(throttles) = blkio.throttle_write_bps_device() {
+            patch.blkio.throttle_write_bps_device = throttles
+                .iter()
+                .map(|t| BlockDeviceThrottle {
+                    major: t.major() as u64,
+                    minor: t.minor() as u64,
+                    rate: t.rate(),
+                })
+                .collect();
+        }
+        if let Some(throttles) = blkio.throttle_read_iops_device() {
+            patch.blkio.throttle_read_iops_device = throttles
+                .iter()
+                .map(|t| BlockDeviceThrottle {
+                    major: t.major() as u64,
+                    minor: t.minor() as u64,
+                    rate: t.rate(),
+                })
+                .collect();
+        }
+        if let Some(throttles) = blkio.throttle_write_iops_device() {
+            patch.blkio.throttle_write_iops_device = throttles
+                .iter()
+                .map(|t| BlockDeviceThrottle {
+                    major: t.major() as u64,
+                    minor: t.minor() as u64,
+                    rate: t.rate(),
+                })
+                .collect();
+        }
+    }
+
+    if let Some(hugepage_limits) = resources.hugepage_limits() {
+        patch.hugepages.limits = hugepage_limits
+            .iter()
+            .map(|h| HugePageLimit {
+                page_size: h.page_size().clone(),
+                limit: h.limit() as u64,
+            })
+            .collect();
+    }
+
+    if let Some(network) = resources.network() {
+        if let Some(class_id) = network.class_id() {
+            patch.network.class_id = Update::Set(class_id as u64);
+        }
+        if let Some(priorities) = network.priorities() {
+            patch.network.priorities = priorities
+                .iter()
+                .map(|p| crate::model::resources::InterfacePriority {
+                    name: p.name().clone(),
+                    priority: p.priority() as u64,
+                })
+                .collect();
+        }
+    }
+
+    if let Some(devices) = resources.devices() {
+        patch.devices.rules = devices
+            .iter()
+            .map(|d| crate::model::resources::DeviceRule {
+                allow: d.allow(),
+                dev_type: d.typ().and_then(|t| t.as_str().chars().next()),
+                major: d.major(),
+                minor: d.minor(),
+                access: d.access().clone().unwrap_or_default(),
+            })
+            .collect();
+    }
+
+    if let Some(unified) = resources.unified() {
+        patch.custom_attributes = unified.clone();
+    }
+
+    Ok(patch)
+}
+
+/// Convert OCI resources for the direct cgroupfs backend.
+///
+/// On cgroup v1, the historical cgroupfs contract treats a missing or zero
+/// OCI `memory.swap` as unspecified. When memory itself becomes unlimited the
+/// combined `memory.memsw.limit_in_bytes` must therefore become unlimited as
+/// well; otherwise the kernel can reject the memory update while the old
+/// finite memsw ceiling remains in force. This is a cgroupfs compatibility
+/// rule, not a hierarchy-wide rule: systemd v1 cannot express a swap update.
+pub(crate) fn oci_to_cgroupfs_resource_patch(
+    resources: &LinuxResources,
+    v2: bool,
+) -> Result<ResourcePatch> {
+    let mut patch = oci_to_resource_patch(resources, v2)?;
+
+    if !v2 {
+        if let Some(memory) = resources.memory() {
+            if memory.limit() == Some(-1) && memory.swap().unwrap_or(0) == 0 {
+                patch.memory.swap = Update::Max;
+            }
+        }
+    }
+
+    Ok(patch)
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::manager::conv::*;
+    use super::*;
 
     #[test]
     fn test_cpu_shares_to_cgroup_v2() {
@@ -138,5 +374,72 @@ mod tests {
         assert!(memory_swap_to_cgroup_v2(50, 100).is_err());
         // Real swap
         assert_eq!(memory_swap_to_cgroup_v2(200, 100).unwrap(), 100);
+    }
+
+    #[test]
+    fn test_oci_to_resource_patch() {
+        use oci_spec::runtime::{
+            LinuxBlockIoBuilder, LinuxCpuBuilder, LinuxMemoryBuilder, LinuxResourcesBuilder,
+        };
+
+        let cpu = LinuxCpuBuilder::default()
+            .shares(2048u64)
+            .cpus("0-3".to_string())
+            .build()
+            .unwrap();
+
+        let memory = LinuxMemoryBuilder::default()
+            .limit(1024 * 1024 * 1024i64)
+            .swap(2 * 1024 * 1024 * 1024i64)
+            .build()
+            .unwrap();
+
+        let blkio = LinuxBlockIoBuilder::default()
+            .leaf_weight(300u16)
+            .build()
+            .unwrap();
+
+        let oci = LinuxResourcesBuilder::default()
+            .cpu(cpu)
+            .memory(memory)
+            .block_io(blkio)
+            .build()
+            .unwrap();
+
+        let patch = oci_to_resource_patch(&oci, true).unwrap();
+        assert_eq!(patch.cpu.shares, Update::Set(2048));
+        assert_eq!(patch.cpuset.cpus, Update::Set("0-3".to_string()));
+        assert_eq!(patch.memory.limit, Update::Set(1024 * 1024 * 1024));
+        assert_eq!(patch.memory.swap, Update::Set(1024 * 1024 * 1024));
+        assert_eq!(patch.blkio.leaf_weight, Update::Set(300));
+        assert!(patch.pids.limit.is_unchanged());
+    }
+
+    #[test]
+    fn test_unlimited_memory_swap_policy_is_backend_specific() {
+        use oci_spec::runtime::{LinuxMemoryBuilder, LinuxResourcesBuilder};
+
+        for swap in [None, Some(0)] {
+            let mut memory = LinuxMemoryBuilder::default().limit(-1i64);
+            if let Some(swap) = swap {
+                memory = memory.swap(swap);
+            }
+            let resources = LinuxResourcesBuilder::default()
+                .memory(memory.build().unwrap())
+                .build()
+                .unwrap();
+
+            let systemd_v1 = oci_to_resource_patch(&resources, false).unwrap();
+            assert_eq!(systemd_v1.memory.limit, Update::Max);
+            assert_eq!(systemd_v1.memory.swap, Update::Unchanged);
+
+            let cgroupfs_v1 = oci_to_cgroupfs_resource_patch(&resources, false).unwrap();
+            assert_eq!(cgroupfs_v1.memory.limit, Update::Max);
+            assert_eq!(cgroupfs_v1.memory.swap, Update::Max);
+
+            let v2 = oci_to_resource_patch(&resources, true).unwrap();
+            assert_eq!(v2.memory.limit, Update::Max);
+            assert_eq!(v2.memory.swap, Update::Max);
+        }
     }
 }
