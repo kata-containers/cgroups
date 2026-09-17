@@ -75,18 +75,28 @@ impl SystemdManager<'_> {
     /// Create a `SystemdManager` from a cgroup path using explicit host paths for discovery.
     pub fn with_host_paths(path: &str, host_paths: &HostPaths) -> Result<Self> {
         let topology = discover(host_paths).map_err(Error::Core)?;
-        Self::with_topology(path, topology)
+        Self::with_topology_and_host_paths(path, topology, host_paths.clone())
     }
 
     /// Create a `SystemdManager` using an already-discovered topology snapshot.
     pub fn with_topology(path: &str, topology: Arc<CgroupTopology>) -> Result<Self> {
+        Self::with_topology_and_host_paths(path, topology, HostPaths::default())
+    }
+
+    /// Create a `SystemdManager` using an already-discovered topology snapshot
+    /// and explicit host paths for later process-membership lookups.
+    pub fn with_topology_and_host_paths(
+        path: &str,
+        topology: Arc<CgroupTopology>,
+        host_paths: HostPaths,
+    ) -> Result<Self> {
         let (slice, unit) = Self::parse_slice_and_unit(path)?;
         let v2 = topology.version == CgroupVersion::V2;
         let props = PropertiesBuilder::default_cgroup(&slice, &unit).build_with_v2(v2);
         let slice_base = expand_slice(&slice)?;
 
         let fs_base = join_path(&slice_base, &unit)?;
-        let fs_manager = FsManager::with_topology(&fs_base, topology)?;
+        let fs_manager = FsManager::with_topology_and_host_paths(&fs_base, topology, host_paths)?;
 
         let cgroup = SystemdClient::new(&unit, props)?;
 
@@ -819,9 +829,10 @@ mod tests {
 #[cfg(test)]
 mod topology_tests {
     use super::SystemdManager;
-    use crate::discovery::{CgroupTopology, CgroupVersion};
+    use crate::discovery::{CgroupTopology, CgroupVersion, HostPaths};
     use crate::manager::conv;
-    use crate::model::{MemoryPatch, PidsPatch, Update};
+    use crate::model::{AttachDestination, MemoryPatch, PidsPatch, Update};
+    use crate::CgroupPid;
     use crate::Manager;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -867,6 +878,62 @@ mod topology_tests {
             &custom_cgroupfs.join("memory").to_string_lossy().to_string()
         );
         assert!(Arc::ptr_eq(manager.topology(), &topology));
+    }
+
+    #[test]
+    fn test_systemd_manager_preserves_injected_host_paths() {
+        struct TempGuard(PathBuf);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "systemd-host-paths-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _guard = TempGuard(temp_dir.clone());
+        let procfs = temp_dir.join("proc");
+        let cgroupfs = temp_dir.join("cgroupfs");
+        std::fs::create_dir_all(procfs.join("4242")).unwrap();
+        std::fs::create_dir_all(&cgroupfs).unwrap();
+        std::fs::write(
+            procfs.join("4242/cgroup"),
+            "0::/test.slice/scope-unit.scope/worker\n",
+        )
+        .unwrap();
+
+        let topology = Arc::new(CgroupTopology {
+            version: CgroupVersion::V2,
+            v2_available: true,
+            mounts: crate::discovery::MountTable::default(),
+            membership: crate::discovery::Membership::default(),
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root: cgroupfs.clone(),
+            hugepages: PathBuf::from("/nonexistent"),
+        });
+        let host_paths = HostPaths {
+            procfs,
+            cgroupfs_override: Some(cgroupfs),
+            hugepages: PathBuf::from("/nonexistent"),
+        };
+
+        let manager = SystemdManager::with_topology_and_host_paths(
+            "test.slice:scope:unit",
+            topology,
+            host_paths.clone(),
+        )
+        .unwrap();
+        assert_eq!(manager.fs_manager.host_paths(), &host_paths);
+
+        let destination = AttachDestination::SameCgroupAs(CgroupPid::from(4242u64));
+        let resolved = manager
+            .fs_manager
+            .resolve_destination(&destination)
+            .unwrap();
+        assert_eq!(resolved.as_path(), std::path::Path::new("worker"));
     }
 
     #[test]

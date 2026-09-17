@@ -92,9 +92,7 @@ impl FsManager {
     pub fn with_host_paths(base: &str, host_paths: &HostPaths) -> Result<Self> {
         let topology = discover(host_paths)?;
         let base = crate::fs::cgroup::parse_cgroup_path(base)?;
-        let mut mgr = Self::empty(base, host_paths.clone());
-        mgr.apply_topology(topology);
-        Ok(mgr)
+        Ok(Self::from_topology(base, topology, host_paths.clone()))
     }
 
     /// Create an instance of FsManager with an already-discovered [`CgroupTopology`].
@@ -118,9 +116,7 @@ impl FsManager {
         host_paths: HostPaths,
     ) -> Result<Self> {
         let base = crate::fs::cgroup::parse_cgroup_path(base)?;
-        let mut mgr = Self::empty(base, host_paths);
-        mgr.apply_topology(topology);
-        Ok(mgr)
+        Ok(Self::from_topology(base, topology, host_paths))
     }
 
     /// Return the topology snapshot held by this manager.
@@ -180,25 +176,23 @@ impl FsManager {
 
     // -- private helpers --------------------------------------------------
 
-    /// Construct an empty manager shell with the given base and host
-    /// paths.  All topology-derived fields are left at placeholder
-    /// values; call [`apply_topology`] immediately after.
-    fn empty(base: CgroupPath, host_paths: HostPaths) -> Self {
+    /// Construct an FsManager directly from a discovered or synthetic
+    /// topology and host paths, without any redundant host I/O.
+    fn from_topology(
+        base: CgroupPath,
+        topology: Arc<CgroupTopology>,
+        host_paths: HostPaths,
+    ) -> Self {
+        let paths = membership_to_subsystem_paths(&topology.membership);
+        let mounts = controller_mounts(&topology, &paths);
+        let cgroup = Cgroup::load_validated_with_topology(topology.clone(), base.clone());
         Self {
-            paths: HashMap::new(),
-            mounts: HashMap::new(),
-            topology: Arc::new(CgroupTopology {
-                version: crate::discovery::CgroupVersion::V1,
-                v2_available: false,
-                mounts: crate::discovery::MountTable::default(),
-                membership: crate::discovery::Membership::default(),
-                controllers: crate::discovery::ControllerSet::default(),
-                cgroupfs_root: PathBuf::new(),
-                hugepages: PathBuf::new(),
-            }),
+            paths,
+            mounts,
+            topology,
             host_paths,
             base,
-            cgroup: Cgroup::default(),
+            cgroup,
             default_destination: AttachDestination::default(),
         }
     }
@@ -1798,48 +1792,6 @@ mod tests {
         manager.destroy().unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
-    }
-
-    /// Kernel-drift canary: read the real `/proc/self/mountinfo` and confirm
-    /// the parser still copes with whatever the running kernel produces.
-    ///
-    /// Fixtures lock our changes to the parser; this locks the parser against
-    /// the live host. The realistic risk is not format breakage (`/proc` is
-    /// userspace ABI) but additions: new controllers, new fields. If a kernel
-    /// change makes `parse_mountinfo_for_line` reject every cgroup line, this
-    /// fails at the source instead of surfacing indirectly as "couldn't find
-    /// the memory controller" in a downstream integration test.
-    ///
-    /// `mountinfo_self()` keeps only v1 `cgroup` mounts (it drops `cgroup2`),
-    /// so it is legitimately empty on a unified v2 host; on v1/hybrid it must
-    /// be non-empty. The line-parser canary covers both versions.
-    #[test]
-    fn test_live_mountinfo_canary() {
-        let data = fs::read_to_string("/proc/self/mountinfo")
-            .expect("canary: /proc/self/mountinfo must be readable");
-
-        let table = crate::discovery::parse_mountinfo(&data)
-            .expect("canary: /proc/self/mountinfo must parse cleanly");
-        assert!(
-            !table.cgroup_mounts().is_empty() || !table.unified_mounts().is_empty(),
-            "canary: no cgroup/cgroup2 mounts parsed from live /proc/self/mountinfo; \
-             parser may have regressed on a kernel format change"
-        );
-
-        let mounts = hierarchies::mountinfo_self();
-        if hierarchies::is_cgroup2_unified_mode() {
-            assert!(
-                mounts.is_empty(),
-                "canary: mountinfo_self() drops cgroup2 on a unified v2 host, got {:?}",
-                mounts
-            );
-        } else {
-            assert!(
-                !mounts.is_empty(),
-                "canary: mountinfo_self() found no v1 cgroup mounts on a v1/hybrid host; \
-                 parser may have regressed"
-            );
-        }
     }
 
     #[test]

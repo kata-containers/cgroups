@@ -53,25 +53,49 @@ macro_rules! skip_if_root {
 }
 
 /// Return early from a test that does not support a cgroup v1 hierarchy.
+///
+/// A discovery failure is a test failure rather than a skip: controlled
+/// root/QEMU environments preflight their hierarchy, so silently returning
+/// here would hide parser or discovery regressions.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! skip_if_cgroups_v1 {
     () => {
-        if !$crate::fs::hierarchies::is_cgroup2_unified_mode() {
-            eprintln!("Skipping test in cgroups v1 mode");
-            return;
+        match $crate::fs::hierarchies::is_cgroup2_unified_mode_with_paths(
+            &$crate::discovery::HostPaths::default(),
+        ) {
+            Ok(true) => {} // unified v2 — proceed
+            Ok(false) => {
+                eprintln!("Skipping test in cgroups v1 mode");
+                return;
+            }
+            Err(e) => {
+                panic!("cgroup discovery failed while selecting a v2 test: {}", e);
+            }
         }
     };
 }
 
 /// Return early from a test that does not support a cgroup v2 hierarchy.
+///
+/// A discovery failure is a test failure rather than a skip: controlled
+/// root/QEMU environments preflight their hierarchy, so silently returning
+/// here would hide parser or discovery regressions.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! skip_if_cgroups_v2 {
     () => {
-        if $crate::fs::hierarchies::is_cgroup2_unified_mode() {
-            eprintln!("Skipping test in cgroups v2 mode");
-            return;
+        match $crate::fs::hierarchies::is_cgroup2_unified_mode_with_paths(
+            &$crate::discovery::HostPaths::default(),
+        ) {
+            Ok(false) => {} // v1 or hybrid — proceed
+            Ok(true) => {
+                eprintln!("Skipping test in cgroups v2 mode");
+                return;
+            }
+            Err(e) => {
+                panic!("cgroup discovery failed while selecting a v1 test: {}", e);
+            }
         }
     };
 }

@@ -368,8 +368,14 @@ impl Default for V1 {
 
 impl V2 {
     /// Build a cgroup v2 view of an already-discovered topology.
-    pub fn with_topology(topology: Arc<CgroupTopology>) -> V2 {
-        V2 { topology }
+    ///
+    /// Returns a [`CoreError::Discovery`] error before constructing the
+    /// hierarchy if `topology` describes a cgroup v1 or hybrid host. This
+    /// prevents v2 creation logic from treating a v1 cgroupfs root as a
+    /// unified hierarchy.
+    pub fn with_topology(topology: Arc<CgroupTopology>) -> CoreResult<V2> {
+        let error_path = topology.cgroupfs_root.clone();
+        Self::with_checked_topology(topology, error_path)
     }
 
     /// Build a cgroup v2 hierarchy from explicit host paths.
@@ -378,10 +384,16 @@ impl V2 {
     /// in unified cgroup v2 mode.
     pub fn with_host_paths(host_paths: &HostPaths) -> CoreResult<V2> {
         let topology = discover(host_paths)?;
+        Self::with_checked_topology(topology, host_paths.procfs.join("self/mountinfo"))
+    }
+
+    /// Validate the topology/hierarchy version invariant before exposing a
+    /// v2 hierarchy to cgroup mutation code.
+    fn with_checked_topology(topology: Arc<CgroupTopology>, error_path: PathBuf) -> CoreResult<V2> {
         if topology.version != CgroupVersion::V2 {
             return Err(crate::error::CoreError::Discovery {
                 step: "construct v2 hierarchy",
-                path: host_paths.procfs.join("self/mountinfo"),
+                path: error_path,
                 cause: std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -402,14 +414,8 @@ impl V2 {
     /// unified cgroup v2 mode. Use [`auto`] or [`V2::with_host_paths`] to
     /// handle non-v2 hosts cleanly.
     pub fn new() -> V2 {
-        let topology = discover(&HostPaths::default()).expect("cgroup discovery failed");
-        if topology.version != CgroupVersion::V2 {
-            panic!(
-                "cannot construct V2 hierarchy: host operates in {:?} mode, not unified cgroup v2",
-                topology.version
-            );
-        }
-        V2 { topology }
+        Self::with_host_paths(&HostPaths::default())
+            .expect("cgroup discovery failed or host is not in unified cgroup v2 mode")
     }
 }
 
@@ -866,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_with_host_paths_rejects_v1_topology() {
+    fn test_v2_constructors_reject_v1_topology_before_mutation() {
         struct TempGuard(PathBuf);
         impl Drop for TempGuard {
             fn drop(&mut self) {
@@ -893,13 +899,35 @@ mod tests {
             cgroupfs_override: Some(temp_dir.join("cgroupfs")),
             hugepages: temp_dir.join("hugepages"),
         };
+        let cgroupfs_root = v1_paths.cgroupfs_override.clone().unwrap();
+        std::fs::create_dir_all(&cgroupfs_root).unwrap();
 
-        // V2::with_host_paths must fail on v1 host
+        // Both checked entry points must fail on a v1 host.
         assert!(V2::with_host_paths(&v1_paths).is_err());
 
-        // And V2::subsystems must return empty if constructed with v1 topology
         let topology = discover(&v1_paths).unwrap();
-        let v2 = V2::with_topology(topology);
-        assert!(v2.subsystems().is_empty());
+        let target = cgroupfs_root.join("must-not-be-created");
+        match V2::with_topology(topology) {
+            Err(crate::error::CoreError::Discovery { step, path, cause }) => {
+                assert_eq!(step, "construct v2 hierarchy");
+                assert_eq!(path, cgroupfs_root);
+                assert_eq!(cause.kind(), std::io::ErrorKind::InvalidData);
+            }
+            Ok(v2) => {
+                // If the version check regresses, exercise the dangerous path:
+                // Cgroup::create would otherwise create this directory using
+                // v2 semantics under a v1 root and report success.
+                let cgroup = Cgroup::load_validated(
+                    Box::new(v2),
+                    CgroupPath::new("must-not-be-created").unwrap(),
+                );
+                cgroup.create().unwrap();
+            }
+            Err(other) => panic!("unexpected error: {}", other),
+        }
+        assert!(
+            !target.exists(),
+            "rejecting a v1 topology must happen before cgroupfs mutation"
+        );
     }
 }
