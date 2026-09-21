@@ -6,17 +6,20 @@
 //! Host discovery: pure parsers for kernel text formats.
 //!
 //! The parsers in this module transform supplied text or bytes into
-//! [`CgroupMountTable`] and [`CgroupMembership`] values and never perform I/O. Reading the host
-//! (`/proc` and the cgroup filesystem) belongs to the topology layer that
-//! assembles a snapshot from these pure results.
+//! [`CgroupMountTable`] and [`CgroupMembership`] values and never perform I/O.
+//! [`topology`] reads the host and assembles a snapshot from these pure results.
 
 pub mod membership;
 pub mod mountinfo;
+pub mod topology;
 
 pub use membership::{
     parse_membership, parse_membership_bytes, CgroupMembership, MembershipRecord,
 };
 pub use mountinfo::{parse_mountinfo, parse_mountinfo_bytes, CgroupMountTable, MountRecord};
+pub use topology::{
+    discover, CgroupTopology, CgroupVersion, ControllerIter, ControllerSet, HostPaths,
+};
 
 /// Iterate newline-delimited procfs records without applying text-mode CRLF
 /// normalization.

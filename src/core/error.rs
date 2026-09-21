@@ -2,7 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0 or MIT
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::io;
 use std::path::PathBuf;
 
 /// Convenience alias for `Result<T, CoreError>`.
@@ -10,7 +12,7 @@ pub type CoreResult<T> = std::result::Result<T, CoreError>;
 
 /// Core errors shared across all cgroup backends.
 ///
-/// These errors originate in the pure-core layer (path validation, parsing)
+/// These errors originate in path validation, parsing, and host discovery
 /// and will be preserved as context by backend-specific error enums.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +28,122 @@ pub enum CoreError {
     /// A mountinfo record failed to parse.
     #[error(transparent)]
     ParseMountError(#[from] ParseMountError),
+
+    /// A `/proc/<pid>/cgroup` parse error with the actual source file path.
+    ///
+    /// The discovery layer attaches the concrete file path that the pure
+    /// parser (which operates on byte buffers) does not know. The parse
+    /// error is preserved as the `#[source]` cause so line numbers and
+    /// format details remain accessible.
+    #[error("parse error in {path:?}: {cause}")]
+    ParseMembershipInFile {
+        /// The file that was read and could not be parsed.
+        path: PathBuf,
+        /// The underlying parse error (preserves line number and details).
+        #[source]
+        cause: ParseMembershipError,
+    },
+
+    /// A mountinfo parse error with the actual source file path.
+    ///
+    /// Same rationale as [`CoreError::ParseMembershipInFile`]: the pure
+    /// parser knows the format but not the file; the discovery layer
+    /// attaches the path.
+    #[error("parse error in {path:?}: {cause}")]
+    ParseMountInFile {
+        /// The file that was read and could not be parsed.
+        path: PathBuf,
+        /// The underlying parse error (preserves line number and details).
+        #[source]
+        cause: ParseMountError,
+    },
+
+    /// A procfs discovery file could not be read.
+    #[error("failed to read procfs file {path:?}: {cause}")]
+    ReadProcFile {
+        /// The procfs file that could not be read.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        cause: io::Error,
+    },
+
+    /// The statfs check on a candidate cgroup2 root failed.
+    #[error("statfs failed for cgroup root {path:?}: {cause}")]
+    StatfsCgroupRoot {
+        /// The candidate cgroup2 mount point.
+        path: PathBuf,
+        /// The underlying OS error, including its errno.
+        #[source]
+        cause: io::Error,
+    },
+
+    /// statfs succeeded, but the candidate root is not a cgroup2 filesystem.
+    #[error("cgroup root {path:?} is not a cgroup2 filesystem")]
+    NotCgroup2 {
+        /// The candidate cgroup2 mount point.
+        path: PathBuf,
+    },
+
+    /// The unified hierarchy's controller names could not be read.
+    #[error("failed to read cgroup controllers in {path:?}: {cause}")]
+    ReadControllers {
+        /// The `cgroup.controllers` file that could not be read.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        cause: io::Error,
+    },
+
+    /// The parsed host layout cannot produce a topology snapshot.
+    #[error("invalid cgroup layout in {path:?}: {cause}")]
+    Layout {
+        /// The procfs file containing the relevant layout records.
+        path: PathBuf,
+        /// The failed layout rule and its structured context.
+        #[source]
+        cause: LayoutError,
+    },
+}
+
+/// A host layout that cannot be represented as a cgroup topology.
+///
+/// These failures describe parsed records, not failed I/O operations.
+/// [`CoreError::Layout`] attaches the concrete procfs source path.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LayoutError {
+    /// The mount table contains neither cgroup nor cgroup2 mounts.
+    #[error("no cgroup or cgroup2 mounts found")]
+    NoCgroupMounts,
+
+    /// The visible v1 mounts imply different natural roots.
+    ///
+    /// Duplicate bind mounts of an already-visible hierarchy are deliberately
+    /// rejected when they imply different natural roots, rather than deduplicated
+    /// by hierarchy.
+    #[error("v1 cgroup mounts have different inferred roots: {roots:?}")]
+    AmbiguousV1Roots {
+        /// The distinct inferred roots, sorted for deterministic diagnostics.
+        roots: BTreeSet<PathBuf>,
+    },
+
+    /// A visible cgroup2 mount has no matching `0::` membership record.
+    #[error("unified mounts but the process has no `0::` membership record")]
+    MissingUnifiedMembership,
+
+    /// No visible cgroup2 mount contains the unified membership path.
+    #[error("no unified mount contains membership {membership:?}; visible mount roots: {roots:?}")]
+    NoMatchingUnifiedMount {
+        /// The path in the process's `0::` membership record.
+        membership: PathBuf,
+        /// The visible cgroup2 mount roots, sorted for deterministic diagnostics.
+        roots: BTreeSet<PathBuf>,
+    },
+
+    /// The process's cgroup membership file contains no records.
+    #[error("no membership records at all")]
+    NoMembershipRecords,
 }
 
 /// A malformed `/proc/<pid>/cgroup` membership record.
