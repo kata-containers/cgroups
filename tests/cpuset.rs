@@ -3,6 +3,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
+#![allow(deprecated)]
 use std::fs;
 
 use cgroups_rs::fs::cpuset::CpuSetController;

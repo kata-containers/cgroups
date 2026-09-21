@@ -35,6 +35,23 @@ macro_rules! skip_if_not_root {
     };
 }
 
+/// Return early from a test that requires unprivileged DAC permission enforcement.
+///
+/// Under effective UID 0 (root), the Linux kernel grants CAP_DAC_OVERRIDE and
+/// CAP_DAC_READ_SEARCH, which bypass standard file/directory permission mode bits.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! skip_if_root {
+    () => {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "Skipping test: requires unprivileged execution (root bypasses DAC permissions)"
+            );
+            return;
+        }
+    };
+}
+
 /// Return early from a test that does not support a cgroup v1 hierarchy.
 ///
 /// A discovery failure is a test failure rather than a skip: controlled

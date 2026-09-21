@@ -4,6 +4,7 @@
 //
 
 //! Integration tests about the hugetlb subsystem
+#![allow(deprecated)]
 use cgroups_rs::fs::memory::{MemController, SetMemory};
 use cgroups_rs::fs::{Cgroup, Controller, MaxValue};
 

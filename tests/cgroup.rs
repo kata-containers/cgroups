@@ -5,6 +5,7 @@
 //
 
 //! Simple unit tests about the control groups system.
+#![allow(deprecated)]
 use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;

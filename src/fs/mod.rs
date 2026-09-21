@@ -24,12 +24,70 @@ macro_rules! update_and_test {
     };
 }
 
+// Transitional compatibility for controllers that migrate to UpdateTracker
+// in the following PR.
 macro_rules! update {
     ($self: ident, $set_func:ident, $value:expr) => {
         if let Some(v) = $value {
             let _ = $self.$set_func(v);
         }
     };
+}
+
+/// Helper to track progress during multi-file resource updates.
+///
+/// Records which operations succeeded so that if an error occurs partway
+/// through an update, the error can report the exact set of changes that
+/// took effect before the failure.
+#[derive(Debug, Default)]
+pub(crate) struct UpdateTracker {
+    succeeded: Vec<String>,
+}
+
+impl UpdateTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            succeeded: Vec::new(),
+        }
+    }
+
+    /// Execute a fallible update step and record its name if successful.
+    /// If it fails, attaches all previously succeeded operations to the error.
+    pub(crate) fn step<F>(&mut self, name: &str, f: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        match f() {
+            Ok(()) => {
+                self.succeeded.push(name.to_string());
+                Ok(())
+            }
+            Err(e) => Err(e.with_succeeded(self.succeeded.clone())),
+        }
+    }
+
+    /// Execute an optional setter: if `val` is `Some(v)`, run `f(v)` and record `name`.
+    pub(crate) fn step_opt<T, F>(&mut self, name: &str, val: Option<T>, f: F) -> Result<()>
+    where
+        F: FnOnce(T) -> Result<()>,
+    {
+        if let Some(v) = val {
+            self.step(name, || f(v))?;
+        }
+        Ok(())
+    }
+
+    /// Return the list of operations that have succeeded so far.
+    #[allow(dead_code)]
+    pub(crate) fn succeeded(&self) -> &[String] {
+        &self.succeeded
+    }
+
+    /// Consume the tracker and return the succeeded list.
+    #[allow(dead_code)]
+    pub(crate) fn into_succeeded(self) -> Vec<String> {
+        self.succeeded
+    }
 }
 
 pub mod blkio;
@@ -232,6 +290,19 @@ mod sealed {
 pub(crate) use crate::fs::sealed::{ControllerInternal, CustomizedAttribute};
 use crate::CgroupPid;
 
+/// Read a kernel-version-dependent cgroup file.
+///
+/// A missing file means that the running kernel does not expose that optional
+/// statistic. Any other failure still belongs to the fallible `try_*`
+/// contract and must reach the caller.
+pub(crate) fn optional_read<T: Default>(result: Result<T>) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if error.is_not_found() => Ok(T::default()),
+        Err(error) => Err(error),
+    }
+}
+
 /// A Controller is a subsystem attached to the control group.
 ///
 /// Implementors are able to control certain aspects of a control group.
@@ -277,10 +348,24 @@ pub trait Controller {
     fn get_cgroup_type(&self) -> Result<String>;
 
     /// Get the list of tasks that this controller has.
+    #[deprecated(note = "use `try_tasks` instead")]
     fn tasks(&self) -> Vec<CgroupPid>;
 
+    /// Get the list of tasks that this controller has, returning an error if reading fails.
+    #[allow(deprecated)]
+    fn try_tasks(&self) -> Result<Vec<CgroupPid>> {
+        Ok(self.tasks())
+    }
+
     /// Get the list of procs that this controller has.
+    #[deprecated(note = "use `try_procs` instead")]
     fn procs(&self) -> Vec<CgroupPid>;
+
+    /// Get the list of procs that this controller has, returning an error if reading fails.
+    #[allow(deprecated)]
+    fn try_procs(&self) -> Result<Vec<CgroupPid>> {
+        Ok(self.procs())
+    }
 
     fn v2(&self) -> bool;
 }
@@ -404,7 +489,8 @@ where
         })
     }
 
-    /// Get the list of procs that this controller has.
+    /// Legacy best-effort process membership read.
+    #[allow(deprecated)]
     fn procs(&self) -> Vec<CgroupPid> {
         let file_name = "cgroup.procs";
         self.open_path(file_name, false)
@@ -413,10 +499,7 @@ where
                 let mut v = Vec::new();
                 for line in bf.lines() {
                     match line {
-                        Ok(line) => {
-                            let n = line.trim().parse().unwrap_or(0u64);
-                            v.push(n);
-                        }
+                        Ok(line) => v.push(line.trim().parse().unwrap_or(0u64)),
                         Err(_) => break,
                     }
                 }
@@ -425,28 +508,67 @@ where
             .unwrap_or_default()
     }
 
-    /// Get the list of tasks that this controller has.
-    fn tasks(&self) -> Vec<CgroupPid> {
-        let mut file_name = "tasks";
-        if self.is_v2() {
-            file_name = "cgroup.threads";
+    /// Get the list of procs that this controller has, returning an error if reading fails.
+    fn try_procs(&self) -> Result<Vec<CgroupPid>> {
+        let file_name = "cgroup.procs";
+        let file = self.open_path(file_name, false)?;
+        let bf = BufReader::new(file);
+        let mut v = Vec::new();
+        for line in bf.lines() {
+            let line = line.map_err(|e| Error::with_cause(ReadFailed(file_name.to_string()), e))?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let n: u64 = trimmed.parse().map_err(|_| Error::new(ParseError))?;
+            v.push(CgroupPid::from(n));
         }
+        Ok(v)
+    }
+
+    /// Legacy best-effort thread membership read.
+    #[allow(deprecated)]
+    fn tasks(&self) -> Vec<CgroupPid> {
+        let file_name = if self.is_v2() {
+            "cgroup.threads"
+        } else {
+            "tasks"
+        };
         self.open_path(file_name, false)
             .map(|file| {
                 let bf = BufReader::new(file);
                 let mut v = Vec::new();
                 for line in bf.lines() {
                     match line {
-                        Ok(line) => {
-                            let n = line.trim().parse().unwrap_or(0u64);
-                            v.push(n);
-                        }
+                        Ok(line) => v.push(line.trim().parse().unwrap_or(0u64)),
                         Err(_) => break,
                     }
                 }
                 v.into_iter().map(CgroupPid::from).collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Get the list of tasks that this controller has, returning an error if reading fails.
+    fn try_tasks(&self) -> Result<Vec<CgroupPid>> {
+        let file_name = if self.is_v2() {
+            "cgroup.threads"
+        } else {
+            "tasks"
+        };
+        let file = self.open_path(file_name, false)?;
+        let bf = BufReader::new(file);
+        let mut v = Vec::new();
+        for line in bf.lines() {
+            let line = line.map_err(|e| Error::with_cause(ReadFailed(file_name.to_string()), e))?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let n: u64 = trimmed.parse().map_err(|_| Error::new(ParseError))?;
+            v.push(CgroupPid::from(n));
+        }
+        Ok(v)
     }
 
     /// set cgroup.type
@@ -1040,4 +1162,93 @@ fn read_u64_from(file: File) -> Result<u64> {
 /// read and parse an i64 data
 fn read_i64_from(file: File) -> Result<i64> {
     read_from::<i64>(file)
+}
+
+#[cfg(test)]
+#[allow(deprecated)]
+mod controller_compatibility_tests {
+    use super::*;
+
+    /// Models a downstream implementation written against the released
+    /// `Controller` contract: it implements only the legacy `tasks` and
+    /// `procs` methods, not the newly added fallible methods.
+    struct LegacyController {
+        path: PathBuf,
+    }
+
+    impl Controller for LegacyController {
+        fn control_type(&self) -> Controllers {
+            Controllers::Cpu
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn base(&self) -> &Path {
+            &self.path
+        }
+
+        fn apply(&self, _res: &Resources) -> Result<()> {
+            Ok(())
+        }
+
+        fn create(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn exists(&self) -> bool {
+            true
+        }
+
+        fn set_notify_on_release(&self, _enable: bool) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_release_agent(&self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn add_task(&self, _pid: &CgroupPid) -> Result<()> {
+            Ok(())
+        }
+
+        fn add_task_by_tgid(&self, _pid: &CgroupPid) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_cgroup_type(&self, _cgroup_type: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_cgroup_type(&self) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn tasks(&self) -> Vec<CgroupPid> {
+            vec![CgroupPid::from(11u64)]
+        }
+
+        fn procs(&self) -> Vec<CgroupPid> {
+            vec![CgroupPid::from(22u64)]
+        }
+
+        fn v2(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn fallible_membership_methods_default_to_legacy_implementation() {
+        let controller = LegacyController {
+            path: PathBuf::from("/unused"),
+        };
+
+        assert_eq!(controller.try_tasks().unwrap(), controller.tasks());
+        assert_eq!(controller.try_procs().unwrap(), controller.procs());
+    }
 }

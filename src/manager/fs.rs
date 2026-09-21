@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
+// Built-in manager call sites move from the released best-effort readers to
+// their fallible counterparts in PR 8 of this stack.
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
