@@ -287,7 +287,6 @@ pub fn oci_to_resource_patch(resources: &LinuxResources, v2: bool) -> Result<Res
 /// well; otherwise the kernel can reject the memory update while the old
 /// finite memsw ceiling remains in force. This is a cgroupfs compatibility
 /// rule, not a hierarchy-wide rule: systemd v1 cannot express a swap update.
-#[allow(dead_code)] // consumed by the cgroupfs backend in the next PR
 pub(crate) fn oci_to_cgroupfs_resource_patch(
     resources: &LinuxResources,
     v2: bool,

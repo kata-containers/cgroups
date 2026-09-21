@@ -52,8 +52,17 @@ pub trait Manager: Send + Sync {
     /// Remove the cgroups.
     fn destroy(&mut self) -> Result<()>;
 
-    /// Set the resources to the cgroups.
-    fn set(&mut self, resources: &LinuxResources) -> Result<()>;
+    /// Set the resources to the cgroups using a cgroup-native [`ResourcePatch`].
+    fn set_resources(&mut self, resources: &ResourcePatch) -> Result<()>;
+
+    /// Set the resources to the cgroups using OCI [`LinuxResources`].
+    ///
+    /// This is an adapter method that translates OCI specification resources
+    /// into a cgroup-native [`ResourcePatch`] before applying.
+    fn set(&mut self, resources: &LinuxResources) -> Result<()> {
+        let patch = conv::oci_to_resource_patch(resources, self.v2())?;
+        self.set_resources(&patch)
+    }
 
     /// Get the cgroup path.
     ///

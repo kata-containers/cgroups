@@ -312,57 +312,6 @@ impl SystemdManager<'_> {
         self.systemd_client.set_properties(&[prop])?;
         Ok(())
     }
-
-    fn set_resources(&mut self, resources: &ResourcePatch) -> Result<()> {
-        let blkio = &resources.blkio;
-        if !blkio.weight.is_unchanged()
-            || !blkio.leaf_weight.is_unchanged()
-            || !blkio.weight_device.is_empty()
-            || !blkio.throttle_read_bps_device.is_empty()
-            || !blkio.throttle_write_bps_device.is_empty()
-            || !blkio.throttle_read_iops_device.is_empty()
-            || !blkio.throttle_write_iops_device.is_empty()
-        {
-            return Err(Error::Unsupported(
-                "blkio resources are not supported by systemd manager".to_string(),
-            ));
-        }
-
-        if !resources.hugepages.limits.is_empty() {
-            return Err(Error::Unsupported(
-                "hugetlb resources are not supported by systemd manager".to_string(),
-            ));
-        }
-
-        if !resources.network.class_id.is_unchanged() || !resources.network.priorities.is_empty() {
-            return Err(Error::Unsupported(
-                "network resources are not supported by systemd manager".to_string(),
-            ));
-        }
-
-        if !resources.devices.rules.is_empty() {
-            return Err(Error::Unsupported(
-                "devices resources are not supported by systemd manager".to_string(),
-            ));
-        }
-
-        if !resources.custom_attributes.is_empty() {
-            return Err(Error::Unsupported(
-                "custom_attributes are not supported by systemd manager".to_string(),
-            ));
-        }
-
-        let mut props = vec![];
-
-        self.set_cpuset_patch(&mut props, &resources.cpuset)?;
-        self.set_cpu_patch(&mut props, &resources.cpu)?;
-        self.set_memory_patch(&mut props, &resources.memory)?;
-        self.set_pids_patch(&mut props, &resources.pids)?;
-
-        self.systemd_client.set_properties(&props)?;
-
-        Ok(())
-    }
 }
 
 impl Manager for SystemdManager<'_> {
@@ -460,6 +409,57 @@ impl Manager for SystemdManager<'_> {
 
     fn pids(&self) -> Result<Vec<CgroupPid>> {
         self.fs_manager.pids()
+    }
+
+    fn set_resources(&mut self, resources: &ResourcePatch) -> Result<()> {
+        let blkio = &resources.blkio;
+        if !blkio.weight.is_unchanged()
+            || !blkio.leaf_weight.is_unchanged()
+            || !blkio.weight_device.is_empty()
+            || !blkio.throttle_read_bps_device.is_empty()
+            || !blkio.throttle_write_bps_device.is_empty()
+            || !blkio.throttle_read_iops_device.is_empty()
+            || !blkio.throttle_write_iops_device.is_empty()
+        {
+            return Err(Error::Unsupported(
+                "blkio resources are not supported by systemd manager".to_string(),
+            ));
+        }
+
+        if !resources.hugepages.limits.is_empty() {
+            return Err(Error::Unsupported(
+                "hugetlb resources are not supported by systemd manager".to_string(),
+            ));
+        }
+
+        if !resources.network.class_id.is_unchanged() || !resources.network.priorities.is_empty() {
+            return Err(Error::Unsupported(
+                "network resources are not supported by systemd manager".to_string(),
+            ));
+        }
+
+        if !resources.devices.rules.is_empty() {
+            return Err(Error::Unsupported(
+                "devices resources are not supported by systemd manager".to_string(),
+            ));
+        }
+
+        if !resources.custom_attributes.is_empty() {
+            return Err(Error::Unsupported(
+                "custom_attributes are not supported by systemd manager".to_string(),
+            ));
+        }
+
+        let mut props = vec![];
+
+        self.set_cpuset_patch(&mut props, &resources.cpuset)?;
+        self.set_cpu_patch(&mut props, &resources.cpu)?;
+        self.set_memory_patch(&mut props, &resources.memory)?;
+        self.set_pids_patch(&mut props, &resources.pids)?;
+
+        self.systemd_client.set_properties(&props)?;
+
+        Ok(())
     }
 
     fn set(&mut self, resources: &LinuxResources) -> Result<()> {
