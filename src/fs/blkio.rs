@@ -14,10 +14,10 @@ use std::path::PathBuf;
 use crate::fs::error::ErrorKind::*;
 use crate::fs::error::*;
 
-use crate::fs::{read_string_from, read_u64_from};
+use crate::fs::{optional_read, read_string_from, read_u64_from};
 use crate::fs::{
     BlkIoResources, ControllIdentifier, ControllerInternal, Controllers, CustomizedAttribute,
-    Resources, Subsystem,
+    Resources, Subsystem, UpdateTracker,
 };
 
 /// A controller that allows controlling the `blkio` subsystem of a Cgroup.
@@ -92,31 +92,19 @@ fn parse_io_service(s: String) -> Result<Vec<IoService>> {
     let mut io_services = Vec::<IoService>::new();
     let mut io_service = IoService::default();
 
-    let lines = s
-        .lines()
-        .filter(|x| x.split_whitespace().count() == 3)
-        .map(|x| {
-            let mut spl = x.split_whitespace();
-            (
-                spl.next().unwrap(),
-                spl.next().unwrap(),
-                spl.next().unwrap(),
-            )
-        })
-        .map(|(a, b, c)| {
-            let mut spl = a.split(':');
-            (
-                spl.next().unwrap().parse::<i16>(),
-                spl.next().unwrap().parse::<i16>(),
-                b,
-                c,
-            )
-        })
-        .collect::<Vec<_>>();
-
-    for (major_num, minor_num, op, val) in lines.iter() {
-        let major = *major_num.as_ref().map_err(|_| Error::new(ParseError))?;
-        let minor = *minor_num.as_ref().map_err(|_| Error::new(ParseError))?;
+    for line in s.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.is_empty() || (fields.len() == 2 && fields[0] == "Total") {
+            continue;
+        }
+        if fields.len() != 3 {
+            return Err(Error::new(ParseError));
+        }
+        let (major, minor) = fields[0]
+            .split_once(':')
+            .ok_or_else(|| Error::new(ParseError))?;
+        let major = major.parse::<i16>().map_err(|_| Error::new(ParseError))?;
+        let minor = minor.parse::<i16>().map_err(|_| Error::new(ParseError))?;
 
         if (major != io_service.major || minor != io_service.minor) && io_service.major != 0 {
             // new block device
@@ -127,9 +115,11 @@ fn parse_io_service(s: String) -> Result<Vec<IoService>> {
         io_service.major = major;
         io_service.minor = minor;
 
-        let val = val.parse::<u64>().map_err(|_| Error::new(ParseError))?;
+        let val = fields[2]
+            .parse::<u64>()
+            .map_err(|_| Error::new(ParseError))?;
 
-        match *op {
+        match fields[1] {
             "Read" => io_service.read = val,
             "Write" => io_service.write = val,
             "Sync" => io_service.sync = val,
@@ -147,82 +137,94 @@ fn parse_io_service(s: String) -> Result<Vec<IoService>> {
     Ok(io_services)
 }
 
-fn get_value(s: &str) -> String {
-    let arr = s.split(':').collect::<Vec<&str>>();
-    if arr.len() != 2 {
-        return "0".to_string();
-    }
-    arr[1].to_string()
-}
+fn parse_io_stat(s: String) -> Result<Vec<IoStat>> {
+    let mut stats = Vec::new();
 
-fn parse_io_stat(s: String) -> Vec<IoStat> {
-    // line:
-    // 8:0 rbytes=180224 wbytes=0 rios=3 wios=0 dbytes=0 dios=0
-    s.lines()
-        .filter(|x| x.split_whitespace().count() == 7)
-        .map(|x| {
-            let arr = x.split_whitespace().collect::<Vec<&str>>();
-            let device = arr[0].split(':').collect::<Vec<&str>>();
-            let (major, minor) = (device[0], device[1]);
+    for line in s.lines().filter(|line| !line.trim().is_empty()) {
+        let mut fields = line.split_whitespace();
+        let device = fields.next().ok_or_else(|| Error::new(ParseError))?;
+        let (major, minor) = device
+            .split_once(':')
+            .ok_or_else(|| Error::new(ParseError))?;
+        let mut stat = IoStat {
+            major: major.parse::<i16>().map_err(|_| Error::new(ParseError))?,
+            minor: minor.parse::<i16>().map_err(|_| Error::new(ParseError))?,
+            rbytes: 0,
+            wbytes: 0,
+            rios: 0,
+            wios: 0,
+            dbytes: 0,
+            dios: 0,
+        };
 
-            IoStat {
-                major: major.parse::<i16>().unwrap(),
-                minor: minor.parse::<i16>().unwrap(),
-                rbytes: get_value(arr[1]).parse::<u64>().unwrap(),
-                wbytes: get_value(arr[2]).parse::<u64>().unwrap(),
-                rios: get_value(arr[3]).parse::<u64>().unwrap(),
-                wios: get_value(arr[4]).parse::<u64>().unwrap(),
-                dbytes: get_value(arr[5]).parse::<u64>().unwrap(),
-                dios: get_value(arr[6]).parse::<u64>().unwrap(),
+        // io.stat is a nested-keyed file: counters can be omitted when zero,
+        // their order is not significant, and future kernels may add keys.
+        for field in fields {
+            let (key, value) = field
+                .split_once('=')
+                .ok_or_else(|| Error::new(ParseError))?;
+            let value = value.parse::<u64>().map_err(|_| Error::new(ParseError))?;
+
+            match key {
+                "rbytes" => stat.rbytes = value,
+                "wbytes" => stat.wbytes = value,
+                "rios" => stat.rios = value,
+                "wios" => stat.wios = value,
+                "dbytes" => stat.dbytes = value,
+                "dios" => stat.dios = value,
+                _ => {}
             }
-        })
-        .collect::<Vec<IoStat>>()
+        }
+
+        stats.push(stat);
+    }
+
+    Ok(stats)
 }
 
 fn parse_io_service_total(s: String) -> Result<u64> {
-    s.lines()
-        .find_map(|line| {
-            let mut parts = line.split_whitespace();
-            match (parts.next(), parts.next(), parts.next()) {
-                (Some("Total"), Some(val), None) => val.parse::<u64>().ok(),
-                _ => None,
-            }
-        })
-        .ok_or_else(|| Error::new(ParseError))
+    if s.trim().is_empty() {
+        return Ok(0);
+    }
+
+    for line in s.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("Total") {
+            continue;
+        }
+        let value = parts.next().ok_or_else(|| Error::new(ParseError))?;
+        if parts.next().is_some() {
+            return Err(Error::new(ParseError));
+        }
+        return value.parse::<u64>().map_err(|_| Error::new(ParseError));
+    }
+
+    Err(Error::new(ParseError))
 }
 
 fn parse_blkio_data(s: String) -> Result<Vec<BlkIoData>> {
-    let r = s
-        .chars()
-        .map(|x| if x == ':' { ' ' } else { x })
-        .collect::<String>();
-
-    let r = r
-        .lines()
-        .flat_map(|x| x.split_whitespace())
-        .collect::<Vec<_>>();
-
-    let r = r.chunks(3).collect::<Vec<_>>();
-
     let mut res = Vec::new();
-
-    let err = r.iter().try_for_each(|x| match x {
-        [major, minor, data] => {
-            res.push(BlkIoData {
-                major: major.parse::<i16>().unwrap(),
-                minor: minor.parse::<i16>().unwrap(),
-                data: data.parse::<u64>().unwrap(),
-            });
-            Ok(())
+    for line in s.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.is_empty() {
+            continue;
         }
-        _ => Err(Error::new(ParseError)),
-    });
-
-    if err.is_err() {
-        Err(Error::new(ParseError))
-    } else {
-        Ok(res)
+        if fields.len() != 2 {
+            return Err(Error::new(ParseError));
+        }
+        let (major, minor) = fields[0]
+            .split_once(':')
+            .ok_or_else(|| Error::new(ParseError))?;
+        res.push(BlkIoData {
+            major: major.parse::<i16>().map_err(|_| Error::new(ParseError))?,
+            minor: minor.parse::<i16>().map_err(|_| Error::new(ParseError))?,
+            data: fields[1]
+                .parse::<u64>()
+                .map_err(|_| Error::new(ParseError))?,
+        });
     }
+
+    Ok(res)
 }
 
 /// Current state and statistics about how throttled are the block devices when accessed from the
@@ -367,42 +369,70 @@ impl ControllerInternal for BlkIoController {
     fn apply(&self, res: &Resources) -> Result<()> {
         // get the resources that apply to this controller
         let res: &BlkIoResources = &res.blkio;
+        let mut tracker = UpdateTracker::new();
 
-        if let Some(weight) = res.weight {
-            let _ = self.set_weight(weight as u64);
-        }
-        if let Some(leaf_weight) = res.leaf_weight {
-            let _ = self.set_leaf_weight(leaf_weight as u64);
-        }
+        tracker.step_opt("blkio.weight", res.weight, |weight| {
+            self.set_weight(weight as u64)
+        })?;
+        tracker.step_opt("blkio.leaf_weight", res.leaf_weight, |leaf_weight| {
+            self.set_leaf_weight(leaf_weight as u64)
+        })?;
 
         for dev in &res.weight_device {
             if let Some(weight) = dev.weight {
-                let _ = self.set_weight_for_device(dev.major, dev.minor, weight as u64);
+                tracker.step(
+                    &format!("blkio.weight_device:{}:{}", dev.major, dev.minor),
+                    || self.set_weight_for_device(dev.major, dev.minor, weight as u64),
+                )?;
             }
             if let Some(leaf_weight) = dev.leaf_weight {
-                let _ = self.set_leaf_weight_for_device(dev.major, dev.minor, leaf_weight as u64);
+                tracker.step(
+                    &format!("blkio.leaf_weight_device:{}:{}", dev.major, dev.minor),
+                    || self.set_leaf_weight_for_device(dev.major, dev.minor, leaf_weight as u64),
+                )?;
             }
         }
 
         for dev in &res.throttle_read_bps_device {
-            let _ = self.throttle_read_bps_for_device(dev.major, dev.minor, dev.rate);
+            tracker.step(
+                &format!("blkio.throttle.read_bps_device:{}:{}", dev.major, dev.minor),
+                || self.throttle_read_bps_for_device(dev.major, dev.minor, dev.rate),
+            )?;
         }
 
         for dev in &res.throttle_write_bps_device {
-            let _ = self.throttle_write_bps_for_device(dev.major, dev.minor, dev.rate);
+            tracker.step(
+                &format!(
+                    "blkio.throttle.write_bps_device:{}:{}",
+                    dev.major, dev.minor
+                ),
+                || self.throttle_write_bps_for_device(dev.major, dev.minor, dev.rate),
+            )?;
         }
 
         for dev in &res.throttle_read_iops_device {
-            let _ = self.throttle_read_iops_for_device(dev.major, dev.minor, dev.rate);
+            tracker.step(
+                &format!(
+                    "blkio.throttle.read_iops_device:{}:{}",
+                    dev.major, dev.minor
+                ),
+                || self.throttle_read_iops_for_device(dev.major, dev.minor, dev.rate),
+            )?;
         }
 
         for dev in &res.throttle_write_iops_device {
-            let _ = self.throttle_write_iops_for_device(dev.major, dev.minor, dev.rate);
+            tracker.step(
+                &format!(
+                    "blkio.throttle.write_iops_device:{}:{}",
+                    dev.major, dev.minor
+                ),
+                || self.throttle_write_iops_for_device(dev.major, dev.minor, dev.rate),
+            )?;
         }
 
-        res.attrs.iter().for_each(|(k, v)| {
-            let _ = self.set(k, v);
-        });
+        for (k, v) in &res.attrs {
+            tracker.step(k, || self.set(k, v))?;
+        }
 
         Ok(())
     }
@@ -439,246 +469,247 @@ impl BlkIoController {
         }
     }
 
-    fn blkio_v2(&self) -> BlkIo {
+    fn blkio_v2_from_stat(stat_str: String) -> BlkIo {
         BlkIo {
-            io_stat: self
-                .open_path("io.stat", false)
-                .and_then(read_string_from)
-                .map(parse_io_stat)
-                .unwrap_or_default(),
+            io_stat: parse_io_stat(stat_str).unwrap_or_default(),
             ..Default::default()
         }
     }
 
+    fn try_blkio_v2(&self) -> Result<BlkIo> {
+        let stat_str = self
+            .open_path("io.stat", false)
+            .and_then(read_string_from)?;
+        Ok(BlkIo {
+            io_stat: parse_io_stat(stat_str)?,
+            ..Default::default()
+        })
+    }
+
     /// Gathers statistics about and reports the state of the block devices used by the control
     /// group's tasks.
+    #[deprecated(note = "use `try_blkio` instead")]
     pub fn blkio(&self) -> BlkIo {
         if self.v2 {
-            return self.blkio_v2();
+            let stat = self
+                .open_path("io.stat", false)
+                .and_then(read_string_from)
+                .unwrap_or_default();
+            return Self::blkio_v2_from_stat(stat);
         }
-        BlkIo {
-            io_merged: self
+
+        let io_serviced = self
+            .open_path("blkio.io_serviced", false)
+            .and_then(read_string_from)
+            .unwrap_or_default();
+        let io_service_bytes = self
+            .open_path("blkio.io_service_bytes", false)
+            .and_then(read_string_from)
+            .unwrap_or_default();
+        self.blkio_v1_from_primary(io_serviced, io_service_bytes, false)
+            .expect("best-effort blkio conversion cannot fail")
+    }
+
+    /// Gathers statistics about and reports the state of the block devices used by the control
+    /// group's tasks, or an error if reading failed.
+    pub fn try_blkio(&self) -> Result<BlkIo> {
+        if self.v2 {
+            return self.try_blkio_v2();
+        }
+        let io_serviced_str = self
+            .open_path("blkio.io_serviced", false)
+            .and_then(read_string_from)?;
+        let io_service_bytes_str = self
+            .open_path("blkio.io_service_bytes", false)
+            .and_then(read_string_from)?;
+
+        self.blkio_v1_from_primary(io_serviced_str, io_service_bytes_str, true)
+    }
+
+    fn blkio_v1_from_primary(
+        &self,
+        io_serviced_str: String,
+        io_service_bytes_str: String,
+        fallible: bool,
+    ) -> Result<BlkIo> {
+        macro_rules! stat {
+            ($result:expr) => {{
+                let result = $result;
+                if fallible {
+                    optional_read(result)?
+                } else {
+                    result.unwrap_or_default()
+                }
+            }};
+        }
+
+        Ok(BlkIo {
+            io_merged: stat!(self
                 .open_path("blkio.io_merged", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_merged_total: self
+                .and_then(parse_io_service)),
+            io_merged_total: stat!(self
                 .open_path("blkio.io_merged", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            io_merged_recursive: self
+                .and_then(parse_io_service_total)),
+            io_merged_recursive: stat!(self
                 .open_path("blkio.io_merged_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_merged_recursive_total: self
+                .and_then(parse_io_service)),
+            io_merged_recursive_total: stat!(self
                 .open_path("blkio.io_merged_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            io_queued: self
+                .and_then(parse_io_service_total)),
+            io_queued: stat!(self
                 .open_path("blkio.io_queued", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_queued_total: self
+                .and_then(parse_io_service)),
+            io_queued_total: stat!(self
                 .open_path("blkio.io_queued", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            io_queued_recursive: self
+                .and_then(parse_io_service_total)),
+            io_queued_recursive: stat!(self
                 .open_path("blkio.io_queued_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_queued_recursive_total: self
+                .and_then(parse_io_service)),
+            io_queued_recursive_total: stat!(self
                 .open_path("blkio.io_queued_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            io_service_bytes: self
-                .open_path("blkio.io_service_bytes", false)
-                .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_service_bytes_total: self
-                .open_path("blkio.io_service_bytes", false)
-                .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            io_service_bytes_recursive: self
+                .and_then(parse_io_service_total)),
+            io_service_bytes: stat!(parse_io_service(io_service_bytes_str.clone())),
+            io_service_bytes_total: stat!(parse_io_service_total(io_service_bytes_str)),
+            io_service_bytes_recursive: stat!(self
                 .open_path("blkio.io_service_bytes_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_service_bytes_recursive_total: self
+                .and_then(parse_io_service)),
+            io_service_bytes_recursive_total: stat!(self
                 .open_path("blkio.io_service_bytes_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            io_serviced: self
-                .open_path("blkio.io_serviced", false)
-                .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_serviced_total: self
-                .open_path("blkio.io_serviced", false)
-                .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            io_serviced_recursive: self
+                .and_then(parse_io_service_total)),
+            io_serviced: stat!(parse_io_service(io_serviced_str.clone())),
+            io_serviced_total: stat!(parse_io_service_total(io_serviced_str)),
+            io_serviced_recursive: stat!(self
                 .open_path("blkio.io_serviced_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_serviced_recursive_total: self
+                .and_then(parse_io_service)),
+            io_serviced_recursive_total: stat!(self
                 .open_path("blkio.io_serviced_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            io_service_time: self
+                .and_then(parse_io_service_total)),
+            io_service_time: stat!(self
                 .open_path("blkio.io_service_time", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_service_time_total: self
+                .and_then(parse_io_service)),
+            io_service_time_total: stat!(self
                 .open_path("blkio.io_service_time", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            io_service_time_recursive: self
+                .and_then(parse_io_service_total)),
+            io_service_time_recursive: stat!(self
                 .open_path("blkio.io_service_time_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_service_time_recursive_total: self
+                .and_then(parse_io_service)),
+            io_service_time_recursive_total: stat!(self
                 .open_path("blkio.io_service_time_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            io_wait_time: self
+                .and_then(parse_io_service_total)),
+            io_wait_time: stat!(self
                 .open_path("blkio.io_wait_time", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_wait_time_total: self
+                .and_then(parse_io_service)),
+            io_wait_time_total: stat!(self
                 .open_path("blkio.io_wait_time", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            io_wait_time_recursive: self
+                .and_then(parse_io_service_total)),
+            io_wait_time_recursive: stat!(self
                 .open_path("blkio.io_wait_time_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service)
-                .unwrap_or_default(),
-            io_wait_time_recursive_total: self
+                .and_then(parse_io_service)),
+            io_wait_time_recursive_total: stat!(self
                 .open_path("blkio.io_wait_time_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_io_service_total)
-                .unwrap_or_default(),
-            leaf_weight: self
+                .and_then(parse_io_service_total)),
+            leaf_weight: stat!(self
                 .open_path("blkio.leaf_weight", false)
-                .and_then(read_u64_from)
-                .unwrap_or(0u64),
-            leaf_weight_device: self
+                .and_then(read_u64_from)),
+            leaf_weight_device: stat!(self
                 .open_path("blkio.leaf_weight_device", false)
                 .and_then(read_string_from)
-                .and_then(parse_blkio_data)
-                .unwrap_or_default(),
-            sectors: self
+                .and_then(parse_blkio_data)),
+            sectors: stat!(self
                 .open_path("blkio.sectors", false)
                 .and_then(read_string_from)
-                .and_then(parse_blkio_data)
-                .unwrap_or_default(),
-            sectors_recursive: self
+                .and_then(parse_blkio_data)),
+            sectors_recursive: stat!(self
                 .open_path("blkio.sectors_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_blkio_data)
-                .unwrap_or_default(),
+                .and_then(parse_blkio_data)),
             throttle: BlkIoThrottle {
-                io_service_bytes: self
+                io_service_bytes: stat!(self
                     .open_path("blkio.throttle.io_service_bytes", false)
                     .and_then(read_string_from)
-                    .and_then(parse_io_service)
-                    .unwrap_or_default(),
-                io_service_bytes_total: self
+                    .and_then(parse_io_service)),
+                io_service_bytes_total: stat!(self
                     .open_path("blkio.throttle.io_service_bytes", false)
                     .and_then(read_string_from)
-                    .and_then(parse_io_service_total)
-                    .unwrap_or_default(),
-                io_service_bytes_recursive: self
+                    .and_then(parse_io_service_total)),
+                io_service_bytes_recursive: stat!(self
                     .open_path("blkio.throttle.io_service_bytes_recursive", false)
                     .and_then(read_string_from)
-                    .and_then(parse_io_service)
-                    .unwrap_or_default(),
-                io_service_bytes_recursive_total: self
+                    .and_then(parse_io_service)),
+                io_service_bytes_recursive_total: stat!(self
                     .open_path("blkio.throttle.io_service_bytes_recursive", false)
                     .and_then(read_string_from)
-                    .and_then(parse_io_service_total)
-                    .unwrap_or_default(),
-                io_serviced: self
+                    .and_then(parse_io_service_total)),
+                io_serviced: stat!(self
                     .open_path("blkio.throttle.io_serviced", false)
                     .and_then(read_string_from)
-                    .and_then(parse_io_service)
-                    .unwrap_or_default(),
-                io_serviced_total: self
+                    .and_then(parse_io_service)),
+                io_serviced_total: stat!(self
                     .open_path("blkio.throttle.io_serviced", false)
                     .and_then(read_string_from)
-                    .and_then(parse_io_service_total)
-                    .unwrap_or_default(),
-                io_serviced_recursive: self
+                    .and_then(parse_io_service_total)),
+                io_serviced_recursive: stat!(self
                     .open_path("blkio.throttle.io_serviced_recursive", false)
                     .and_then(read_string_from)
-                    .and_then(parse_io_service)
-                    .unwrap_or_default(),
-                io_serviced_recursive_total: self
+                    .and_then(parse_io_service)),
+                io_serviced_recursive_total: stat!(self
                     .open_path("blkio.throttle.io_serviced_recursive", false)
                     .and_then(read_string_from)
-                    .and_then(parse_io_service_total)
-                    .unwrap_or_default(),
-                read_bps_device: self
+                    .and_then(parse_io_service_total)),
+                read_bps_device: stat!(self
                     .open_path("blkio.throttle.read_bps_device", false)
                     .and_then(read_string_from)
-                    .and_then(parse_blkio_data)
-                    .unwrap_or_default(),
-                read_iops_device: self
+                    .and_then(parse_blkio_data)),
+                read_iops_device: stat!(self
                     .open_path("blkio.throttle.read_iops_device", false)
                     .and_then(read_string_from)
-                    .and_then(parse_blkio_data)
-                    .unwrap_or_default(),
-                write_bps_device: self
+                    .and_then(parse_blkio_data)),
+                write_bps_device: stat!(self
                     .open_path("blkio.throttle.write_bps_device", false)
                     .and_then(read_string_from)
-                    .and_then(parse_blkio_data)
-                    .unwrap_or_default(),
-                write_iops_device: self
+                    .and_then(parse_blkio_data)),
+                write_iops_device: stat!(self
                     .open_path("blkio.throttle.write_iops_device", false)
                     .and_then(read_string_from)
-                    .and_then(parse_blkio_data)
-                    .unwrap_or_default(),
+                    .and_then(parse_blkio_data)),
             },
-            time: self
+            time: stat!(self
                 .open_path("blkio.time", false)
                 .and_then(read_string_from)
-                .and_then(parse_blkio_data)
-                .unwrap_or_default(),
-            time_recursive: self
+                .and_then(parse_blkio_data)),
+            time_recursive: stat!(self
                 .open_path("blkio.time_recursive", false)
                 .and_then(read_string_from)
-                .and_then(parse_blkio_data)
-                .unwrap_or_default(),
-            weight: self
+                .and_then(parse_blkio_data)),
+            weight: stat!(self
                 .open_path("blkio.weight", false)
-                .and_then(read_u64_from)
-                .unwrap_or(0u64),
-            weight_device: self
+                .and_then(read_u64_from)),
+            weight_device: stat!(self
                 .open_path("blkio.weight_device", false)
                 .and_then(read_string_from)
-                .and_then(parse_blkio_data)
-                .unwrap_or_default(),
+                .and_then(parse_blkio_data)),
             io_stat: Vec::new(),
-        }
+        })
     }
 
     /// Set the leaf weight on the control group's tasks, i.e., how are they weighted against the
@@ -829,9 +860,10 @@ impl BlkIoController {
 impl CustomizedAttribute for BlkIoController {}
 #[cfg(test)]
 mod test {
-    use crate::fs::blkio::{parse_blkio_data, BlkIoData};
-    use crate::fs::blkio::{parse_io_service, parse_io_service_total, IoService};
+    use crate::fs::blkio::{parse_blkio_data, BlkIoController, BlkIoData};
+    use crate::fs::blkio::{parse_io_service, parse_io_service_total, parse_io_stat, IoService};
     use crate::fs::error::*;
+    use std::fs;
 
     static TEST_VALUE: &str = "\
 8:32 Read 4280320
@@ -869,6 +901,13 @@ Total 61823067136
     fn test_parse_io_service_total() {
         let ok = parse_io_service_total(TEST_VALUE.to_string()).unwrap();
         assert_eq!(ok, 61823067136);
+        assert_eq!(parse_io_service_total(String::new()).unwrap(), 0);
+        assert_eq!(
+            parse_io_service_total("Total invalid\n".to_string())
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::ParseError
+        );
     }
 
     #[test]
@@ -971,5 +1010,105 @@ b:32 Write 1
                 }
             ]
         );
+        assert_eq!(
+            parse_blkio_data("8:not-a-minor 1\n".to_string())
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::ParseError
+        );
+    }
+
+    #[test]
+    fn test_parse_io_stat_accepts_keyed_partial_device_lines() {
+        let input = concat!(
+            "8:0 dios=6 rbytes=1 unknown=7 wios=4 rios=3 dbytes=5 wbytes=2\n",
+            "7:7 \n",
+            "8:1 wbytes=9\n",
+        );
+
+        assert_eq!(
+            parse_io_stat(input.to_string()).unwrap(),
+            vec![
+                crate::fs::blkio::IoStat {
+                    major: 8,
+                    minor: 0,
+                    rbytes: 1,
+                    wbytes: 2,
+                    rios: 3,
+                    wios: 4,
+                    dbytes: 5,
+                    dios: 6,
+                },
+                crate::fs::blkio::IoStat {
+                    major: 7,
+                    minor: 7,
+                    rbytes: 0,
+                    wbytes: 0,
+                    rios: 0,
+                    wios: 0,
+                    dbytes: 0,
+                    dios: 0,
+                },
+                crate::fs::blkio::IoStat {
+                    major: 8,
+                    minor: 1,
+                    rbytes: 0,
+                    wbytes: 9,
+                    rios: 0,
+                    wios: 0,
+                    dbytes: 0,
+                    dios: 0,
+                },
+            ]
+        );
+
+        assert_eq!(
+            BlkIoController::blkio_v2_from_stat(input.to_string())
+                .io_stat
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_parse_io_stat_reports_malformed_values() {
+        let valid = "8:0 rbytes=1 wbytes=2 rios=3 wios=4 dbytes=5 dios=6\n";
+        assert_eq!(
+            parse_io_stat(valid.replace("rbytes=1", "rbytes=invalid"))
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::ParseError
+        );
+        assert_eq!(
+            parse_io_stat("8:0 rbytes\n".to_string())
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::ParseError
+        );
+    }
+
+    #[test]
+    fn test_try_blkio_defaults_only_missing_optional_files() {
+        let path = std::env::temp_dir().join(format!(
+            "cgroups-blkio-try-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("blkio.io_serviced"), TEST_VALUE).unwrap();
+        fs::write(path.join("blkio.io_service_bytes"), TEST_VALUE).unwrap();
+        let controller = BlkIoController::new(path.clone(), path.clone(), false);
+
+        let stats = controller.try_blkio().unwrap();
+        assert_eq!(stats.io_serviced_total, 61823067136);
+        assert_eq!(stats.weight, 0);
+
+        fs::write(path.join("blkio.weight"), "invalid\n").unwrap();
+        assert_eq!(
+            controller.try_blkio().unwrap_err().kind(),
+            &ErrorKind::ParseError
+        );
+
+        fs::remove_dir_all(path).unwrap();
     }
 }
