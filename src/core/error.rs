@@ -7,6 +7,8 @@ use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 
+use crate::core::discovery::CgroupVersion;
+
 /// Convenience alias for `Result<T, CoreError>`.
 pub type CoreResult<T> = std::result::Result<T, CoreError>;
 
@@ -17,6 +19,17 @@ pub type CoreResult<T> = std::result::Result<T, CoreError>;
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
+    /// The requested hierarchy version differs from the topology's primary
+    /// cgroup version.
+    #[error("cannot build a cgroup {requested:?} hierarchy from a {found:?} topology at {path:?}")]
+    VersionMismatch {
+        /// The cgroupfs root of the supplied topology.
+        path: PathBuf,
+        /// The cgroup version requested for the hierarchy.
+        requested: CgroupVersion,
+        /// The primary cgroup version recorded by the topology.
+        found: CgroupVersion,
+    },
     /// A cgroup path failed validation.
     #[error(transparent)]
     PathError(#[from] PathError),
@@ -344,6 +357,14 @@ impl ParseMountError {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PathError {
+    /// A legacy string-based hierarchy cannot represent the path.
+    #[error("invalid cgroup path {input:?} in {operation}: legacy hierarchy requires UTF-8")]
+    NonUtf8 {
+        /// The original input that was rejected.
+        input: PathBuf,
+        /// The operation that attempted to use the path.
+        operation: &'static str,
+    },
     /// The path is absolute (starts with `/`).
     #[error("invalid cgroup path {input:?} in {operation}: path is absolute")]
     AbsolutePath {

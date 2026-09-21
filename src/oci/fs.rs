@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
+// The manager migrates to checked cgroup entry points in the next PR.
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

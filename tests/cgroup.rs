@@ -209,6 +209,7 @@ fn test_kill_cgroup() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_cgroup_with_relative_paths() {
     cgroups_rs::skip_if_not_root!();
     cgroups_rs::skip_if_cgroups_v2!();
