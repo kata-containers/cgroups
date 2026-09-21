@@ -24,16 +24,6 @@ macro_rules! update_and_test {
     };
 }
 
-// Transitional compatibility for controllers that migrate to UpdateTracker
-// in the following PR.
-macro_rules! update {
-    ($self: ident, $set_func:ident, $value:expr) => {
-        if let Some(v) = $value {
-            let _ = $self.$set_func(v);
-        }
-    };
-}
-
 /// Helper to track progress during multi-file resource updates.
 ///
 /// Records which operations succeeded so that if an error occurs partway

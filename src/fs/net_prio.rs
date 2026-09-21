@@ -17,13 +17,14 @@ use crate::fs::error::*;
 use crate::fs::read_u64_from;
 use crate::fs::{
     ControllIdentifier, ControllerInternal, Controllers, NetworkResources, Resources, Subsystem,
+    UpdateTracker,
 };
 
 /// A controller that allows controlling the `net_prio` subsystem of a Cgroup.
 ///
 /// In essence, using `net_prio` one can set the priority of the packets emitted from the control
 /// group's tasks. This can then be used to have QoS restrictions on certain control groups and
-/// thus, prioritizing certain tasks.
+/// tasks.
 #[derive(Debug, Clone)]
 pub struct NetPrioController {
     base: PathBuf,
@@ -47,9 +48,12 @@ impl ControllerInternal for NetPrioController {
     fn apply(&self, res: &Resources) -> Result<()> {
         // get the resources that apply to this controller
         let res: &NetworkResources = &res.network;
+        let mut tracker = UpdateTracker::new();
 
         for i in &res.priorities {
-            let _ = self.set_if_prio(&i.name, i.priority);
+            tracker.step(&format!("net_prio.ifpriomap:{}", i.name), || {
+                self.set_if_prio(&i.name, i.priority)
+            })?;
         }
 
         Ok(())
@@ -87,10 +91,17 @@ impl NetPrioController {
     }
 
     /// Retrieves the current priority of the emitted packets.
+    #[deprecated(note = "use `try_prio_idx` instead")]
     pub fn prio_idx(&self) -> u64 {
         self.open_path("net_prio.prioidx", false)
             .and_then(read_u64_from)
             .unwrap_or(0)
+    }
+
+    /// Retrieves the current priority of the emitted packets, or an error if reading failed.
+    pub fn try_prio_idx(&self) -> Result<u64> {
+        self.open_path("net_prio.prioidx", false)
+            .and_then(read_u64_from)
     }
 
     /// A map of priorities for each network interface.
