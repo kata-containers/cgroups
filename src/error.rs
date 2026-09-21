@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 or MIT
 
+use std::io;
 use std::path::PathBuf;
 
 /// Convenience alias for `Result<T, CoreError>`.
@@ -34,6 +35,18 @@ pub enum CoreError {
         line: usize,
         /// Human-readable description of the malformation.
         reason: String,
+    },
+
+    /// A host discovery step failed while reading the host.
+    #[error("discovery failed at {step} ({path}): {cause}")]
+    Discovery {
+        /// The discovery step that failed.
+        step: &'static str,
+        /// The host path the step was operating on.
+        path: PathBuf,
+        /// The underlying I/O error, preserved as the error-chain source.
+        #[source]
+        cause: io::Error,
     },
 }
 
