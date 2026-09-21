@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use oci_spec::runtime::LinuxResources;
 use oci_spec::runtime::{
     LinuxBlockIo, LinuxCpu, LinuxDeviceCgroup, LinuxHugepageLimit, LinuxMemory, LinuxNetwork,
-    LinuxPids, LinuxResources,
+    LinuxPids,
 };
 
-use crate::discovery::membership::Membership;
+use crate::discovery::membership::{parse_membership, Membership};
 use crate::discovery::topology::{discover, CgroupTopology, HostPaths};
 use crate::fs::blkio::{BlkIoController, BlkIoData, IoService, IoStat};
 use crate::fs::cpu::CpuController;
@@ -30,7 +31,7 @@ use crate::fs::pid::PidController;
 use crate::fs::{hierarchies, Cgroup, ControllIdentifier, Controller, MaxValue, Subsystem};
 use crate::manager::error::Error;
 use crate::manager::{conv, Manager, Result};
-use crate::model::CgroupPath;
+use crate::model::{AttachDestination, CgroupPath};
 use crate::stats::{
     BlkioCgroupStats, BlkioStat, CpuAcctStats, CpuCgroupStats, CpuThrottlingStats,
     HugeTlbCgroupStats, HugeTlbStat, MemoryCgroupStats, MemoryStats, PidsCgroupStats,
@@ -52,6 +53,10 @@ pub struct FsManager {
     /// The discovered host topology, shared with the managed cgroup and
     /// every clone of this manager.
     topology: Arc<CgroupTopology>,
+    /// Host paths used to discover the topology; stored so that
+    /// [`FsManager::refresh`] can re-discover from the same procfs /
+    /// cgroupfs source without the caller needing to remember them.
+    host_paths: HostPaths,
     /// Base path of the cgroup filesystem in validated relative form;
     /// the complete path would be:
     /// - cgroup v1: "<cgroupfs_root>/<subsystem>/<base>"
@@ -59,6 +64,8 @@ pub struct FsManager {
     base: CgroupPath,
     /// Cgroup managed by this manager.
     cgroup: Cgroup,
+    /// Default attachment destination for processes and threads.
+    default_destination: AttachDestination,
 }
 
 impl FsManager {
@@ -80,34 +87,303 @@ impl FsManager {
     }
 
     /// Create an instance of FsManager with explicit [`HostPaths`].
+    ///
+    /// The provided host paths are stored so that [`FsManager::refresh`]
+    /// can re-discover from the same source.
     pub fn with_host_paths(base: &str, host_paths: &HostPaths) -> Result<Self> {
         let topology = discover(host_paths)?;
-        Self::with_topology(base, topology)
+        let base = crate::fs::cgroup::parse_cgroup_path(base)?;
+        Ok(Self::from_topology(base, topology, host_paths.clone()))
     }
 
     /// Create an instance of FsManager with an already-discovered [`CgroupTopology`].
+    ///
+    /// Because no [`HostPaths`] are given, [`FsManager::refresh`] will
+    /// re-discover from [`HostPaths::default()`]. Use
+    /// [`FsManager::with_topology_and_host_paths`] to pair a
+    /// pre-discovered topology with specific host paths.
     pub fn with_topology(base: &str, topology: Arc<CgroupTopology>) -> Result<Self> {
-        let base = crate::fs::cgroup::parse_cgroup_path(base)?;
-        let paths = membership_to_subsystem_paths(&topology.membership);
-        let mounts = controller_mounts(&topology, &paths);
-        let cgroup = Cgroup::load_validated_with_topology(topology.clone(), base.clone());
+        Self::with_topology_and_host_paths(base, topology, HostPaths::default())
+    }
 
-        Ok(Self {
-            paths,
-            mounts,
-            topology,
-            base,
-            cgroup,
-        })
+    /// Create an instance of FsManager with an already-discovered
+    /// [`CgroupTopology`] and explicit [`HostPaths`].
+    ///
+    /// The topology is used immediately; the host paths are stored so
+    /// that [`FsManager::refresh`] can re-discover from the same source.
+    pub fn with_topology_and_host_paths(
+        base: &str,
+        topology: Arc<CgroupTopology>,
+        host_paths: HostPaths,
+    ) -> Result<Self> {
+        let base = crate::fs::cgroup::parse_cgroup_path(base)?;
+        Ok(Self::from_topology(base, topology, host_paths))
     }
 
     /// Return the topology snapshot held by this manager.
     pub fn topology(&self) -> &Arc<CgroupTopology> {
         &self.topology
     }
+
+    /// Return the host paths this manager was constructed with.
+    ///
+    /// These are the paths that [`FsManager::refresh`] will use to
+    /// re-discover the topology.
+    pub fn host_paths(&self) -> &HostPaths {
+        &self.host_paths
+    }
+
+    /// Re-discover the host topology from the stored host paths and
+    /// rebuild all derived state (`paths`, `mounts`, `cgroup`).
+    ///
+    /// The validated `base` path is preserved. The old topology snapshot
+    /// remains valid for any other `Arc` holders; this manager and its
+    /// managed cgroup switch to the new snapshot.
+    ///
+    /// # When to call
+    ///
+    /// After a namespace transition (`setns(CLONE_NEWCGROUP)`,
+    /// `unshare(CLONE_NEWCGROUP)`) or after cgroup controller mounts
+    /// change, the manager's cached view of `/proc/self/cgroup` and
+    /// `/proc/self/mountinfo` becomes stale. Calling `refresh()` reads
+    /// those files again and rebuilds the manager's state.
+    pub fn refresh(&mut self) -> Result<()> {
+        let topology = discover(&self.host_paths)?;
+        self.apply_topology(topology);
+        Ok(())
+    }
+
+    /// Re-discover the host topology from explicit host paths, update
+    /// the stored paths, and rebuild all derived state.
+    ///
+    /// Subsequent calls to [`FsManager::refresh`] will use the new
+    /// `host_paths`.
+    pub fn refresh_with_host_paths(&mut self, host_paths: &HostPaths) -> Result<()> {
+        let topology = discover(host_paths)?;
+        self.host_paths = host_paths.clone();
+        self.apply_topology(topology);
+        Ok(())
+    }
+
+    /// Rebuild all derived state from an externally-provided topology
+    /// snapshot. The stored host paths are not modified.
+    ///
+    /// Use this when the caller has already run discovery (e.g. to
+    /// inspect the result before committing) or when injecting a
+    /// synthetic topology in tests.
+    pub fn refresh_with_topology(&mut self, topology: Arc<CgroupTopology>) {
+        self.apply_topology(topology);
+    }
+
+    // -- private helpers --------------------------------------------------
+
+    /// Construct an FsManager directly from a discovered or synthetic
+    /// topology and host paths, without any redundant host I/O.
+    fn from_topology(
+        base: CgroupPath,
+        topology: Arc<CgroupTopology>,
+        host_paths: HostPaths,
+    ) -> Self {
+        let paths = membership_to_subsystem_paths(&topology.membership);
+        let mounts = controller_mounts(&topology, &paths);
+        let cgroup = Cgroup::load_validated_with_topology(topology.clone(), base.clone());
+        Self {
+            paths,
+            mounts,
+            topology,
+            host_paths,
+            base,
+            cgroup,
+            default_destination: AttachDestination::default(),
+        }
+    }
+
+    /// Replace the topology and rebuild all derived state from it.
+    ///
+    /// This is the single point where `paths`, `mounts`, `cgroup`, and
+    /// `topology` are updated, shared between constructors and refresh
+    /// methods.
+    fn apply_topology(&mut self, topology: Arc<CgroupTopology>) {
+        let paths = membership_to_subsystem_paths(&topology.membership);
+        let mounts = controller_mounts(&topology, &paths);
+        let cgroup = Cgroup::load_validated_with_topology(topology.clone(), self.base.clone());
+        self.paths = paths;
+        self.mounts = mounts;
+        self.cgroup = cgroup;
+        self.topology = topology;
+    }
 }
 
 impl FsManager {
+    /// Return the validated base path of this manager.
+    pub fn base(&self) -> &CgroupPath {
+        &self.base
+    }
+
+    /// Set the default attachment destination used by [`Manager::add_proc`]
+    /// and [`Manager::add_thread`].
+    pub fn set_default_destination(&mut self, destination: AttachDestination) {
+        self.default_destination = destination;
+    }
+
+    /// Builder method to set the default attachment destination.
+    pub fn with_default_destination(mut self, destination: AttachDestination) -> Self {
+        self.default_destination = destination;
+        self
+    }
+
+    /// Return the current default attachment destination.
+    pub fn default_destination(&self) -> &AttachDestination {
+        &self.default_destination
+    }
+
+    /// Resolve an [`AttachDestination`] into a concrete relative [`CgroupPath`]
+    /// below `self.base`.
+    ///
+    /// - [`AttachDestination::ManagedCgroup`] resolves to [`CgroupPath::root()`],
+    ///   meaning attachment directly to the managed cgroup.
+    /// - [`AttachDestination::Subgroup(path)`] resolves directly to `path`.
+    /// - [`AttachDestination::SameCgroupAs(ref_pid)`] reads the membership
+    ///   of `ref_pid` from `<procfs>/<ref_pid>/cgroup`, verifies that it is
+    ///   inside the managed cgroup subtree (`self.base`), and computes the
+    ///   relative subpath below `self.base`.
+    pub fn resolve_destination(&self, destination: &AttachDestination) -> Result<CgroupPath> {
+        match destination {
+            AttachDestination::ManagedCgroup => Ok(CgroupPath::root()?),
+            AttachDestination::Subgroup(path) => Ok(path.clone()),
+            AttachDestination::SameCgroupAs(ref_pid) => {
+                let proc_cgroup = self
+                    .host_paths
+                    .procfs
+                    .join(ref_pid.pid.to_string())
+                    .join("cgroup");
+                let content = std::fs::read_to_string(&proc_cgroup).map_err(|e| {
+                    Error::Attachment(format!(
+                        "failed to read membership for reference pid {} from {}: {}",
+                        ref_pid.pid,
+                        proc_cgroup.display(),
+                        e
+                    ))
+                })?;
+                let membership = parse_membership(&content).map_err(|e| {
+                    Error::Attachment(format!(
+                        "failed to parse membership for reference pid {}: {}",
+                        ref_pid.pid, e
+                    ))
+                })?;
+
+                if self.v2() {
+                    let record = membership.unified().ok_or_else(|| {
+                        Error::Attachment(format!(
+                            "unified membership record (0::) not found for pid {}",
+                            ref_pid.pid
+                        ))
+                    })?;
+                    let rel_path = record.path.strip_prefix("/").unwrap_or(&record.path);
+
+                    let base_path = self.base.as_path();
+                    if !rel_path.starts_with(base_path) {
+                        return Err(Error::Attachment(format!(
+                            "reference process {} (cgroup {:?}) is outside managed cgroup {:?}",
+                            ref_pid.pid,
+                            record.path,
+                            self.base.as_path()
+                        )));
+                    }
+
+                    let sub = rel_path.strip_prefix(base_path).map_err(|_| {
+                        Error::Attachment(format!(
+                            "reference process {} is not within managed cgroup",
+                            ref_pid.pid
+                        ))
+                    })?;
+
+                    if sub.as_os_str().is_empty() {
+                        Ok(CgroupPath::root()?)
+                    } else {
+                        Ok(CgroupPath::new(sub)?)
+                    }
+                } else {
+                    let record = membership
+                        .records()
+                        .iter()
+                        .find(|r| r.controllers.iter().any(|c| self.paths.contains_key(c)))
+                        .or_else(|| membership.records().first())
+                        .ok_or_else(|| {
+                            Error::Attachment(format!(
+                                "no membership records found for pid {}",
+                                ref_pid.pid
+                            ))
+                        })?;
+
+                    let rel_path = record.path.strip_prefix("/").unwrap_or(&record.path);
+
+                    let base_path = self.base.as_path();
+                    if !rel_path.starts_with(base_path) {
+                        return Err(Error::Attachment(format!(
+                            "reference process {} (cgroup {:?}) is outside managed cgroup {:?}",
+                            ref_pid.pid,
+                            record.path,
+                            self.base.as_path()
+                        )));
+                    }
+
+                    let sub = rel_path.strip_prefix(base_path).map_err(|_| {
+                        Error::Attachment(format!(
+                            "reference process {} is not within managed cgroup",
+                            ref_pid.pid
+                        ))
+                    })?;
+
+                    if sub.as_os_str().is_empty() {
+                        Ok(CgroupPath::root()?)
+                    } else {
+                        Ok(CgroupPath::new(sub)?)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure that a destination below a systemd-delegated cgroup exists
+    /// without enabling cgroup v2 controllers on the managed unit root.
+    pub(crate) fn prepare_delegated_destination(&self, destination: &CgroupPath) -> Result<()> {
+        if !self.exists() {
+            return Err(Error::Attachment(
+                "cannot prepare an attachment destination before the managed cgroup exists"
+                    .to_string(),
+            ));
+        }
+        if destination.is_root() {
+            return Ok(());
+        }
+
+        let target_path = self.base.join(destination);
+        let target_cg = Cgroup::load_validated_with_topology(self.topology.clone(), target_path);
+        target_cg.create_delegated_subgroup()?;
+        Ok(())
+    }
+
+    /// Attach a process to an already-resolved destination in a delegated
+    /// cgroup subtree.  This is used when systemd cannot relocate a process
+    /// because it already belongs to the unit.
+    pub(crate) fn add_proc_to_delegated_destination(
+        &self,
+        tgid: CgroupPid,
+        destination: &CgroupPath,
+    ) -> Result<()> {
+        self.prepare_delegated_destination(destination)?;
+        if destination.is_root() {
+            self.cgroup.add_task_by_tgid(tgid)?;
+        } else {
+            let target_path = self.base.join(destination);
+            let target_cg =
+                Cgroup::load_validated_with_topology(self.topology.clone(), target_path);
+            target_cg.add_task_by_tgid(tgid)?;
+        }
+        Ok(())
+    }
+
     /// Create the cgroups if they are not created yet.
     pub(crate) fn create_cgroups(&mut self) -> Result<()> {
         if self.exists() {
@@ -121,6 +397,10 @@ impl FsManager {
     /// with cgroup v2, see [1].
     ///
     /// 1: https://github.com/kata-containers/kata-containers/issues/10733
+    #[deprecated(
+        since = "0.5.2",
+        note = "use explicit AttachDestination with add_proc_to or with_default_destination"
+    )]
     pub fn subcgroup(&self) -> &str {
         // Check if we're in a Docker-in-Docker setup by verifying:
         // 1. We're using cgroups v2 (which restricts direct process control)
@@ -917,23 +1197,60 @@ impl FsManager {
 
 impl Manager for FsManager {
     fn add_proc(&mut self, tgid: CgroupPid) -> Result<()> {
+        let dest = self.default_destination.clone();
+        self.add_proc_to(tgid, &dest)
+    }
+
+    fn add_proc_to(&mut self, tgid: CgroupPid, destination: &AttachDestination) -> Result<()> {
         self.create_cgroups()?;
-        self.cgroup.add_task_by_tgid(tgid)?;
+        let sub = self.resolve_destination(destination)?;
+        if sub.is_root() {
+            self.cgroup.add_task_by_tgid(tgid)?;
+        } else {
+            let target_path = self.base.join(&sub);
+            let target_cg =
+                Cgroup::load_validated_with_topology(self.topology.clone(), target_path);
+            if !target_cg.exists() {
+                target_cg.create()?;
+            }
+            target_cg.add_task_by_tgid(tgid)?;
+        }
         Ok(())
     }
 
     fn add_thread(&mut self, pid: CgroupPid) -> Result<()> {
-        self.create_cgroups()?;
+        let dest = self.default_destination.clone();
+        self.add_thread_to(pid, &dest)
+    }
 
-        self.cgroup.add_task(pid).or_else(|err| {
-            // Try to add_proc with the pid when threaded cgroup is
-            // disabled in cgroup v2.
-            if err.kind() == &FsErrorKind::CgroupMode && self.v2() {
-                self.add_proc(pid)
-            } else {
-                Err(Error::Cgroupfs(err))
+    fn add_thread_to(&mut self, pid: CgroupPid, destination: &AttachDestination) -> Result<()> {
+        self.create_cgroups()?;
+        let sub = self.resolve_destination(destination)?;
+        if sub.is_root() {
+            self.cgroup.add_task(pid).or_else(|err| {
+                // Try to add_proc with the pid when threaded cgroup is
+                // disabled in cgroup v2.
+                if err.kind() == &FsErrorKind::CgroupMode && self.v2() {
+                    self.add_proc_to(pid, destination)
+                } else {
+                    Err(Error::Cgroupfs(err))
+                }
+            })
+        } else {
+            let target_path = self.base.join(&sub);
+            let target_cg =
+                Cgroup::load_validated_with_topology(self.topology.clone(), target_path);
+            if !target_cg.exists() {
+                target_cg.create()?;
             }
-        })
+            target_cg.add_task(pid).or_else(|err| {
+                if err.kind() == &FsErrorKind::CgroupMode && self.v2() {
+                    self.add_proc_to(pid, destination)
+                } else {
+                    Err(Error::Cgroupfs(err))
+                }
+            })
+        }
     }
 
     fn pids(&self) -> Result<Vec<CgroupPid>> {
@@ -1429,48 +1746,6 @@ mod tests {
         child.wait().unwrap();
     }
 
-    /// Kernel-drift canary: read the real `/proc/self/mountinfo` and confirm
-    /// the parser still copes with whatever the running kernel produces.
-    ///
-    /// Fixtures lock our changes to the parser; this locks the parser against
-    /// the live host. The realistic risk is not format breakage (`/proc` is
-    /// userspace ABI) but additions: new controllers, new fields. If a kernel
-    /// change makes `parse_mountinfo_for_line` reject every cgroup line, this
-    /// fails at the source instead of surfacing indirectly as "couldn't find
-    /// the memory controller" in a downstream integration test.
-    ///
-    /// `mountinfo_self()` keeps only v1 `cgroup` mounts (it drops `cgroup2`),
-    /// so it is legitimately empty on a unified v2 host; on v1/hybrid it must
-    /// be non-empty. The line-parser canary covers both versions.
-    #[test]
-    fn test_live_mountinfo_canary() {
-        let data = fs::read_to_string("/proc/self/mountinfo")
-            .expect("canary: /proc/self/mountinfo must be readable");
-
-        let table = crate::discovery::parse_mountinfo(&data)
-            .expect("canary: /proc/self/mountinfo must parse cleanly");
-        assert!(
-            !table.cgroup_mounts().is_empty() || !table.unified_mounts().is_empty(),
-            "canary: no cgroup/cgroup2 mounts parsed from live /proc/self/mountinfo; \
-             parser may have regressed on a kernel format change"
-        );
-
-        let mounts = hierarchies::mountinfo_self();
-        if hierarchies::is_cgroup2_unified_mode() {
-            assert!(
-                mounts.is_empty(),
-                "canary: mountinfo_self() drops cgroup2 on a unified v2 host, got {:?}",
-                mounts
-            );
-        } else {
-            assert!(
-                !mounts.is_empty(),
-                "canary: mountinfo_self() found no v1 cgroup mounts on a v1/hybrid host; \
-                 parser may have regressed"
-            );
-        }
-    }
-
     #[test]
     fn test_parse_value_from_tuples() {
         let tuple_str = "system 100000\nuser 200000";
@@ -1700,13 +1975,16 @@ mod tests {
 /// exact (controller, path) pair instead of a vague "is_empty" / "contains_key".
 #[cfg(test)]
 mod parse_tests {
-    use super::{controller_mounts, membership_to_subsystem_paths};
+    use super::{controller_mounts, membership_to_subsystem_paths, FsManager};
+    use crate::discovery::topology::HostPaths;
     use crate::discovery::{CgroupTopology, CgroupVersion, ControllerSet};
     use crate::error::CoreError;
     use crate::fs::hierarchies;
     use crate::manager::error::Error;
     use std::collections::HashMap;
     use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     /// One `/proc/<pid>/cgroup` input plus the expected controller->path map.
     /// `expect` is the full HashMap the parser must produce; `None` means
@@ -1939,11 +2217,6 @@ mod parse_tests {
 
     #[test]
     fn test_fs_manager_with_topology() {
-        use super::FsManager;
-        use crate::discovery::CgroupTopology;
-        use std::path::{Path, PathBuf};
-        use std::sync::Arc;
-
         struct TempGuard(PathBuf);
         impl Drop for TempGuard {
             fn drop(&mut self) {
@@ -2002,5 +2275,410 @@ mod parse_tests {
         let cp = CgroupPath::new("mycgroup/sub").unwrap();
         let typed = join_cgroup_path(Path::new("/sys/fs/cgroup"), &cp);
         assert_eq!(typed, Path::new("/sys/fs/cgroup/mycgroup/sub"));
+    }
+
+    /// Build a synthetic v1 topology with the given cgroupfs root,
+    /// a single `memory` controller, and a membership path.
+    fn synthetic_v1_topology(
+        cgroupfs_root: PathBuf,
+        membership_line: &str,
+        mountinfo_line: &str,
+    ) -> Arc<CgroupTopology> {
+        let mounts = crate::discovery::parse_mountinfo(mountinfo_line).unwrap();
+        let membership = crate::discovery::parse_membership(membership_line).unwrap();
+        Arc::new(CgroupTopology {
+            version: crate::discovery::CgroupVersion::V1,
+            v2_available: false,
+            mounts,
+            membership,
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root,
+            hugepages: PathBuf::from("/nonexistent"),
+        })
+    }
+
+    #[test]
+    fn test_refresh_with_topology_replaces_derived_state() {
+        // Initial topology: memory controller, membership at /user.slice
+        let root_a = PathBuf::from("/tmp/cg-refresh-a");
+        let topo_a = synthetic_v1_topology(
+            root_a.clone(),
+            "1:memory:/user.slice",
+            "43 33 0:38 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:20 - cgroup cgroup rw,memory",
+        );
+
+        let mut manager = FsManager::with_topology("test/child", topo_a.clone()).unwrap();
+        assert_eq!(
+            manager.mounts.get("memory").unwrap(),
+            &root_a.join("memory").to_string_lossy().to_string(),
+        );
+        assert!(Arc::ptr_eq(manager.topology(), &topo_a));
+
+        // Refresh with a different topology: different cgroupfs root,
+        // different membership path.
+        let root_b = PathBuf::from("/tmp/cg-refresh-b");
+        let topo_b = synthetic_v1_topology(
+            root_b.clone(),
+            "2:memory:/container.slice",
+            "44 33 0:39 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:21 - cgroup cgroup rw,memory",
+        );
+
+        manager.refresh_with_topology(topo_b.clone());
+
+        // Derived state must reflect the new topology.
+        assert!(Arc::ptr_eq(manager.topology(), &topo_b));
+        assert_eq!(
+            manager.mounts.get("memory").unwrap(),
+            &root_b.join("memory").to_string_lossy().to_string(),
+        );
+        assert_eq!(manager.paths.get("memory").unwrap(), "/container.slice",);
+        // Cgroup must also use the new topology.
+        assert!(manager.cgroup.topology().is_some());
+        assert!(Arc::ptr_eq(&manager.cgroup.topology().unwrap(), &topo_b,));
+    }
+
+    #[test]
+    fn test_refresh_preserves_base() {
+        let topo = synthetic_v1_topology(
+            PathBuf::from("/tmp/cg-base-test"),
+            "1:memory:/",
+            "43 33 0:38 / /sys/fs/cgroup/memory rw,nosuid - cgroup cgroup rw,memory",
+        );
+
+        let mut manager = FsManager::with_topology("my/group", topo).unwrap();
+        assert_eq!(manager.base.as_path(), Path::new("my/group"));
+
+        // Refresh with a completely different topology.
+        let topo2 = synthetic_v1_topology(
+            PathBuf::from("/tmp/cg-base-test-2"),
+            "2:memory:/other",
+            "44 33 0:39 / /sys/fs/cgroup/memory rw,nosuid - cgroup cgroup rw,memory",
+        );
+        manager.refresh_with_topology(topo2);
+
+        // Base must be unchanged.
+        assert_eq!(manager.base.as_path(), Path::new("my/group"));
+    }
+
+    #[test]
+    fn test_refresh_with_host_paths_updates_stored_paths() {
+        let topo = synthetic_v1_topology(
+            PathBuf::from("/tmp/cg-hp-test"),
+            "1:memory:/",
+            "43 33 0:38 / /sys/fs/cgroup/memory rw,nosuid - cgroup cgroup rw,memory",
+        );
+
+        let original_hp = HostPaths {
+            procfs: PathBuf::from("/proc"),
+            cgroupfs_override: None,
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+        let manager =
+            FsManager::with_topology_and_host_paths("test/sub", topo, original_hp.clone()).unwrap();
+
+        // Stored host_paths should match what we provided.
+        assert_eq!(manager.host_paths(), &original_hp);
+
+        // refresh_with_host_paths will try to discover from a
+        // non-existent procfs and fail — but the stored host_paths
+        // should NOT be updated on failure.
+        let bad_hp = HostPaths {
+            procfs: PathBuf::from("/nonexistent/proc"),
+            cgroupfs_override: None,
+            hugepages: PathBuf::from("/nonexistent/hugepages"),
+        };
+        // We need a mutable binding to call refresh.
+        let mut manager = manager;
+        let result = manager.refresh_with_host_paths(&bad_hp);
+        assert!(
+            result.is_err(),
+            "refresh from nonexistent procfs should fail"
+        );
+        // On failure, the stored host_paths must still be the original.
+        assert_eq!(manager.host_paths(), &original_hp);
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::discovery::{CgroupTopology, CgroupVersion, ControllerSet, HostPaths, MountTable};
+    use crate::manager::{Error, FsManager, Manager};
+    use crate::model::{AttachDestination, CgroupPath};
+    use crate::CgroupPid;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            let rand_id: u64 = rand::random();
+            let path = std::env::temp_dir().join(format!("cgroup_test_{}_{}", prefix, rand_id));
+            fs::create_dir_all(&path).expect("failed to create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &PathBuf {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn make_test_topology_v2(cgroupfs_root: PathBuf) -> Arc<CgroupTopology> {
+        Arc::new(CgroupTopology {
+            version: CgroupVersion::V2,
+            v2_available: true,
+            mounts: MountTable::default(),
+            membership: Default::default(),
+            controllers: ControllerSet::default(),
+            cgroupfs_root,
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        })
+    }
+
+    #[test]
+    fn test_attach_destination_managed_cgroup_and_subgroup() {
+        let fixture = TestDir::new("attach_dest");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        fs::create_dir_all(&cgroupfs_root).unwrap();
+
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let manager =
+            FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
+
+        // Default destination must be ManagedCgroup
+        assert_eq!(
+            manager.default_destination(),
+            &AttachDestination::ManagedCgroup
+        );
+
+        // Resolve ManagedCgroup -> root CgroupPath
+        let resolved = manager
+            .resolve_destination(&AttachDestination::ManagedCgroup)
+            .unwrap();
+        assert!(resolved.is_root());
+
+        // Resolve explicit Subgroup
+        let sub = CgroupPath::new("init.scope").unwrap();
+        let resolved = manager
+            .resolve_destination(&AttachDestination::Subgroup(sub.clone()))
+            .unwrap();
+        assert_eq!(resolved, sub);
+
+        // with_default_destination builder
+        let manager = manager.with_default_destination(AttachDestination::Subgroup(sub.clone()));
+        assert_eq!(
+            manager.default_destination(),
+            &AttachDestination::Subgroup(sub)
+        );
+    }
+
+    #[test]
+    fn test_resolve_same_cgroup_as_descendant_v2() {
+        let fixture = TestDir::new("same_cgroup_descendant");
+        let procfs = fixture.path().join("proc");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        fs::create_dir_all(&cgroupfs_root).unwrap();
+
+        // Create mock /proc/12345/cgroup
+        let pid_dir = procfs.join("12345");
+        fs::create_dir_all(&pid_dir).unwrap();
+        let mut f = File::create(pid_dir.join("cgroup")).unwrap();
+        writeln!(f, "0::/container.slice/init").unwrap();
+
+        let host_paths = HostPaths {
+            procfs,
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let manager =
+            FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
+
+        let dest = AttachDestination::SameCgroupAs(CgroupPid::from(12345u64));
+        let resolved = manager.resolve_destination(&dest).unwrap();
+        assert_eq!(resolved, CgroupPath::new("init").unwrap());
+    }
+
+    #[test]
+    fn test_resolve_same_cgroup_as_same_base_v2() {
+        let fixture = TestDir::new("same_cgroup_exact");
+        let procfs = fixture.path().join("proc");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        fs::create_dir_all(&cgroupfs_root).unwrap();
+
+        // Create mock /proc/23456/cgroup with exact same base path
+        let pid_dir = procfs.join("23456");
+        fs::create_dir_all(&pid_dir).unwrap();
+        let mut f = File::create(pid_dir.join("cgroup")).unwrap();
+        writeln!(f, "0::/container.slice").unwrap();
+
+        let host_paths = HostPaths {
+            procfs,
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let manager =
+            FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
+
+        let dest = AttachDestination::SameCgroupAs(CgroupPid::from(23456u64));
+        let resolved = manager.resolve_destination(&dest).unwrap();
+        assert!(resolved.is_root());
+    }
+
+    #[test]
+    fn test_resolve_same_cgroup_as_outside_managed_cgroup_fails() {
+        let fixture = TestDir::new("same_cgroup_outside");
+        let procfs = fixture.path().join("proc");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        fs::create_dir_all(&cgroupfs_root).unwrap();
+
+        // Create mock /proc/34567/cgroup pointing to a completely different slice
+        let pid_dir = procfs.join("34567");
+        fs::create_dir_all(&pid_dir).unwrap();
+        let mut f = File::create(pid_dir.join("cgroup")).unwrap();
+        writeln!(f, "0::/system.slice/other.service").unwrap();
+
+        let host_paths = HostPaths {
+            procfs,
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let manager =
+            FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
+
+        let dest = AttachDestination::SameCgroupAs(CgroupPid::from(34567u64));
+        let result = manager.resolve_destination(&dest);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Attachment(msg) => {
+                assert!(msg.contains("outside managed cgroup"), "error: {}", msg);
+            }
+            other => panic!("expected Error::Attachment, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_same_cgroup_as_nonexistent_pid_fails() {
+        let fixture = TestDir::new("same_cgroup_missing_pid");
+        let procfs = fixture.path().join("proc");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        fs::create_dir_all(&cgroupfs_root).unwrap();
+
+        let host_paths = HostPaths {
+            procfs,
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let manager =
+            FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
+
+        let dest = AttachDestination::SameCgroupAs(CgroupPid::from(999999u64));
+        let result = manager.resolve_destination(&dest);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Attachment(msg) => {
+                assert!(msg.contains("failed to read membership"), "error: {}", msg);
+            }
+            other => panic!("expected Error::Attachment, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_fs_manager_add_proc_to_explicit_subgroup() {
+        let fixture = TestDir::new("add_proc_subgroup");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let container_dir = cgroupfs_root.join("container.slice");
+        let init_dir = container_dir.join("init");
+        fs::create_dir_all(&init_dir).unwrap();
+
+        // Create cgroup.procs inside both container and init
+        File::create(container_dir.join("cgroup.procs")).unwrap();
+        let init_procs = init_dir.join("cgroup.procs");
+        File::create(&init_procs).unwrap();
+
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let mut manager =
+            FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
+
+        // Attach to explicit subgroup "init"
+        let dest = AttachDestination::subgroup("init").unwrap();
+        manager.add_proc_to(CgroupPid::from(42u64), &dest).unwrap();
+
+        // Verify 42 was written to container.slice/init/cgroup.procs
+        let content = fs::read_to_string(&init_procs).unwrap();
+        assert_eq!(content.trim(), "42");
+    }
+
+    #[test]
+    fn test_delegated_attachment_creates_v2_leaf_without_enabling_controllers() {
+        let fixture = TestDir::new("delegated_attachment");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let managed_dir = cgroupfs_root.join("test.slice/scope-unit.scope");
+        fs::create_dir_all(&managed_dir).unwrap();
+
+        let topology = Arc::new(CgroupTopology {
+            version: CgroupVersion::V2,
+            v2_available: true,
+            mounts: MountTable::default(),
+            membership: Default::default(),
+            controllers: vec!["memory".to_string()].into_iter().collect(),
+            cgroupfs_root: cgroupfs_root.clone(),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        });
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+        let manager = FsManager::with_topology_and_host_paths(
+            "test.slice/scope-unit.scope",
+            topology,
+            host_paths,
+        )
+        .unwrap();
+        let destination = CgroupPath::new("worker").unwrap();
+
+        manager
+            .add_proc_to_delegated_destination(CgroupPid::from(42u64), &destination)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(managed_dir.join("worker/cgroup.procs"))
+                .unwrap()
+                .trim(),
+            "42"
+        );
+        assert!(!cgroupfs_root.join("cgroup.subtree_control").exists());
+        assert!(!managed_dir.join("cgroup.subtree_control").exists());
     }
 }

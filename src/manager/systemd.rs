@@ -1,3 +1,4 @@
+use crate::model::AttachDestination;
 // Copyright (c) 2025 Ant Group
 //
 // SPDX-License-Identifier: Apache-2.0 or MIT
@@ -37,6 +38,8 @@ pub struct SystemdManager<'a> {
     systemd_client: SystemdClient<'a>,
     /// Cgroupfs manager
     fs_manager: FsManager,
+    /// Default destination
+    default_destination: AttachDestination,
 }
 
 impl SystemdManager<'_> {
@@ -70,18 +73,28 @@ impl SystemdManager<'_> {
     /// Create a `SystemdManager` from a cgroup path using explicit host paths for discovery.
     pub fn with_host_paths(path: &str, host_paths: &HostPaths) -> Result<Self> {
         let topology = discover(host_paths).map_err(Error::Core)?;
-        Self::with_topology(path, topology)
+        Self::with_topology_and_host_paths(path, topology, host_paths.clone())
     }
 
     /// Create a `SystemdManager` using an already-discovered topology snapshot.
     pub fn with_topology(path: &str, topology: Arc<CgroupTopology>) -> Result<Self> {
+        Self::with_topology_and_host_paths(path, topology, HostPaths::default())
+    }
+
+    /// Create a `SystemdManager` using an already-discovered topology snapshot
+    /// and explicit host paths for later process-membership lookups.
+    pub fn with_topology_and_host_paths(
+        path: &str,
+        topology: Arc<CgroupTopology>,
+        host_paths: HostPaths,
+    ) -> Result<Self> {
         let (slice, unit) = Self::parse_slice_and_unit(path)?;
         let v2 = topology.version == CgroupVersion::V2;
         let props = PropertiesBuilder::default_cgroup(&slice, &unit).build_with_v2(v2);
         let slice_base = expand_slice(&slice)?;
 
         let fs_base = join_path(&slice_base, &unit)?;
-        let fs_manager = FsManager::with_topology(&fs_base, topology)?;
+        let fs_manager = FsManager::with_topology_and_host_paths(&fs_base, topology, host_paths)?;
 
         let cgroup = SystemdClient::new(&unit, props)?;
 
@@ -90,12 +103,30 @@ impl SystemdManager<'_> {
             unit,
             fs_manager,
             systemd_client: cgroup,
+            default_destination: AttachDestination::default(),
         })
     }
 
     /// Return the topology snapshot held by this manager.
     pub fn topology(&self) -> &Arc<CgroupTopology> {
         self.fs_manager.topology()
+    }
+
+    /// Set the default attachment destination used by [`Manager::add_proc`]
+    /// and [`Manager::add_thread`].
+    pub fn set_default_destination(&mut self, destination: AttachDestination) {
+        self.default_destination = destination;
+    }
+
+    /// Builder method to set the default attachment destination.
+    pub fn with_default_destination(mut self, destination: AttachDestination) -> Self {
+        self.default_destination = destination;
+        self
+    }
+
+    /// Return the current default attachment destination.
+    pub fn default_destination(&self) -> &AttachDestination {
+        &self.default_destination
     }
 }
 
@@ -222,26 +253,65 @@ impl SystemdManager<'_> {
 
 impl Manager for SystemdManager<'_> {
     fn add_proc(&mut self, pid: CgroupPid) -> Result<()> {
+        let dest = self.default_destination.clone();
+        self.add_proc_to(pid, &dest)
+    }
+
+    fn add_proc_to(&mut self, pid: CgroupPid, destination: &AttachDestination) -> Result<()> {
+        let sub = self.fs_manager.resolve_destination(destination)?;
+        let subcgroup = if sub.is_root() {
+            "/".to_string()
+        } else {
+            format!("/{}", sub.as_path().display())
+        };
+
         if !self.systemd_client.exists() {
             self.systemd_client.set_pid_prop(pid)?;
             self.systemd_client.start()?;
-            // The fs_manager was created in load mode, which doesn't create
-            // the cgroups. So we create them here.
-            self.fs_manager.create_cgroups()?;
+            if !sub.is_root() {
+                // StartTransientUnit has already placed this PID in the unit
+                // root. AttachProcessesToUnit deliberately treats any PID
+                // already belonging to the unit as a no-op, so move it through
+                // the delegated cgroupfs subtree instead.
+                self.fs_manager
+                    .add_proc_to_delegated_destination(pid, &sub)?;
+            }
             return Ok(());
         }
 
-        let subcgroup = self.fs_manager.subcgroup();
-        self.systemd_client.add_process(pid, subcgroup)?;
+        self.fs_manager.prepare_delegated_destination(&sub)?;
+
+        // systemd ignores the requested subgroup when the process is already
+        // anywhere inside this unit. Detect that case and perform the
+        // intra-unit move through the delegated cgroupfs tree. Processes
+        // outside the unit still go through systemd so it can perform the
+        // privileged cross-cgroup migration.
+        let current = self
+            .fs_manager
+            .resolve_destination(&AttachDestination::SameCgroupAs(pid));
+        match current {
+            Ok(current) if current == sub => return Ok(()),
+            Ok(_) => self
+                .fs_manager
+                .add_proc_to_delegated_destination(pid, &sub)?,
+            Err(_) => self.systemd_client.add_process(pid, &subcgroup)?,
+        }
 
         Ok(())
     }
 
-    /// `add_thread()` is the same as `add_proc()`, as systemd doesn't
-    /// expose an API to add a thread directly. As a result, the whole
-    /// threads belonging to one process will be added to this cgroup.
+    /// `add_thread()` is unsupported on `SystemdManager` because systemd does not
+    /// expose an API to attach individual threads. Thread-level attachment cannot
+    /// be safely downgraded to process-level migration.
     fn add_thread(&mut self, pid: CgroupPid) -> Result<()> {
-        self.add_proc(pid)
+        let dest = self.default_destination.clone();
+        self.add_thread_to(pid, &dest)
+    }
+
+    fn add_thread_to(&mut self, _pid: CgroupPid, _destination: &AttachDestination) -> Result<()> {
+        Err(Error::Unsupported(
+            "systemd manager does not support thread-level attachment".to_string(),
+        ))
     }
 
     fn cgroup_path(&self, subsystem: Option<&str>) -> Result<String> {
@@ -359,7 +429,7 @@ mod tests {
     //! Don't run tests in parallel, use `--test-threads=1`!
     //!
 
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::thread::sleep;
     use std::time::Duration;
 
@@ -501,6 +571,54 @@ mod tests {
         assert!(!manager.systemd_client.exists());
     }
 
+    #[test]
+    fn test_add_proc_to_exact_subgroups_v2() {
+        skip_if_not_root!();
+        skip_if_no_systemd!();
+        skip_if_cgroups_v1!();
+
+        fn assert_contains_pid(path: &Path, pid: u32) {
+            let content = std::fs::read_to_string(path).unwrap();
+            assert!(
+                content.lines().any(|line| line == pid.to_string()),
+                "{} does not contain pid {}: {:?}",
+                path.display(),
+                pid,
+                content
+            );
+        }
+
+        let mut manager = new_systemd_manager();
+        let managed_path = PathBuf::from(managed_cgroup_path(&manager, None));
+        let mut initial = spawn_sleep_inf();
+        let initial_pid = CgroupPid::from(initial.id() as u64);
+
+        // Starting a scope requires the initial PID in the unit root. The
+        // manager must then move it directly into the requested leaf because
+        // AttachProcessesToUnit ignores subgroup paths for same-unit PIDs.
+        let first = AttachDestination::subgroup("first").unwrap();
+        manager.add_proc_to(initial_pid, &first).unwrap();
+        assert_contains_pid(&managed_path.join("first/cgroup.procs"), initial.id());
+
+        // Moving a PID already in the unit to another missing leaf exercises
+        // the same-unit path on an existing scope.
+        let second = AttachDestination::subgroup("second").unwrap();
+        manager.add_proc_to(initial_pid, &second).unwrap();
+        assert_contains_pid(&managed_path.join("second/cgroup.procs"), initial.id());
+
+        // A process outside the unit still uses systemd for the privileged
+        // cross-cgroup migration, after the destination leaf is created.
+        let mut external = spawn_sleep_inf();
+        let external_pid = CgroupPid::from(external.id() as u64);
+        let third = AttachDestination::subgroup("third").unwrap();
+        manager.add_proc_to(external_pid, &third).unwrap();
+        assert_contains_pid(&managed_path.join("third/cgroup.procs"), external.id());
+
+        manager.destroy().unwrap();
+        initial.wait().unwrap();
+        external.wait().unwrap();
+    }
+
     fn controller<'a, T>(fs_manager: &'a FsManager) -> &'a T
     where
         &'a T: From<&'a Subsystem>,
@@ -613,7 +731,9 @@ mod tests {
 #[cfg(test)]
 mod topology_tests {
     use super::SystemdManager;
-    use crate::discovery::{CgroupTopology, CgroupVersion};
+    use crate::discovery::{CgroupTopology, CgroupVersion, HostPaths};
+    use crate::model::AttachDestination;
+    use crate::CgroupPid;
     use crate::Manager;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -659,5 +779,89 @@ mod topology_tests {
             &custom_cgroupfs.join("memory").to_string_lossy().to_string()
         );
         assert!(Arc::ptr_eq(manager.topology(), &topology));
+    }
+
+    #[test]
+    fn test_systemd_manager_preserves_injected_host_paths() {
+        struct TempGuard(PathBuf);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "systemd-host-paths-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _guard = TempGuard(temp_dir.clone());
+        let procfs = temp_dir.join("proc");
+        let cgroupfs = temp_dir.join("cgroupfs");
+        std::fs::create_dir_all(procfs.join("4242")).unwrap();
+        std::fs::create_dir_all(&cgroupfs).unwrap();
+        std::fs::write(
+            procfs.join("4242/cgroup"),
+            "0::/test.slice/scope-unit.scope/worker\n",
+        )
+        .unwrap();
+
+        let topology = Arc::new(CgroupTopology {
+            version: CgroupVersion::V2,
+            v2_available: true,
+            mounts: crate::discovery::MountTable::default(),
+            membership: crate::discovery::Membership::default(),
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root: cgroupfs.clone(),
+            hugepages: PathBuf::from("/nonexistent"),
+        });
+        let host_paths = HostPaths {
+            procfs,
+            cgroupfs_override: Some(cgroupfs),
+            hugepages: PathBuf::from("/nonexistent"),
+        };
+
+        let manager = SystemdManager::with_topology_and_host_paths(
+            "test.slice:scope:unit",
+            topology,
+            host_paths.clone(),
+        )
+        .unwrap();
+        assert_eq!(manager.fs_manager.host_paths(), &host_paths);
+
+        let destination = AttachDestination::SameCgroupAs(CgroupPid::from(4242u64));
+        let resolved = manager
+            .fs_manager
+            .resolve_destination(&destination)
+            .unwrap();
+        assert_eq!(resolved.as_path(), std::path::Path::new("worker"));
+    }
+
+    #[test]
+    fn test_systemd_add_thread_unsupported() {
+        let topology = Arc::new(CgroupTopology {
+            version: CgroupVersion::V2,
+            v2_available: true,
+            mounts: crate::discovery::MountTable::default(),
+            membership: crate::discovery::Membership::default(),
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root: PathBuf::from("/sys/fs/cgroup"),
+            hugepages: PathBuf::from("/nonexistent"),
+        });
+
+        let mut manager = SystemdManager::with_topology("test.slice:scope:unit", topology).unwrap();
+        let pid = crate::CgroupPid { pid: 42 };
+        match manager.add_thread(pid) {
+            Err(crate::manager::error::Error::Unsupported(msg)) => {
+                assert!(msg.contains("thread-level attachment"))
+            }
+            other => panic!("expected Unsupported error, got {:?}", other),
+        }
+        match manager.add_thread_to(pid, &crate::model::AttachDestination::ManagedCgroup) {
+            Err(crate::manager::error::Error::Unsupported(msg)) => {
+                assert!(msg.contains("thread-level attachment"))
+            }
+            other => panic!("expected Unsupported error, got {:?}", other),
+        }
     }
 }
