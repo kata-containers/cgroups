@@ -531,9 +531,55 @@ pub trait Hierarchy: std::fmt::Debug + Send + Sync {
     fn root_control_group(&self) -> Cgroup;
 
     /// Return a handle to the parent control group in the hierarchy.
+    ///
+    /// Implementations should panic rather than return the root control group
+    /// when `path` has no parent. New code should prefer the fallible
+    /// [`Hierarchy::parent_control_group_path`] method.
+    ///
+    /// # Panics
+    ///
+    /// May panic if `path` is the hierarchy root or cannot be resolved.
     fn parent_control_group(&self, path: &str) -> Cgroup;
 
+    /// Return a handle to the parent control group in the hierarchy from a `&Path`.
+    ///
+    /// Fails closed if the path represents the root control group, if the parent
+    /// contains invalid components, or if a legacy custom hierarchy receives
+    /// an invalid UTF-8 path.
+    fn parent_control_group_path(&self, path: &Path) -> Result<Cgroup> {
+        if path.as_os_str().is_empty() {
+            return Err(Error::with_cause(
+                ErrorKind::InvalidPath,
+                crate::core::error::PathError::RootPath {
+                    input: path.to_path_buf(),
+                    operation: "parent_control_group_path",
+                },
+            ));
+        }
+        let str_slice = path.to_str().ok_or_else(|| {
+            Error::with_cause(
+                ErrorKind::InvalidPath,
+                crate::core::error::PathError::NonUtf8 {
+                    input: path.to_path_buf(),
+                    operation: "parent_control_group_path (non-utf8)",
+                },
+            )
+        })?;
+        Ok(self.parent_control_group(str_slice))
+    }
+
     fn v2(&self) -> bool;
+
+    /// The immutable topology snapshot this hierarchy was constructed
+    /// from, when the hierarchy is one of the discovery-built ones.
+    ///
+    /// Built-in hierarchies expose the snapshot to cgroup operations.
+    /// Custom implementations may keep the default (`None`); a
+    /// [`Cgroup`](crate::fs::Cgroup) still preserves the exact custom
+    /// hierarchy when cloned because the trait object itself is shared.
+    fn topology(&self) -> Option<std::sync::Arc<crate::core::discovery::CgroupTopology>> {
+        None
+    }
 }
 
 /// Resource limits for the memory subsystem.

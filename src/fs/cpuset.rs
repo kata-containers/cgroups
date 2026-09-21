@@ -11,7 +11,7 @@
 
 use log::*;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::fs::error::ErrorKind::*;
 use crate::fs::error::*;
@@ -124,11 +124,11 @@ impl ControllerInternal for CpuSetController {
         let current = self.get_path();
 
         if current != self.get_base() {
-            match copy_from_parent(current.to_str().unwrap(), "cpuset.cpus") {
+            match copy_from_parent(current, "cpuset.cpus") {
                 Ok(_) => (),
                 Err(err) => error!("error create_dir for cpuset.cpus {:?}", err),
             }
-            match copy_from_parent(current.to_str().unwrap(), "cpuset.mems") {
+            match copy_from_parent(current, "cpuset.mems") {
                 Ok(_) => (),
                 Err(err) => error!("error create_dir for cpuset.mems {:?}", err),
             }
@@ -136,21 +136,20 @@ impl ControllerInternal for CpuSetController {
     }
 }
 
-fn find_no_empty_parent(from: &str, file: &str) -> Result<(String, Vec<PathBuf>)> {
-    let mut current_path = ::std::path::Path::new(from).to_path_buf();
+fn find_no_empty_parent(from: &Path, file: &str) -> Result<(String, Vec<PathBuf>)> {
+    let mut current_path = from.to_path_buf();
     let mut v = vec![];
 
     loop {
-        let current_value =
-            match ::std::fs::read_to_string(current_path.clone().join(file).to_str().unwrap()) {
-                Ok(cpus) => String::from(cpus.trim()),
-                Err(e) => {
-                    return Err(Error::with_cause(
-                        ReadFailed(current_path.display().to_string()),
-                        e,
-                    ))
-                }
-            };
+        let current_value = match ::std::fs::read_to_string(current_path.join(file)) {
+            Ok(cpus) => String::from(cpus.trim()),
+            Err(e) => {
+                return Err(Error::with_cause(
+                    ReadFailed(current_path.display().to_string()),
+                    e,
+                ))
+            }
+        };
 
         if !current_value.is_empty() {
             return Ok((current_value, v));
@@ -169,7 +168,7 @@ fn find_no_empty_parent(from: &str, file: &str) -> Result<(String, Vec<PathBuf>)
 
 /// copy_from_parent copy the cpuset.cpus and cpuset.mems from the parent
 /// directory to the current directory if the file's contents are 0
-fn copy_from_parent(current: &str, file: &str) -> Result<()> {
+fn copy_from_parent(current: &Path, file: &str) -> Result<()> {
     // find not empty cpus/memes from current directory.
     let (value, parents) = find_no_empty_parent(current, file)?;
 
@@ -180,7 +179,7 @@ fn copy_from_parent(current: &str, file: &str) -> Result<()> {
     for p in parents.iter().rev() {
         let mut pb = p.clone();
         pb.push(file);
-        match ::std::fs::write(pb.to_str().unwrap(), value.as_bytes()) {
+        match ::std::fs::write(&pb, value.as_bytes()) {
             Ok(_) => (),
             Err(e) => {
                 return Err(Error::with_cause(

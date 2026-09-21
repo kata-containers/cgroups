@@ -239,6 +239,9 @@ mod tests {
         expected_operation: &'static str,
     ) -> ExpectedPathError {
         let (kind, input, operation) = match error {
+            PathError::NonUtf8 { .. } => {
+                panic!("typed path validation must preserve non-UTF-8 paths")
+            }
             PathError::AbsolutePath { input, operation } => {
                 (ExpectedPathError::AbsolutePath, input, operation)
             }

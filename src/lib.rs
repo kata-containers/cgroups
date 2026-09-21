@@ -34,25 +34,49 @@ macro_rules! skip_if_not_root {
 }
 
 /// Return early from a test that does not support a cgroup v1 hierarchy.
+///
+/// A discovery failure is a test failure rather than a skip: controlled
+/// root/QEMU environments preflight their hierarchy, so silently returning
+/// here would hide parser or discovery regressions.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! skip_if_cgroups_v1 {
     () => {
-        if !$crate::fs::hierarchies::is_cgroup2_unified_mode() {
-            eprintln!("Skipping test in cgroups v1 mode");
-            return;
+        match $crate::fs::hierarchies::is_cgroup2_unified_mode_with_paths(
+            &$crate::core::discovery::HostPaths::default(),
+        ) {
+            Ok(true) => {} // unified v2 — proceed
+            Ok(false) => {
+                eprintln!("Skipping test in cgroups v1 mode");
+                return;
+            }
+            Err(e) => {
+                panic!("cgroup discovery failed while selecting a v2 test: {}", e);
+            }
         }
     };
 }
 
 /// Return early from a test that does not support a cgroup v2 hierarchy.
+///
+/// A discovery failure is a test failure rather than a skip: controlled
+/// root/QEMU environments preflight their hierarchy, so silently returning
+/// here would hide parser or discovery regressions.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! skip_if_cgroups_v2 {
     () => {
-        if $crate::fs::hierarchies::is_cgroup2_unified_mode() {
-            eprintln!("Skipping test in cgroups v2 mode");
-            return;
+        match $crate::fs::hierarchies::is_cgroup2_unified_mode_with_paths(
+            &$crate::core::discovery::HostPaths::default(),
+        ) {
+            Ok(false) => {} // v1 or hybrid — proceed
+            Ok(true) => {
+                eprintln!("Skipping test in cgroups v2 mode");
+                return;
+            }
+            Err(e) => {
+                panic!("cgroup discovery failed while selecting a v1 test: {}", e);
+            }
         }
     };
 }
@@ -61,6 +85,62 @@ macro_rules! skip_if_cgroups_v2 {
 pub mod tests {
     use std::fs;
     use std::process::{Child, Command, Stdio};
+
+    /// Own synthetic discovery files for topology-based handle tests.
+    #[cfg(feature = "fixtures")]
+    pub(crate) struct TopologyFixture {
+        pub(crate) topology: std::sync::Arc<crate::core::CgroupTopology>,
+        root: std::path::PathBuf,
+    }
+
+    #[cfg(feature = "fixtures")]
+    impl TopologyFixture {
+        pub(crate) fn new(mountinfo: &[u8], membership: &[u8], controllers: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "cgroups-topology-fixture-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir_all(root.join("proc/self")).unwrap();
+            fs::create_dir_all(root.join("cgroup")).unwrap();
+            fs::create_dir_all(root.join("hugepages")).unwrap();
+            fs::write(root.join("proc/self/mountinfo"), mountinfo).unwrap();
+            fs::write(root.join("proc/self/cgroup"), membership).unwrap();
+            fs::write(root.join("cgroup/cgroup.controllers"), controllers).unwrap();
+            let paths = crate::core::HostPaths::new(root.join("proc"), root.join("hugepages"))
+                .with_fixture_root(root.join("cgroup"));
+            let topology = crate::core::discover(&paths).unwrap();
+            Self { topology, root }
+        }
+    }
+
+    #[cfg(feature = "fixtures")]
+    impl Drop for TopologyFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(feature = "fixtures")]
+    pub(crate) fn topology_fixture(
+        version: crate::core::CgroupVersion,
+        controllers: &str,
+    ) -> TopologyFixture {
+        match version {
+            crate::core::CgroupVersion::V1 => TopologyFixture::new(
+                b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+                b"1:memory:/\n",
+                controllers,
+            ),
+            crate::core::CgroupVersion::V2 => TopologyFixture::new(
+                b"47 44 0:30 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+                b"0::/\n",
+                controllers,
+            ),
+        }
+    }
 
     /// Start a mock subprocess that will sleep forever
     pub fn spawn_sleep_inf() -> Child {

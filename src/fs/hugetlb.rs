@@ -10,7 +10,7 @@
 //!  [Documentation/cgroup-v1/hugetlb.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/hugetlb.txt)
 use log::warn;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::fs::error::ErrorKind::*;
 use crate::fs::error::*;
@@ -89,7 +89,12 @@ impl<'a> From<&'a Subsystem> for &'a HugeTlbController {
 impl HugeTlbController {
     /// Constructs a new `HugeTlbController` with `root` serving as the root of the control group.
     pub fn new(point: PathBuf, root: PathBuf, v2: bool) -> Self {
-        let sizes = get_hugepage_sizes();
+        Self::new_with_hugepages(point, root, v2, Path::new(HUGEPAGESIZE_DIR))
+    }
+
+    /// Constructs a new `HugeTlbController` with an explicit hugetlbfs mount root.
+    pub fn new_with_hugepages(point: PathBuf, root: PathBuf, v2: bool, hugepages: &Path) -> Self {
+        let sizes = get_hugepage_sizes_at(hugepages);
         Self {
             base: root,
             path: point,
@@ -184,8 +189,8 @@ pub const HUGEPAGESIZE_DIR: &str = "/sys/kernel/mm/hugepages";
 use std::collections::HashMap;
 use std::fs;
 
-fn get_hugepage_sizes() -> Vec<String> {
-    let dirs = fs::read_dir(HUGEPAGESIZE_DIR);
+fn get_hugepage_sizes_at(dir: &Path) -> Vec<String> {
+    let dirs = fs::read_dir(dir);
     if dirs.is_err() {
         return Vec::new();
     }

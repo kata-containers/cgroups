@@ -8,16 +8,21 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(test)]
 use crate::core::discovery::mountinfo::parse_mountinfo_line_bytes;
 use crate::core::discovery::mountinfo::{parse_mountinfo_bytes, MountRecord};
-use crate::core::error::ParseMountError;
+use crate::core::discovery::topology::v1_mount_natural_root;
+use crate::core::discovery::{discover, CgroupTopology, CgroupVersion, HostPaths};
+use crate::core::error::{CoreError, CoreResult, ParseMountError, PathError};
+use crate::core::CgroupPath;
 use crate::fs::blkio::BlkIoController;
 use crate::fs::cpu::CpuController;
 use crate::fs::cpuacct::CpuAcctController;
 use crate::fs::cpuset::CpuSetController;
 use crate::fs::devices::DevicesController;
+use crate::fs::error::Result;
 use crate::fs::freezer::FreezerController;
 use crate::fs::hugetlb::HugeTlbController;
 use crate::fs::memory::MemController;
@@ -98,11 +103,11 @@ pub(crate) fn parse_mountinfo_for_line(line: &str) -> Option<Mountinfo> {
 
 /// Parse v1 cgroup mount lines from `/proc/self/mountinfo` content.
 #[cfg(test)]
-fn mountinfo_file_str(input: &str) -> Result<Vec<Mountinfo>, ParseMountError> {
+fn mountinfo_file_str(input: &str) -> std::result::Result<Vec<Mountinfo>, ParseMountError> {
     mountinfo_file_bytes(input.as_bytes())
 }
 
-fn mountinfo_file_bytes(input: &[u8]) -> Result<Vec<Mountinfo>, ParseMountError> {
+fn mountinfo_file_bytes(input: &[u8]) -> std::result::Result<Vec<Mountinfo>, ParseMountError> {
     let table = parse_mountinfo_bytes(input)?;
     Ok(table
         .cgroup_mounts()
@@ -113,7 +118,7 @@ fn mountinfo_file_bytes(input: &[u8]) -> Result<Vec<Mountinfo>, ParseMountError>
 }
 
 /// Read and parse the current process's v1 cgroup mounts.
-pub fn try_mountinfo_self() -> Result<Vec<Mountinfo>, MountinfoError> {
+pub fn try_mountinfo_self() -> std::result::Result<Vec<Mountinfo>, MountinfoError> {
     let data = fs::read(MOUNTINFO_PATH).map_err(|cause| MountinfoError::Read {
         path: PathBuf::from(MOUNTINFO_PATH),
         cause,
@@ -138,15 +143,39 @@ pub fn mountinfo_self() -> Vec<Mountinfo> {
     }
 }
 
+/// Derive the parent cgroup path from a path.
+///
+/// Returns an error if the path has no parent or if the derived parent path
+/// contains invalid components.
+pub(crate) fn parent_cgroup_path(path: &Path) -> CoreResult<CgroupPath> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            CgroupPath::new(parent).map_err(Into::into)
+        }
+        Some(_) => CgroupPath::root().map_err(Into::into),
+        None => Err(PathError::RootPath {
+            input: path.to_path_buf(),
+            operation: "parent_cgroup_path",
+        }
+        .into()),
+    }
+}
+
 /// The standard, original cgroup implementation. Often referred to as "cgroupv1".
+///
+/// On a v2-primary topology, this view still exposes visible named v1
+/// hierarchies. Its root is inferred from the first v1 mount, matching the
+/// legacy representative-root behavior when those mounts have separate roots.
+/// Each controller retains its own mount point. With no v1 mounts, the view
+/// is empty and its root defaults to `/sys/fs/cgroup`.
 #[derive(Debug, Clone)]
 pub struct V1 {
-    mountinfo: Vec<Mountinfo>,
+    topology: Arc<CgroupTopology>,
 }
 
 #[derive(Debug, Clone)]
 pub struct V2 {
-    root: String,
+    topology: Arc<CgroupTopology>,
 }
 
 impl Hierarchy for V1 {
@@ -196,8 +225,11 @@ impl Hierarchy for V1 {
             subs.push(Subsystem::NetPrio(NetPrioController::new(point, root)));
         }
         if let Some((point, root)) = self.get_mount_point(Controllers::HugeTlb) {
-            subs.push(Subsystem::HugeTlb(HugeTlbController::new(
-                point, root, false,
+            subs.push(Subsystem::HugeTlb(HugeTlbController::new_with_hugepages(
+                point,
+                root,
+                false,
+                self.topology.hugepages(),
             )));
         }
         if let Some((point, root)) = self.get_mount_point(Controllers::Rdma) {
@@ -213,26 +245,40 @@ impl Hierarchy for V1 {
     }
 
     fn root_control_group(&self) -> Cgroup {
-        Cgroup::load(auto(), "")
+        Cgroup::load_validated(Box::new(self.clone()), CgroupPath::root().unwrap())
     }
 
     fn parent_control_group(&self, path: &str) -> Cgroup {
-        let path = Path::new(path);
-        let parent_path = path.parent().unwrap().to_string_lossy().to_string();
-        Cgroup::load(auto(), parent_path)
+        self.parent_control_group_path(Path::new(path))
+            .expect("cannot resolve parent cgroup; use Hierarchy::parent_control_group_path")
+    }
+
+    fn parent_control_group_path(&self, path: &Path) -> Result<Cgroup> {
+        let cpath = parent_cgroup_path(path).map_err(|e| {
+            crate::fs::error::Error::with_cause(crate::fs::error::ErrorKind::InvalidPath, e)
+        })?;
+        Ok(Cgroup::load_validated(Box::new(self.clone()), cpath))
     }
 
     fn root(&self) -> PathBuf {
-        self.mountinfo
-            .iter()
-            .find_map(|m| {
-                if m.fs_type.0 == "cgroup" {
-                    return Some(m.mount_point.parent().unwrap());
-                }
-                None
+        if self.topology.version() == CgroupVersion::V1 {
+            return self.topology.cgroupfs_root().to_path_buf();
+        }
+        // A v2-primary snapshot may retain named v1 mounts. Their
+        // filesystem roots are independent of the unified root.
+        self.topology
+            .mounts()
+            .cgroup_mounts()
+            .first()
+            .map(|mount| {
+                self.topology
+                    .resolve_mount_point(v1_mount_natural_root(mount))
             })
-            .unwrap()
-            .to_path_buf()
+            .unwrap_or_else(|| PathBuf::from(UNIFIED_MOUNTPOINT))
+    }
+
+    fn topology(&self) -> Option<Arc<CgroupTopology>> {
+        Some(self.topology.clone())
     }
 }
 
@@ -242,16 +288,13 @@ impl Hierarchy for V2 {
     }
 
     fn subsystems(&self) -> Vec<Subsystem> {
-        let p = format!("{}/{}", UNIFIED_MOUNTPOINT, "cgroup.controllers");
-        let ret = fs::read_to_string(p.as_str());
-        if ret.is_err() {
+        if self.topology.version() != CgroupVersion::V2 {
             return vec![];
         }
 
         let mut subs = vec![];
 
-        let controllers = ret.unwrap().trim().to_string();
-        let mut controller_list: Vec<&str> = controllers.split(' ').collect();
+        let mut controller_list: Vec<&str> = self.topology.controllers().iter().collect();
 
         // The freezer functionality is present in V2, but not as a controller,
         // but apparently as a core functionality. FreezerController supports
@@ -303,10 +346,11 @@ impl Hierarchy for V2 {
                     )));
                 }
                 "hugetlb" => {
-                    subs.push(Subsystem::HugeTlb(HugeTlbController::new(
+                    subs.push(Subsystem::HugeTlb(HugeTlbController::new_with_hugepages(
                         self.root(),
                         PathBuf::from(""),
                         true,
+                        self.topology.hugepages(),
                     )));
                 }
                 _ => {}
@@ -317,50 +361,82 @@ impl Hierarchy for V2 {
     }
 
     fn root_control_group(&self) -> Cgroup {
-        Cgroup::load(auto(), "")
+        Cgroup::load_validated(Box::new(self.clone()), CgroupPath::root().unwrap())
     }
 
     fn parent_control_group(&self, path: &str) -> Cgroup {
-        let path = Path::new(path);
-        let parent_path = path.parent().unwrap().to_string_lossy().to_string();
-        Cgroup::load(auto(), parent_path)
+        self.parent_control_group_path(Path::new(path))
+            .expect("cannot resolve parent cgroup; use Hierarchy::parent_control_group_path")
+    }
+
+    fn parent_control_group_path(&self, path: &Path) -> Result<Cgroup> {
+        let cpath = parent_cgroup_path(path).map_err(|e| {
+            crate::fs::error::Error::with_cause(crate::fs::error::ErrorKind::InvalidPath, e)
+        })?;
+        Ok(Cgroup::load_validated(Box::new(self.clone()), cpath))
     }
 
     fn root(&self) -> PathBuf {
-        PathBuf::from(self.root.clone())
+        self.topology.cgroupfs_root().to_path_buf()
+    }
+
+    fn topology(&self) -> Option<Arc<CgroupTopology>> {
+        Some(self.topology.clone())
     }
 }
 
 impl V1 {
-    /// Finds where control groups are mounted to and returns a hierarchy in which control groups
-    /// can be created.
+    /// Build a cgroup v1 view of an already-discovered topology.
     ///
-    /// Use [`Self::try_new`] when discovery errors must reach the caller.
+    /// The v1 view is valid on any topology. It exposes only visible v1
+    /// mounts, including named hierarchies on a v2-primary host. Without v1
+    /// mounts it has no subsystems. Construction performs no I/O.
+    pub fn with_topology(topology: Arc<CgroupTopology>) -> V1 {
+        V1 { topology }
+    }
+
+    /// Build a cgroup v1 hierarchy from explicit host paths.
+    pub fn with_host_paths(host_paths: &HostPaths) -> CoreResult<V1> {
+        let topology = discover(host_paths)?;
+        Ok(V1 { topology })
+    }
+
+    /// Build a cgroup v1 hierarchy from a fresh host discovery.
+    ///
+    /// # Panics
+    ///
+    /// Panics if host discovery fails; use [`V1::with_topology`] with a
+    /// handled [`discover`](crate::core::discovery::discover) result to
+    /// control the failure instead.
     pub fn new() -> V1 {
         V1 {
-            mountinfo: mountinfo_self(),
+            topology: discover(&HostPaths::default()).expect("cgroup discovery failed"),
         }
     }
 
-    /// Construct a v1 hierarchy, preserving mount-table discovery errors.
-    pub fn try_new() -> Result<V1, MountinfoError> {
-        Ok(V1 {
-            mountinfo: try_mountinfo_self()?,
-        })
+    /// Construct a v1 hierarchy, preserving topology discovery errors.
+    pub fn try_new() -> CoreResult<V1> {
+        Self::with_host_paths(&HostPaths::default())
     }
 
     pub fn get_mount_point(&self, controller: Controllers) -> Option<(PathBuf, PathBuf)> {
         let controller_name = controller.to_string();
-        self.mountinfo.iter().find_map(|m| {
-            if m.fs_type.0 == "cgroup"
-                && m.super_opts
+        self.topology
+            .mounts()
+            .cgroup_mounts()
+            .iter()
+            .find_map(|mount| {
+                if mount
+                    .super_opts
                     .iter()
                     .any(|opt| opt.as_slice() == controller_name.as_bytes())
-            {
-                return Some((m.mount_point.to_owned(), m.mount_root.to_owned()));
-            }
-            None
-        })
+                {
+                    let point = self.topology.resolve_mount_point(&mount.mount_point);
+                    Some((point, mount.mount_root.clone()))
+                } else {
+                    None
+                }
+            })
     }
 }
 
@@ -371,12 +447,50 @@ impl Default for V1 {
 }
 
 impl V2 {
-    /// Finds where control groups are mounted to and returns a hierarchy in which control groups
-    /// can be created.
-    pub fn new() -> V2 {
-        V2 {
-            root: String::from(UNIFIED_MOUNTPOINT),
+    /// Build a cgroup v2 view of an already-discovered topology.
+    ///
+    /// Returns a [`CoreError::VersionMismatch`] error before constructing the
+    /// hierarchy if `topology` describes a cgroup v1 or hybrid host. This
+    /// prevents v2 creation logic from treating a v1 cgroupfs root as a
+    /// unified hierarchy.
+    pub fn with_topology(topology: Arc<CgroupTopology>) -> CoreResult<V2> {
+        let error_path = topology.cgroupfs_root().to_path_buf();
+        Self::with_checked_topology(topology, error_path)
+    }
+
+    /// Build a cgroup v2 hierarchy from explicit host paths.
+    ///
+    /// Returns a [`CoreError::VersionMismatch`] error if the host does not operate
+    /// in unified cgroup v2 mode.
+    pub fn with_host_paths(host_paths: &HostPaths) -> CoreResult<V2> {
+        let topology = discover(host_paths)?;
+        let error_path = topology.cgroupfs_root().to_path_buf();
+        Self::with_checked_topology(topology, error_path)
+    }
+
+    /// Validate the topology/hierarchy version invariant before exposing a
+    /// v2 hierarchy to cgroup mutation code.
+    fn with_checked_topology(topology: Arc<CgroupTopology>, error_path: PathBuf) -> CoreResult<V2> {
+        if topology.version() != CgroupVersion::V2 {
+            return Err(CoreError::VersionMismatch {
+                path: error_path,
+                requested: CgroupVersion::V2,
+                found: topology.version(),
+            });
         }
+        Ok(V2 { topology })
+    }
+
+    /// Build a cgroup v2 hierarchy from a fresh host discovery.
+    ///
+    /// # Panics
+    ///
+    /// Panics if host discovery fails or if the host does not operate in
+    /// unified cgroup v2 mode. Use [`auto`] or [`V2::with_host_paths`] to
+    /// handle non-v2 hosts cleanly.
+    pub fn new() -> V2 {
+        Self::with_host_paths(&HostPaths::default())
+            .expect("cgroup discovery failed or host is not in unified cgroup v2 mode")
     }
 }
 
@@ -388,23 +502,52 @@ impl Default for V2 {
 
 pub const UNIFIED_MOUNTPOINT: &str = "/sys/fs/cgroup";
 
-pub fn is_cgroup2_unified_mode() -> bool {
-    use nix::sys::statfs;
-
-    let path = std::path::Path::new(UNIFIED_MOUNTPOINT);
-    let fs_stat = match statfs::statfs(path) {
-        Ok(fs_stat) => fs_stat,
-        Err(_) => return false,
-    };
-
-    fs_stat.filesystem_type() == statfs::CGROUP2_SUPER_MAGIC
+/// Whether the host operates in unified cgroup v2 mode for the given host paths.
+///
+/// Discovers the topology using the specified [`HostPaths`] and preserves any
+/// discovery error for callers that need to distinguish failure from v1.
+pub fn is_cgroup2_unified_mode_with_paths(host_paths: &HostPaths) -> CoreResult<bool> {
+    discover(host_paths).map(|topology| topology.version() == CgroupVersion::V2)
 }
 
+/// Whether the host operates in unified cgroup v2 mode.
+///
+/// Delegates to host discovery on the default host paths: the parsed mount
+/// table (not a single statfs probe) is authoritative, and hybrid hosts
+/// correctly report `false` here because their primary hierarchy is v1.
+/// A discovery failure maps to `false`, matching the historical boolean-probe
+/// semantics.
+///
+pub fn is_cgroup2_unified_mode() -> bool {
+    is_cgroup2_unified_mode_with_paths(&HostPaths::default()).unwrap_or(false)
+}
+
+/// Build the hierarchy for explicit host paths.
+pub fn auto_with_host_paths(host_paths: &HostPaths) -> CoreResult<Box<dyn Hierarchy>> {
+    let topology = discover(host_paths)?;
+    Ok(auto_with_topology(topology))
+}
+
+/// Build the hierarchy for the current host, discovering the topology
+/// once.
+///
+/// # Panics
+///
+/// Panics if host discovery fails; use
+/// [`auto_with_topology`] with a handled
+/// [`discover`](crate::core::discovery::discover) result to control the
+/// failure instead.
 pub fn auto() -> Box<dyn Hierarchy> {
-    if is_cgroup2_unified_mode() {
-        Box::new(V2::new())
-    } else {
-        Box::new(V1::new())
+    let topology = discover(&HostPaths::default()).expect("cgroup discovery failed");
+    auto_with_topology(topology)
+}
+
+/// Build the hierarchy for an already-discovered topology, avoiding a
+/// second host discovery.
+pub fn auto_with_topology(topology: Arc<CgroupTopology>) -> Box<dyn Hierarchy> {
+    match topology.version() {
+        CgroupVersion::V1 => Box::new(V1 { topology }),
+        CgroupVersion::V2 => Box::new(V2 { topology }),
     }
 }
 
@@ -412,6 +555,125 @@ pub fn auto() -> Box<dyn Hierarchy> {
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
+
+    #[cfg(feature = "fixtures")]
+    mod v1_views {
+        use super::*;
+        use crate::fs::Controller;
+
+        struct Fixture {
+            root: PathBuf,
+            paths: HostPaths,
+        }
+
+        impl Fixture {
+            fn new(mountinfo: &str, membership: &str) -> Self {
+                let root = std::env::temp_dir().join(format!(
+                    "hierarchy-compat-{}-{}",
+                    std::process::id(),
+                    rand::random::<u64>()
+                ));
+                let proc_self = root.join("proc/self");
+                let cgroupfs = root.join("cgroupfs");
+                fs::create_dir_all(&proc_self).unwrap();
+                fs::create_dir_all(&cgroupfs).unwrap();
+                fs::write(proc_self.join("mountinfo"), mountinfo).unwrap();
+                fs::write(proc_self.join("cgroup"), membership).unwrap();
+                fs::write(cgroupfs.join("cgroup.controllers"), "cpu memory\n").unwrap();
+                let paths = HostPaths::new(root.join("proc"), root.join("hugepages"))
+                    .with_fixture_root(cgroupfs);
+                Self { root, paths }
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        const V2_MOUNT: &str = "47 44 0:30 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+
+        #[test]
+        fn test_v1_view_uses_named_mount_root_on_v2_primary_topology() {
+            for (mount_point, expected_root) in [
+                ("/opt/legacy/systemd", "/opt/legacy"),
+                ("/srv/legacy-tree", "/srv/legacy-tree"),
+            ] {
+                let mounts = format!(
+                    "{V2_MOUNT}51 44 0:51 /delegated {mount_point} rw - cgroup cgroup rw,name=systemd\n"
+                );
+                let fixture = Fixture::new(&mounts, "0::/\n1:name=systemd:/delegated/work\n");
+                let topology = discover(&fixture.paths).unwrap();
+                assert_eq!(topology.version(), CgroupVersion::V2);
+                assert_eq!(topology.cgroupfs_root(), fixture.root.join("cgroupfs"));
+                assert_eq!(
+                    V1::with_host_paths(&fixture.paths).unwrap().root(),
+                    Path::new(expected_root),
+                );
+
+                // Converting the snapshot and querying the view need no live procfs.
+                fs::remove_dir_all(fixture.paths.procfs.join("self")).unwrap();
+                let v1 = V1::with_topology(topology.clone());
+                assert_eq!(v1.root(), Path::new(expected_root));
+                assert_eq!(v1.clone().root(), Path::new(expected_root));
+                assert!(Arc::ptr_eq(&topology, &v1.topology().unwrap()));
+                assert_eq!(
+                    v1.get_mount_point(Controllers::Systemd),
+                    Some((PathBuf::from(mount_point), PathBuf::from("/delegated"))),
+                );
+                let handle =
+                    Cgroup::load_validated(Box::new(v1), CgroupPath::new("child").unwrap());
+                let systemd: &SystemdController = handle.controller_of().unwrap();
+                assert_eq!(systemd.path(), Path::new(mount_point).join("child"));
+            }
+        }
+
+        #[test]
+        fn test_v1_view_with_separate_named_roots_uses_first_v1_mount() {
+            let systemd_mount =
+                "51 44 0:51 / /opt/legacy/systemd rw - cgroup cgroup rw,name=systemd\n";
+            let openrc_mount = "52 44 0:52 / /run/openrc rw - cgroup cgroup rw,name=openrc\n";
+            for (named_mounts, expected_root) in [
+                (format!("{systemd_mount}{openrc_mount}"), "/opt/legacy"),
+                (format!("{openrc_mount}{systemd_mount}"), "/run"),
+            ] {
+                let fixture = Fixture::new(
+                    &format!("{V2_MOUNT}{named_mounts}"),
+                    "0::/\n1:name=systemd:/\n2:name=openrc:/\n",
+                );
+                let topology = discover(&fixture.paths).unwrap();
+                assert_eq!(topology.version(), CgroupVersion::V2);
+                let v1 = V1::with_topology(topology);
+                assert_eq!(v1.root(), Path::new(expected_root));
+                assert_eq!(
+                    v1.get_mount_point(Controllers::Systemd),
+                    Some((PathBuf::from("/opt/legacy/systemd"), PathBuf::from("/"))),
+                );
+            }
+        }
+
+        #[test]
+        fn test_v1_view_preserves_non_utf8_named_mount_root() {
+            let fixture = crate::tests::TopologyFixture::new(
+                b"47 44 0:30 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
+                  51 44 0:51 / /opt/legacy-\xff/systemd rw - cgroup cgroup rw,name=systemd\n",
+                b"0::/\n1:name=systemd:/\n",
+                "cpu memory",
+            );
+            assert_eq!(fixture.topology.version(), CgroupVersion::V2);
+            let v1 = V1::with_topology(fixture.topology.clone());
+            assert_eq!(v1.root().as_os_str().as_bytes(), b"/opt/legacy-\xff");
+        }
+
+        #[test]
+        fn test_v1_view_without_v1_mounts_uses_legacy_empty_root() {
+            let fixture = Fixture::new(V2_MOUNT, "0::/\n");
+            let v1 = V1::with_topology(discover(&fixture.paths).unwrap());
+            assert_eq!(v1.root(), Path::new(UNIFIED_MOUNTPOINT));
+            assert!(v1.subsystems().is_empty());
+        }
+    }
 
     /// One mountinfo line plus its expected parse result.
     ///
@@ -586,6 +848,7 @@ mod tests {
     ];
 
     #[test]
+    #[allow(deprecated)]
     fn test_parse_mountinfo_for_line_table() {
         for case in CASES {
             let got = parse_mountinfo_for_line(case.line);
@@ -689,17 +952,20 @@ bad mountinfo line\n";
     }
 
     #[test]
+    #[cfg(feature = "fixtures")]
     fn test_v1_controller_match_with_non_utf8_super_option() {
-        let mountinfo = mountinfo_file_bytes(
-            b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory,release_agent=/tmp/agent-\xff\n",
-        )
-        .unwrap();
+        let input = b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory,release_agent=/tmp/agent-\xff\n";
+        let mountinfo = mountinfo_file_bytes(input).unwrap();
         assert_eq!(mountinfo[0].super_opts[2], b"release_agent=/tmp/agent-\xff");
 
-        let hierarchy = V1 { mountinfo };
+        let fixture = crate::tests::TopologyFixture::new(input, b"1:memory:/\n", "");
+        let hierarchy = V1::with_topology(fixture.topology.clone());
         assert_eq!(
             hierarchy.get_mount_point(Controllers::Mem),
-            Some((PathBuf::from("/sys/fs/cgroup/memory"), PathBuf::from("/"),))
+            Some((
+                fixture.topology.cgroupfs_root().join("memory"),
+                PathBuf::from("/")
+            ))
         );
     }
 
@@ -729,5 +995,160 @@ bad mountinfo line\n";
             let info = parse_mountinfo_for_line(mi.0).unwrap();
             assert_eq!(info, mi.1)
         }
+    }
+
+    #[test]
+    #[cfg(feature = "fixtures")]
+    fn test_v1_hierarchy_mountpoint_and_hugetlb_override() {
+        struct TempGuard(PathBuf);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!("v1-hier-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _guard = TempGuard(temp_dir.clone());
+        let custom_cgroupfs = temp_dir.join("cgroupfs");
+        let custom_hugepages = temp_dir.join("hugepages");
+        std::fs::create_dir_all(&custom_cgroupfs).unwrap();
+        std::fs::create_dir_all(custom_hugepages.join("hugepages-2048kB")).unwrap();
+
+        let mountinfo = "\
+43 33 0:38 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:20 - cgroup cgroup rw,memory
+44 33 0:39 / /sys/fs/cgroup/hugetlb rw,nosuid,nodev,noexec,relatime shared:21 - cgroup cgroup rw,hugetlb";
+        let proc_self = temp_dir.join("proc/self");
+        std::fs::create_dir_all(&proc_self).unwrap();
+        std::fs::write(proc_self.join("mountinfo"), mountinfo).unwrap();
+        std::fs::write(proc_self.join("cgroup"), "1:memory:/\n2:hugetlb:/\n").unwrap();
+        let host_paths = HostPaths::new(temp_dir.join("proc"), custom_hugepages)
+            .with_fixture_root(custom_cgroupfs.clone());
+        let topology = discover(&host_paths).unwrap();
+
+        let v1 = V1::with_topology(topology);
+        let mem_point = v1.get_mount_point(Controllers::Mem).unwrap();
+        assert_eq!(mem_point.0, custom_cgroupfs.join("memory"));
+
+        let subs = v1.subsystems();
+        let hugetlb_sub = subs
+            .iter()
+            .find(|s| s.controller_name() == "hugetlb")
+            .unwrap();
+        match hugetlb_sub {
+            Subsystem::HugeTlb(c) => {
+                assert!(c.size_supported("2MB"));
+            }
+            _ => panic!("expected HugeTlb controller"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "fixtures")]
+    fn test_is_cgroup2_unified_mode_is_scoped_to_host_paths() {
+        struct TempGuard(PathBuf);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn write_proc(root: &Path, mountinfo: &str, membership: &str) {
+            let proc_self = root.join("proc/self");
+            std::fs::create_dir_all(&proc_self).unwrap();
+            std::fs::write(proc_self.join("mountinfo"), mountinfo).unwrap();
+            std::fs::write(proc_self.join("cgroup"), membership).unwrap();
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!("hier-mode-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _guard = TempGuard(temp_dir.clone());
+
+        let v1_root = temp_dir.join("v1");
+        write_proc(
+            &v1_root,
+            "43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory",
+            "1:memory:/",
+        );
+        let v1_paths = HostPaths::new(v1_root.join("proc"), v1_root.join("hugepages"))
+            .with_fixture_root(v1_root.join("cgroupfs"));
+
+        let v2_root = temp_dir.join("v2");
+        write_proc(
+            &v2_root,
+            "47 44 0:30 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw",
+            "0::/",
+        );
+        let v2_cgroupfs = v2_root.join("cgroupfs");
+        std::fs::create_dir_all(&v2_cgroupfs).unwrap();
+        std::fs::write(v2_cgroupfs.join("cgroup.controllers"), "cpu memory\n").unwrap();
+        let v2_paths = HostPaths::new(v2_root.join("proc"), v2_root.join("hugepages"))
+            .with_fixture_root(v2_cgroupfs);
+
+        assert!(!is_cgroup2_unified_mode_with_paths(&v1_paths).unwrap());
+        assert!(is_cgroup2_unified_mode_with_paths(&v2_paths).unwrap());
+        assert!(!is_cgroup2_unified_mode_with_paths(&v1_paths).unwrap());
+    }
+
+    #[test]
+    #[cfg(feature = "fixtures")]
+    fn test_v2_constructors_reject_v1_topology_before_mutation() {
+        struct TempGuard(PathBuf);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("v2-hier-reject-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _guard = TempGuard(temp_dir.clone());
+
+        let proc_self = temp_dir.join("proc/self");
+        std::fs::create_dir_all(&proc_self).unwrap();
+        std::fs::write(
+            proc_self.join("mountinfo"),
+            "43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory",
+        )
+        .unwrap();
+        std::fs::write(proc_self.join("cgroup"), "1:memory:/").unwrap();
+
+        let cgroupfs_root = temp_dir.join("cgroupfs");
+        let v1_paths = HostPaths::new(temp_dir.join("proc"), temp_dir.join("hugepages"))
+            .with_fixture_root(cgroupfs_root.clone());
+        std::fs::create_dir_all(&cgroupfs_root).unwrap();
+
+        // Both checked entry points must fail on a v1 host.
+        assert!(V2::with_host_paths(&v1_paths).is_err());
+
+        let topology = discover(&v1_paths).unwrap();
+        let target = cgroupfs_root.join("must-not-be-created");
+        match V2::with_topology(topology) {
+            Err(CoreError::VersionMismatch {
+                path,
+                requested,
+                found,
+            }) => {
+                assert_eq!(path, cgroupfs_root);
+                assert_eq!(requested, CgroupVersion::V2);
+                assert_eq!(found, CgroupVersion::V1);
+            }
+            Ok(v2) => {
+                // If the version check regresses, exercise the dangerous path:
+                // Cgroup::create would otherwise create this directory using
+                // v2 semantics under a v1 root and report success.
+                let cgroup = Cgroup::load_validated(
+                    Box::new(v2),
+                    CgroupPath::new("must-not-be-created").unwrap(),
+                );
+                cgroup.create().unwrap();
+            }
+            Err(other) => panic!("unexpected error: {}", other),
+        }
+        assert!(
+            !target.exists(),
+            "rejecting a v1 topology must happen before cgroupfs mutation"
+        );
     }
 }
