@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 macro_rules! update_and_test {
-    ($self: ident, $set_func:ident, $value:expr, $get_func:ident) => {
+    ($self:ident, $set_func:ident, $value:expr, $get_func:ident) => {
         if let Some(v) = $value {
             $self.$set_func(v)?;
             if $self.$get_func()? != v {
@@ -24,8 +24,10 @@ macro_rules! update_and_test {
     };
 }
 
+// Preserve the released best-effort setter behavior.
+// TODO: Remove this macro once all call sites propagate setter failures.
 macro_rules! update {
-    ($self: ident, $set_func:ident, $value:expr) => {
+    ($self:ident, $set_func:ident, $value:expr) => {
         if let Some(v) = $value {
             let _ = $self.$set_func(v);
         }
@@ -150,7 +152,7 @@ impl fmt::Display for Controllers {
 mod sealed {
     use super::*;
 
-    pub trait ControllerInternal {
+    pub(crate) trait ControllerInternal {
         fn apply(&self, res: &Resources) -> Result<()>;
 
         // meta stuff
@@ -192,6 +194,68 @@ mod sealed {
             }
         }
 
+        /// Read a resource value, attaching its path to I/O and parser failures.
+        /// The parser receives trimmed text; parse errors retain the original input.
+        fn read_value<T, E>(
+            &self,
+            name: &str,
+            parser: impl FnOnce(&str) -> std::result::Result<T, E>,
+        ) -> Result<T>
+        where
+            E: 'static + Send + Sync + std::error::Error,
+        {
+            let path = self.get_path().join(name);
+            let mut file = File::open(&path).map_err(|cause| {
+                Error::with_cause(
+                    ReadFailed(path.display().to_string()),
+                    ReadFileError::Open {
+                        path: path.clone(),
+                        cause,
+                    },
+                )
+            })?;
+            let mut input = String::new();
+            file.read_to_string(&mut input).map_err(|cause| {
+                Error::with_cause(
+                    ReadFailed(path.display().to_string()),
+                    ReadFileError::Read {
+                        path: path.clone(),
+                        cause,
+                    },
+                )
+            })?;
+            parser(input.trim()).map_err(|cause| {
+                Error::with_cause(
+                    ParseError,
+                    ReadFileError::Parse {
+                        path,
+                        input,
+                        cause: Box::new(cause),
+                    },
+                )
+            })
+        }
+
+        /// Write a resource value with consistent context for open and write failures.
+        fn write_value(&self, name: &str, value: &str) -> Result<()> {
+            let path = self.get_path().join(name);
+            let mut file = File::create(&path).map_err(|cause| {
+                Error::with_cause(
+                    WriteFailed(name.to_owned(), value.to_owned()),
+                    WriteFileError::Open {
+                        path: path.clone(),
+                        cause,
+                    },
+                )
+            })?;
+            file.write_all(value.as_bytes()).map_err(|cause| {
+                Error::with_cause(
+                    WriteFailed(name.to_owned(), value.to_owned()),
+                    WriteFileError::Write { path, cause },
+                )
+            })
+        }
+
         fn get_max_value(&self, f: &str) -> Result<MaxValue> {
             self.open_path(f, false).and_then(|mut file| {
                 let mut string = String::new();
@@ -209,13 +273,9 @@ mod sealed {
         }
     }
 
-    pub trait CustomizedAttribute: ControllerInternal {
+    pub(crate) trait CustomizedAttribute: ControllerInternal {
         fn set(&self, key: &str, value: &str) -> Result<()> {
-            self.open_path(key, true).and_then(|mut file| {
-                file.write_all(value.as_ref()).map_err(|e| {
-                    Error::with_cause(WriteFailed(key.to_string(), value.to_string()), e)
-                })
-            })
+            self.write_value(key, value)
         }
 
         #[allow(dead_code)]
@@ -234,6 +294,18 @@ mod sealed {
 pub(crate) use crate::fs::sealed::{ControllerInternal, CustomizedAttribute};
 use crate::CgroupPid;
 
+/// Read a kernel-version-dependent cgroup file.
+///
+/// A missing file means that the running kernel does not expose that optional
+/// statistic. Any other failure must reach the caller.
+pub(crate) fn optional_read<T: Default>(result: Result<T>) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if error.is_not_found() => Ok(T::default()),
+        Err(error) => Err(error),
+    }
+}
+
 /// A Controller is a subsystem attached to the control group.
 ///
 /// Implementors are able to control certain aspects of a control group.
@@ -249,6 +321,8 @@ pub trait Controller {
 
     /// Apply a set of resources to the Controller, invoking its internal functions to pass the
     /// kernel the information.
+    ///
+    /// Updates are not rolled back; earlier writes may have taken effect.
     fn apply(&self, res: &Resources) -> Result<()>;
 
     /// Create this controller
@@ -278,11 +352,19 @@ pub trait Controller {
     /// get cgroup type.
     fn get_cgroup_type(&self) -> Result<String>;
 
-    /// Get the list of tasks that this controller has.
-    fn tasks(&self) -> Vec<CgroupPid>;
+    /// Get the list of tasks that this controller has, returning an error if reading fails.
+    ///
+    /// Built-in controllers read `tasks` on v1 and `cgroup.threads` on v2.
+    /// Implementations must propagate I/O and parse failures instead of returning
+    /// partial results or replacing malformed entries with PID zero.
+    fn tasks(&self) -> Result<Vec<CgroupPid>>;
 
-    /// Get the list of procs that this controller has.
-    fn procs(&self) -> Vec<CgroupPid>;
+    /// Get the list of procs that this controller has, returning an error if reading fails.
+    ///
+    /// Built-in controllers read `cgroup.procs` on both versions.
+    /// Implementations must propagate I/O and parse failures instead of returning
+    /// partial results or replacing malformed entries with PID zero.
+    fn procs(&self) -> Result<Vec<CgroupPid>>;
 
     fn v2(&self) -> bool;
 }
@@ -406,49 +488,22 @@ where
         })
     }
 
-    /// Get the list of procs that this controller has.
-    fn procs(&self) -> Vec<CgroupPid> {
+    /// Get the list of procs that this controller has, returning an error if reading fails.
+    fn procs(&self) -> Result<Vec<CgroupPid>> {
         let file_name = "cgroup.procs";
-        self.open_path(file_name, false)
-            .map(|file| {
-                let bf = BufReader::new(file);
-                let mut v = Vec::new();
-                for line in bf.lines() {
-                    match line {
-                        Ok(line) => {
-                            let n = line.trim().parse().unwrap_or(0u64);
-                            v.push(n);
-                        }
-                        Err(_) => break,
-                    }
-                }
-                v.into_iter().map(CgroupPid::from).collect()
-            })
-            .unwrap_or_default()
+        let file = self.open_path(file_name, false)?;
+        read_pids(BufReader::new(file), &self.get_path().join(file_name))
     }
 
-    /// Get the list of tasks that this controller has.
-    fn tasks(&self) -> Vec<CgroupPid> {
-        let mut file_name = "tasks";
-        if self.is_v2() {
-            file_name = "cgroup.threads";
-        }
-        self.open_path(file_name, false)
-            .map(|file| {
-                let bf = BufReader::new(file);
-                let mut v = Vec::new();
-                for line in bf.lines() {
-                    match line {
-                        Ok(line) => {
-                            let n = line.trim().parse().unwrap_or(0u64);
-                            v.push(n);
-                        }
-                        Err(_) => break,
-                    }
-                }
-                v.into_iter().map(CgroupPid::from).collect()
-            })
-            .unwrap_or_default()
+    /// Get the list of tasks that this controller has, returning an error if reading fails.
+    fn tasks(&self) -> Result<Vec<CgroupPid>> {
+        let file_name = if self.is_v2() {
+            "cgroup.threads"
+        } else {
+            "tasks"
+        };
+        let file = self.open_path(file_name, false)?;
+        read_pids(BufReader::new(file), &self.get_path().join(file_name))
     }
 
     /// set cgroup.type
@@ -987,6 +1042,40 @@ pub fn nested_keyed_to_hashmap(mut file: File) -> Result<HashMap<String, HashMap
     Ok(h)
 }
 
+fn parse_pid(input: &str, line: usize) -> std::result::Result<CgroupPid, error::ParsePidError> {
+    input
+        .trim()
+        .parse::<u64>()
+        .map(CgroupPid::from)
+        .map_err(|cause| error::ParsePidError {
+            line,
+            input: input.to_owned(),
+            cause,
+        })
+}
+
+fn read_pids(reader: impl BufRead, path: &Path) -> Result<Vec<CgroupPid>> {
+    let mut pids = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let input =
+            line.map_err(|cause| Error::with_cause(ReadFailed(path.display().to_string()), cause))?;
+        if input.trim().is_empty() {
+            continue;
+        }
+        let pid = parse_pid(&input, index + 1).map_err(|cause| {
+            Error::with_cause(
+                ParseError,
+                error::ParsePidFileError {
+                    path: path.to_path_buf(),
+                    cause,
+                },
+            )
+        })?;
+        pids.push(pid);
+    }
+    Ok(pids)
+}
+
 fn read_from<T>(mut file: File) -> Result<T>
 where
     T: FromStr,
@@ -1024,4 +1113,136 @@ fn read_u64_from(file: File) -> Result<u64> {
 /// read and parse an i64 data
 fn read_i64_from(file: File) -> Result<i64> {
     read_from::<i64>(file)
+}
+
+#[cfg(test)]
+mod controller_membership_tests {
+    use super::*;
+
+    #[test]
+    fn membership_read_failure_preserves_full_path_and_errno_after_valid_prefix() {
+        use std::error::Error as _;
+        use std::io::{self, Cursor};
+
+        struct FailingRead;
+        impl Read for FailingRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
+
+        let path = Path::new("/fixture/cgroup/cgroup.procs");
+        let reader = BufReader::new(Cursor::new(b"100\n").chain(FailingRead));
+        let error = read_pids(reader, path).unwrap_err();
+        assert_eq!(error.kind(), &ReadFailed(path.display().to_string()));
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+    }
+
+    /// Models a downstream implementation of the fallible membership contract.
+    struct CustomController {
+        path: PathBuf,
+    }
+
+    impl Controller for CustomController {
+        fn control_type(&self) -> Controllers {
+            Controllers::Cpu
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn base(&self) -> &Path {
+            &self.path
+        }
+
+        fn apply(&self, _res: &Resources) -> Result<()> {
+            Ok(())
+        }
+
+        fn create(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn exists(&self) -> bool {
+            true
+        }
+
+        fn set_notify_on_release(&self, _enable: bool) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_release_agent(&self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn add_task(&self, _pid: &CgroupPid) -> Result<()> {
+            Ok(())
+        }
+
+        fn add_task_by_tgid(&self, _pid: &CgroupPid) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_cgroup_type(&self, _cgroup_type: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_cgroup_type(&self) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn tasks(&self) -> Result<Vec<CgroupPid>> {
+            Ok(vec![CgroupPid::from(11u64)])
+        }
+
+        fn procs(&self) -> Result<Vec<CgroupPid>> {
+            Err(Error::with_cause(
+                ReadFailed(self.path.join("cgroup.procs").display().to_string()),
+                std::io::Error::from_raw_os_error(libc::EACCES),
+            ))
+        }
+
+        fn v2(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn custom_controller_membership_methods_return_values_and_errors() {
+        use std::error::Error as _;
+
+        let custom = CustomController {
+            path: PathBuf::from("/unused"),
+        };
+        let controller: &dyn Controller = &custom;
+
+        assert_eq!(controller.tasks().unwrap(), [CgroupPid::from(11u64)]);
+        let error = controller.procs().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ReadFailed("/unused/cgroup.procs".to_string())
+        );
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+    }
 }

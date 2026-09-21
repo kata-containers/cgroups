@@ -30,14 +30,14 @@ fn test_procs_iterator_cgroup() {
         // Add a task to the control group.
         cg.add_task_by_tgid(CgroupPid::from(pid)).unwrap();
 
-        let mut procs = cg.procs().into_iter();
+        let mut procs = cg.procs().unwrap().into_iter();
         // Verify that the task is indeed in the xcontrol group
         assert_eq!(procs.next(), Some(CgroupPid::from(pid)));
         assert_eq!(procs.next(), None);
 
         // Now, try removing it.
         cg.remove_task_by_tgid(CgroupPid::from(pid)).unwrap();
-        procs = cg.procs().into_iter();
+        procs = cg.procs().unwrap().into_iter();
 
         // Verify that it was indeed removed.
         assert_eq!(procs.next(), None);
@@ -57,14 +57,14 @@ fn test_tasks_iterator_cgroup_v1() {
         // Add a task to the control group.
         cg.add_task(CgroupPid::from(pid)).unwrap();
 
-        let mut tasks = cg.tasks().into_iter();
+        let mut tasks = cg.tasks().unwrap().into_iter();
         // Verify that the task is indeed in the xcontrol group
         assert_eq!(tasks.next(), Some(CgroupPid::from(pid)));
         assert_eq!(tasks.next(), None);
 
         // Now, try removing it.
         cg.remove_task(CgroupPid::from(pid)).unwrap();
-        tasks = cg.tasks().into_iter();
+        tasks = cg.tasks().unwrap().into_iter();
 
         // Verify that it was indeed removed.
         assert_eq!(tasks.next(), None);
@@ -140,7 +140,7 @@ fn test_tasks_iterator_cgroup_threaded_mode() {
         // Add a proc to the control group.
         cg.add_task_by_tgid(CgroupPid::from(pid)).unwrap();
 
-        let mut procs = cg.procs().into_iter();
+        let mut procs = cg.procs().unwrap().into_iter();
         // Verify that the task is indeed in the x control group
         assert_eq!(procs.next(), Some(CgroupPid::from(pid)));
         assert_eq!(procs.next(), None);
@@ -148,7 +148,7 @@ fn test_tasks_iterator_cgroup_threaded_mode() {
         // Add a task to the sub control group.
         cg_threaded_sub1.add_task(CgroupPid::from(pid)).unwrap();
 
-        let mut tasks = cg_threaded_sub1.tasks().into_iter();
+        let mut tasks = cg_threaded_sub1.tasks().unwrap().into_iter();
         // Verify that the task is indeed in the xcontrol group
         assert_eq!(tasks.next(), Some(CgroupPid::from(pid)));
         assert_eq!(tasks.next(), None);
@@ -157,14 +157,14 @@ fn test_tasks_iterator_cgroup_threaded_mode() {
         cg_threaded_sub1
             .move_task_to_parent(CgroupPid::from(pid))
             .unwrap();
-        tasks = cg_threaded_sub1.tasks().into_iter();
+        tasks = cg_threaded_sub1.tasks().unwrap().into_iter();
 
         // Verify that it was indeed removed.
         assert_eq!(tasks.next(), None);
 
         // Now, try removing it.
         cg.remove_task_by_tgid(CgroupPid::from(pid)).unwrap();
-        procs = cg.procs().into_iter();
+        procs = cg.procs().unwrap().into_iter();
 
         // Verify that it was indeed removed.
         assert_eq!(procs.next(), None);
@@ -172,6 +172,53 @@ fn test_tasks_iterator_cgroup_threaded_mode() {
     cg_threaded_sub1.delete().unwrap();
     cg_threaded_sub2.delete().unwrap();
     cg.delete().unwrap();
+}
+
+#[cfg(feature = "oci")]
+#[test]
+fn test_destroy_empty_threaded_cgroup_v2() {
+    use std::error::Error as _;
+
+    use cgroups_rs::core::{discover, HostPaths};
+    use cgroups_rs::oci::{FsManager, Manager};
+
+    cgroups_rs::skip_if_not_root!();
+    cgroups_rs::skip_if_cgroups_v1!();
+
+    let topology = discover(&HostPaths::default()).unwrap();
+    let hierarchy = cgroups_rs::fs::hierarchies::from_topology(topology.clone());
+    let base = CgroupPath::new("test_destroy_empty_threaded_cgroup_v2").unwrap();
+    let parent = Cgroup::new(hierarchy.clone(), base.clone()).unwrap();
+    let threaded_base = base.join(&CgroupPath::new("threaded").unwrap());
+    let threaded = Cgroup::builder(hierarchy, threaded_base.clone())
+        .controllers(ControllerSelection::Only(vec![
+            "cpu".into(),
+            "cpuset".into(),
+        ]))
+        .create()
+        .unwrap();
+    threaded.set_cgroup_type(CGROUP_MODE_THREADED).unwrap();
+    assert_eq!(threaded.get_cgroup_type().unwrap(), CGROUP_MODE_THREADED);
+    assert!(threaded.tasks().unwrap().is_empty());
+
+    // A real threaded cgroup rejects this read even when it is empty. The
+    // strict reader must retain the errno; only destroy handles it specially.
+    let error = threaded.procs().unwrap_err();
+    assert_eq!(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
+        Some(libc::EOPNOTSUPP)
+    );
+
+    let mut manager = FsManager::new(topology, threaded_base).unwrap();
+    manager.destroy().unwrap();
+    assert!(!threaded.exists());
+    manager.destroy().unwrap();
+    parent.delete().unwrap();
 }
 
 #[test]
@@ -187,7 +234,7 @@ fn test_kill_cgroup() {
         cg.add_task_by_tgid(CgroupPid::from(child.id() as u64))
             .unwrap();
 
-        let cg_procs = cg.procs();
+        let cg_procs = cg.procs().unwrap();
         assert_eq!(cg_procs.len(), 1_usize);
 
         // Now kill and wait on the proc.

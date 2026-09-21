@@ -10,7 +10,7 @@
 //!  [Documentation/cgroup-v1/memory.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/memory.txt)
 use log::warn;
 use std::collections::HashMap;
-use std::io::Write;
+use std::error::Error as _;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
@@ -511,7 +511,9 @@ impl ControllerInternal for MemController {
         update!(self, set_soft_limit, memres.memory_soft_limit);
         update!(self, set_kmem_limit, memres.kernel_memory_limit);
         update!(self, set_memswap_limit, memres.memory_swap_limit);
-        update!(self, set_tcp_limit, memres.kernel_tcp_memory_limit);
+        if !self.v2 {
+            update!(self, set_tcp_limit, memres.kernel_tcp_memory_limit);
+        }
         update!(self, set_swappiness, memres.swappiness);
 
         memres.attrs.iter().for_each(|(k, v)| {
@@ -545,11 +547,7 @@ impl MemController {
             let f = value.1;
             if let Some(v) = v {
                 let v = v.to_string();
-                self.open_path(f, true).and_then(|mut file| {
-                    file.write_all(v.as_ref()).map_err(|e| {
-                        Error::with_cause(WriteFailed(f.to_string(), format!("{:?}", v)), e)
-                    })
-                })?;
+                self.write_value(f, &v)?;
             }
         }
         Ok(())
@@ -774,14 +772,7 @@ impl MemController {
 
     /// Reset the fail counter
     pub fn reset_fail_count(&self) -> Result<()> {
-        self.open_path("memory.failcnt", true).and_then(|mut file| {
-            file.write_all("0".to_string().as_ref()).map_err(|e| {
-                Error::with_cause(
-                    WriteFailed("memory.failcnt".to_string(), "0".to_string()),
-                    e,
-                )
-            })
-        })
+        self.write_value("memory.failcnt", "0")
     }
 
     /// Reset the kernel memory fail counter
@@ -791,15 +782,7 @@ impl MemController {
             return Ok(());
         }
 
-        self.open_path("memory.kmem.failcnt", true)
-            .and_then(|mut file| {
-                file.write_all("0".to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("memory.kmem.failcnt".to_string(), "0".to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("memory.kmem.failcnt", "0")
     }
 
     /// Reset the TCP related fail counter
@@ -809,41 +792,17 @@ impl MemController {
             return Ok(());
         }
 
-        self.open_path("memory.kmem.tcp.failcnt", true)
-            .and_then(|mut file| {
-                file.write_all("0".to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("memory.kmem.tcp.failcnt".to_string(), "0".to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("memory.kmem.tcp.failcnt", "0")
     }
 
     /// Reset the memory+swap fail counter
     pub fn reset_memswap_fail_count(&self) -> Result<()> {
-        self.open_path("memory.memsw.failcnt", true)
-            .and_then(|mut file| {
-                file.write_all("0".to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("memory.memsw.failcnt".to_string(), "0".to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("memory.memsw.failcnt", "0")
     }
 
     /// Reset the max memory usage recorded
     pub fn reset_max_usage(&self) -> Result<()> {
-        self.open_path("memory.max_usage_in_bytes", true)
-            .and_then(|mut file| {
-                file.write_all("0".to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("memory.max_usage_in_bytes".to_string(), "0".to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("memory.max_usage_in_bytes", "0")
     }
 
     /// Set the memory usage limit of the control group, in bytes.
@@ -856,10 +815,7 @@ impl MemController {
                 limit_str = "max".to_string();
             }
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(limit_str.as_ref())
-                .map_err(|e| Error::with_cause(WriteFailed(file_name.to_string(), limit_str), e))
-        })
+        self.write_value(file_name, &limit_str)
     }
 
     /// Set the kernel memory limit of the control group, in bytes.
@@ -869,21 +825,20 @@ impl MemController {
             return Ok(());
         }
 
-        self.open_path("memory.kmem.limit_in_bytes", true)
-            .and_then(|mut file| {
-                let r = file.write_all(limit.to_string().as_ref());
-                match r {
-                    Ok(()) => Ok(()),
-                    Err(ref e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
-                        warn!("memory.kmem.limit_in_bytes is unsupported by the kernel");
-                        Ok(())
-                    }
-                    Err(e) => Err(Error::with_cause(
-                        WriteFailed("memory.kmem.limit_in_bytes".to_string(), limit.to_string()),
-                        e,
-                    )),
-                }
-            })
+        match self.write_value("memory.kmem.limit_in_bytes", &limit.to_string()) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.source().and_then(|cause| cause.downcast_ref::<WriteFileError>()),
+                    Some(WriteFileError::Write { cause, .. })
+                        if cause.raw_os_error() == Some(libc::EOPNOTSUPP)
+                ) =>
+            {
+                warn!("memory.kmem.limit_in_bytes is unsupported by the kernel");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Set the memory+swap limit of the control group, in bytes.
@@ -896,10 +851,7 @@ impl MemController {
                 limit_str = "max".to_string();
             }
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(limit_str.as_ref())
-                .map_err(|e| Error::with_cause(WriteFailed(file_name.to_string(), limit_str), e))
-        })
+        self.write_value(file_name, &limit_str)
     }
 
     /// Set how much kernel memory can be used for TCP-related buffers by the control group.
@@ -909,18 +861,7 @@ impl MemController {
             return Ok(());
         }
 
-        self.open_path("memory.kmem.tcp.limit_in_bytes", true)
-            .and_then(|mut file| {
-                file.write_all(limit.to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed(
-                            "memory.kmem.tcp.limit_in_bytes".to_string(),
-                            limit.to_string(),
-                        ),
-                        e,
-                    )
-                })
-            })
+        self.write_value("memory.kmem.tcp.limit_in_bytes", &limit.to_string())
     }
 
     /// Set the soft limit of the control group, in bytes.
@@ -932,11 +873,7 @@ impl MemController {
         if self.v2 {
             file_name = "memory.low"
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(limit.to_string().as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed(file_name.to_string(), limit.to_string()), e)
-            })
-        })
+        self.write_value(file_name, &limit.to_string())
     }
 
     /// Set how likely the kernel is to swap out parts of the address space used by the control
@@ -949,26 +886,14 @@ impl MemController {
             file_name = "memory.swap.max"
         }
 
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(swp.to_string().as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed(file_name.to_string(), swp.to_string()), e)
-            })
-        })
+        self.write_value(file_name, &swp.to_string())
     }
 
     pub fn disable_oom_killer(&self) -> Result<()> {
         if self.v2 {
             Err(Error::new(CgroupVersion))
         } else {
-            self.open_path("memory.oom_control", true)
-                .and_then(|mut file| {
-                    file.write_all("1".to_string().as_ref()).map_err(|e| {
-                        Error::with_cause(
-                            WriteFailed("memory.oom_control".to_string(), "1".to_string()),
-                            e,
-                        )
-                    })
-                })
+            self.write_value("memory.oom_control", "1")
         }
     }
 

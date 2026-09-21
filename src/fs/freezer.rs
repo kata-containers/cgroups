@@ -8,7 +8,7 @@
 //!
 //! See the Kernel's documentation for more information about this subsystem, found at:
 //!  [Documentation/cgroup-v1/freezer-subsystem.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/freezer-subsystem.txt)
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 
 use crate::fs::error::ErrorKind::*;
@@ -43,6 +43,10 @@ impl ControllerInternal for FreezerController {
     }
     fn get_base(&self) -> &PathBuf {
         &self.base
+    }
+
+    fn is_v2(&self) -> bool {
+        self.v2
     }
 
     fn apply(&self, _res: &Resources) -> Result<()> {
@@ -89,10 +93,7 @@ impl FreezerController {
             content = "1".to_string();
         }
 
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(content.as_ref())
-                .map_err(|e| Error::with_cause(WriteFailed(file_name.to_string(), content), e))
-        })
+        self.write_value(file_name, &content)
     }
 
     /// Thaws, that is, unfreezes the processes in the control group.
@@ -103,10 +104,7 @@ impl FreezerController {
             file_name = "cgroup.freeze";
             content = "0".to_string();
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(content.as_ref())
-                .map_err(|e| Error::with_cause(WriteFailed(file_name.to_string(), content), e))
-        })
+        self.write_value(file_name, &content)
     }
 
     /// Retrieve the state of processes in the control group.
@@ -130,5 +128,30 @@ impl FreezerController {
                 Err(e) => Err(Error::with_cause(ReadFailed(file_name.to_string()), e)),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FreezerController;
+    use crate::fs::Controller;
+    use crate::CgroupPid;
+
+    #[test]
+    fn test_tasks_v2_reads_threads() {
+        let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "");
+        let root = fixture.topology.fixture_root().unwrap();
+        std::fs::write(root.join("cgroup.threads"), b"100\n101\n200\n").unwrap();
+        let freezer = FreezerController::new(root.to_path_buf(), root.to_path_buf(), true);
+
+        assert_eq!(
+            freezer.tasks().unwrap(),
+            vec![
+                CgroupPid::from(100),
+                CgroupPid::from(101),
+                CgroupPid::from(200)
+            ]
+        );
+        assert!(freezer.v2());
     }
 }

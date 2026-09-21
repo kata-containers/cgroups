@@ -40,7 +40,7 @@ fn test_cpuset_set_cpus() {
     {
         let cpuset: &CpuSetController = cg.controller_of().unwrap();
 
-        let set = cpuset.cpuset();
+        let set = cpuset.cpuset().unwrap();
         if cg.v2() {
             assert_eq!(0, set.cpus.len());
         } else {
@@ -52,7 +52,7 @@ fn test_cpuset_set_cpus() {
         let r = cpuset.set_cpus("0");
         assert!(r.is_ok());
 
-        let set = cpuset.cpuset();
+        let set = cpuset.cpuset().unwrap();
         assert_eq!(1, set.cpus.len());
         assert_eq!((0, 0), set.cpus[0]);
 
@@ -62,7 +62,7 @@ fn test_cpuset_set_cpus() {
         if !cpus.is_empty() {
             let r = cpuset.set_cpus(cpus);
             assert!(r.is_ok());
-            let set = cpuset.cpuset();
+            let set = cpuset.cpuset().unwrap();
             assert_eq!(1, set.cpus.len());
             assert_eq!(format!("{}-{}", set.cpus[0].0, set.cpus[0].1), cpus);
         }
@@ -82,7 +82,7 @@ fn test_cpuset_set_cpus_add_task() {
     .unwrap();
 
     let cpuset: &CpuSetController = cg.controller_of().unwrap();
-    let set = cpuset.cpuset();
+    let set = cpuset.cpuset().unwrap();
     if cg.v2() {
         assert_eq!(0, set.cpus.len());
     } else {
@@ -93,13 +93,13 @@ fn test_cpuset_set_cpus_add_task() {
     // Add a task to the control group.
     let pid_i = libc::pid_t::from(nix::unistd::getpid()) as u64;
     let _ = cg.add_task_by_tgid(CgroupPid::from(pid_i));
-    let tasks = cg.tasks();
+    let tasks = cg.tasks().unwrap();
     assert!(!tasks.is_empty());
     println!("tasks after added: {:?}", tasks);
 
     // remove task
     cg.remove_task_by_tgid(CgroupPid::from(pid_i)).unwrap();
-    let tasks = cg.tasks();
+    let tasks = cg.tasks().unwrap();
     println!("tasks after deleted: {:?}", tasks);
     assert_eq!(0, tasks.len());
 

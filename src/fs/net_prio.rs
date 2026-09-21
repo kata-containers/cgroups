@@ -8,7 +8,7 @@
 //! See the Kernel's documentation for more information about this subsystem, found at:
 //!  [Documentation/cgroup-v1/net_prio.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/net_prio.txt)
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 use crate::fs::error::ErrorKind::*;
@@ -119,18 +119,6 @@ impl NetPrioController {
 
     /// Set the priority of the network traffic on `eif` to be `prio`.
     pub fn set_if_prio(&self, eif: &str, prio: u64) -> Result<()> {
-        self.open_path("net_prio.ifpriomap", true)
-            .and_then(|mut file| {
-                file.write_all(format!("{} {}", eif, prio).as_ref())
-                    .map_err(|e| {
-                        Error::with_cause(
-                            WriteFailed(
-                                "net_prio.ifpriomap".to_string(),
-                                format!("{} {}", eif, prio),
-                            ),
-                            e,
-                        )
-                    })
-            })
+        self.write_value("net_prio.ifpriomap", &format!("{} {}", eif, prio))
     }
 }

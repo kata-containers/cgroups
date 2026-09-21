@@ -665,6 +665,41 @@ mod topology_tests {
     use std::sync::Arc;
 
     #[test]
+    fn test_pids_before_creation_and_after_removal() {
+        for version in [CgroupVersion::V1, CgroupVersion::V2] {
+            let fixture = crate::tests::topology_fixture(version, "memory");
+            // Construction and pids() require no D-Bus connection. This tests
+            // filesystem delegation, not the lifetime of a real systemd unit.
+            let manager =
+                SystemdManager::new(fixture.topology.clone(), "test.slice:scope:unit").unwrap();
+            let root = fixture.topology.fixture_root().unwrap();
+            let mount = if version == CgroupVersion::V1 {
+                root.join("memory")
+            } else {
+                root.to_path_buf()
+            };
+            let directory = mount.join("test.slice/scope-unit.scope");
+            let tasks = directory.join(if version == CgroupVersion::V1 {
+                "tasks"
+            } else {
+                "cgroup.threads"
+            });
+
+            assert!(manager.pids().unwrap().is_empty());
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(&tasks, "100\n").unwrap();
+            assert_eq!(manager.pids().unwrap(), [crate::CgroupPid::from(100)]);
+            fs::remove_file(&tasks).unwrap();
+            assert!(matches!(
+                manager.pids().unwrap_err(),
+                crate::oci::Error::Cgroupfs(error) if error.is_not_found()
+            ));
+            fs::remove_dir(&directory).unwrap();
+            assert!(manager.pids().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn test_managers_share_topology_without_rediscovery() {
         for version in [CgroupVersion::V1, CgroupVersion::V2] {
             let fixture = crate::tests::topology_fixture(version, "memory");

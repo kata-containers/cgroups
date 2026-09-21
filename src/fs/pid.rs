@@ -8,7 +8,7 @@
 //!
 //! See the Kernel's documentation for more information about this subsystem, found at:
 //!  [Documentation/cgroups-v1/pids.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/pids.txt)
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 
 use crate::fs::error::ErrorKind::*;
@@ -141,15 +141,6 @@ impl PidController {
     /// are about to set (`max_pid`), then no processess will be killed. Additonally, attaching
     /// extra processes to a control group disregards the limit.
     pub fn set_pid_max(&self, max_pid: MaxValue) -> Result<()> {
-        self.open_path("pids.max", true).and_then(|mut file| {
-            let string_to_write = max_pid.to_string();
-            match file.write_all(string_to_write.as_ref()) {
-                Ok(_) => Ok(()),
-                Err(e) => Err(Error::with_cause(
-                    WriteFailed("pids.max".to_string(), format!("{:?}", max_pid)),
-                    e,
-                )),
-            }
-        })
+        self.write_value("pids.max", &max_pid.to_string())
     }
 }

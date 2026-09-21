@@ -7,7 +7,7 @@
 //!
 //! See the Kernel's documentation for more information about this subsystem, found at:
 //!  [Documentation/cgroup-v1/devices.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/devices.txt)
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 
 use log::*;
@@ -237,17 +237,7 @@ impl DevicesController {
             format!("{}", major)
         };
         let final_str = format!("{} {}:{} {}", devtype.to_char(), major, minor, perms);
-        self.open_path("devices.allow", true).and_then(|mut file| {
-            file.write_all(final_str.as_ref()).map_err(|e| {
-                Error::with_cause(
-                    WriteFailed(
-                        self.get_path().join("devices.allow").display().to_string(),
-                        final_str,
-                    ),
-                    e,
-                )
-            })
-        })
+        self.write_value("devices.allow", &final_str)
     }
 
     /// Deny the control group's tasks access to the devices covered by `dev`.
@@ -276,17 +266,7 @@ impl DevicesController {
             format!("{}", major)
         };
         let final_str = format!("{} {}:{} {}", devtype.to_char(), major, minor, perms);
-        self.open_path("devices.deny", true).and_then(|mut file| {
-            file.write_all(final_str.as_ref()).map_err(|e| {
-                Error::with_cause(
-                    WriteFailed(
-                        self.get_path().join("devices.deny").display().to_string(),
-                        final_str,
-                    ),
-                    e,
-                )
-            })
-        })
+        self.write_value("devices.deny", &final_str)
     }
 
     /// Get the current list of allowed devices.
