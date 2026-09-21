@@ -15,6 +15,9 @@ pub mod stats;
 pub use stats::CgroupStats;
 pub mod systemd;
 
+pub mod error;
+pub mod model;
+
 /// Return early from a test that requires effective root privileges.
 ///
 /// This is exported so integration tests can share the same privilege check.
