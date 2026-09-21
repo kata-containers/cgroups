@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
+use crate::error::CoreError;
 use crate::fs::error::Error as CgroupfsError;
 use crate::systemd::dbus::error::Error as SystemdDbusError;
 use crate::systemd::error::Error as SystemdCgroupError;
@@ -25,4 +26,7 @@ pub enum Error {
 
     #[error("systemd dbus error: {0}")]
     SystemdDbus(#[from] SystemdDbusError),
+
+    #[error("core error: {0}")]
+    Core(#[from] CoreError),
 }

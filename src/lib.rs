@@ -15,6 +15,7 @@ pub mod stats;
 pub use stats::CgroupStats;
 pub mod systemd;
 
+pub mod discovery;
 pub mod error;
 pub mod model;
 

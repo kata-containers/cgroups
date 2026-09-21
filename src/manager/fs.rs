@@ -13,6 +13,7 @@ use oci_spec::runtime::{
     LinuxPids, LinuxResources,
 };
 
+use crate::discovery::membership::parse_membership;
 use crate::fs::blkio::{BlkIoController, BlkIoData, IoService, IoStat};
 use crate::fs::cgroup::UNIFIED_MOUNTPOINT;
 use crate::fs::cpu::CpuController;
@@ -881,30 +882,39 @@ impl Manager for FsManager {
 }
 
 /// Parse cgroup subsystem paths from a `/proc/self/cgroup` content string.
-fn parse_cgroup_subsystems_str(input: &str) -> HashMap<String, String> {
+///
+/// Transitional view conversion over [`parse_membership`]: parse errors
+/// are propagated (preserved as the error cause), colons inside a cgroup
+/// path survive, and unified-hierarchy records keep the legacy
+/// `"" -> <path>` entry documented on [`FsManager`].
+fn parse_cgroup_subsystems_str(input: &str) -> Result<HashMap<String, String>> {
+    let membership = parse_membership(input)?;
     let mut cgroup_paths = HashMap::new();
-    // Expected line format: `10:memory:/user.slice`
-    for line in input.lines() {
-        let parts: Vec<&str> = line.split(':').collect();
-        if parts.len() != 3 {
-            // Ignore corrupt lines
-            continue;
+    for record in membership.records() {
+        if record.controllers.is_empty() {
+            // Unified-hierarchy records bind no controllers; they are
+            // exposed through the legacy empty-string key.
+            cgroup_paths.insert(String::new(), record.path.to_string_lossy().into_owned());
+        } else {
+            for controller in &record.controllers {
+                cgroup_paths.insert(
+                    controller.clone(),
+                    record.path.to_string_lossy().into_owned(),
+                );
+            }
         }
-        let subsystems = parts[1].split(',');
-        let path = parts[2];
-        subsystems.for_each(|subsystem| {
-            cgroup_paths.insert(subsystem.to_string(), path.to_string());
-        });
     }
-    cgroup_paths
+    Ok(cgroup_paths)
 }
 
 /// Parse cgroup subsystem paths from `/proc/self/cgroup`.
+///
+/// Malformed content is a discovery error, not an empty map.
 fn parse_cgroup_subsystems() -> Result<HashMap<String, String>> {
     let data = fs::read_to_string(CGROUP_PATH)
         .map_err(|err| FsError::with_cause(FsErrorKind::FsError, err))
         .map_err(Error::Cgroupfs)?;
-    Ok(parse_cgroup_subsystems_str(&data))
+    parse_cgroup_subsystems_str(&data)
 }
 
 /// Parse cgroup mount information from a `/proc/self/mountinfo` content string.
@@ -1447,24 +1457,26 @@ mod tests {
 #[cfg(test)]
 mod parse_tests {
     use super::{parse_cgroup_mountinfo_str, parse_cgroup_subsystems_str};
+    use crate::error::CoreError;
     use crate::fs::hierarchies;
+    use crate::manager::error::Error;
     use std::collections::HashMap;
     use std::fs;
 
     /// One `/proc/<pid>/cgroup` input plus the expected controller->path map.
-    /// `expect` is the full HashMap the parser must produce; an empty map means
-    /// every line was rejected.
+    /// `expect` is the full HashMap the parser must produce; `None` means
+    /// the input is malformed and must be rejected with a parse error.
     struct Case {
         name: &'static str,
         input: &'static str,
-        expect: &'static [(&'static str, &'static str)],
+        expect: Option<&'static [(&'static str, &'static str)]>,
     }
 
     const CASES: &[Case] = &[
         Case {
-            name: "v2-single: empty controller key maps to path",
+            name: "v2-single: unified record maps to the legacy empty key",
             input: "0::/user.slice/user-1001.slice/user@1001.service/app.slice/snap.opencode.scope",
-            expect: &[("", "/user.slice/user-1001.slice/user@1001.service/app.slice/snap.opencode.scope")],
+            expect: Some(&[("", "/user.slice/user-1001.slice/user@1001.service/app.slice/snap.opencode.scope")]),
         },
         Case {
             name: "v1-multi: multi-line file merges into one map",
@@ -1483,7 +1495,7 @@ mod parse_tests {
 2:hugetlb:/
 1:name=systemd:/user.slice/user-1000.slice/session-4.scope
 0::/user.slice/user-1000.slice/session-4.scope",
-            expect: &[
+            expect: Some(&[
                 ("pids", "/user.slice/user-1000.slice/session-4.scope"),
                 ("cpu", "/user.slice"),
                 ("cpuacct", "/user.slice"),
@@ -1500,7 +1512,7 @@ mod parse_tests {
                 ("hugetlb", "/"),
                 ("name=systemd", "/user.slice/user-1000.slice/session-4.scope"),
                 ("", "/user.slice/user-1000.slice/session-4.scope"),
-            ],
+            ]),
         },
         // TODO: deferred parser defect. `parse_cgroup_subsystems_str` splits on ':'
         // without limiting to 3 parts (e.g. `splitn(3, ':')`), so any path
@@ -1512,19 +1524,24 @@ mod parse_tests {
         //   ("memory", "/docker/ab:cd/init")
         //   ("", "/a:b:c")
         Case {
-            name: "colon-path: known defect, colon in path breaks 3-part split (all dropped)",
+            name: "colon-path: colons survive, v2 path exposed via the empty key",
             input: "0::/user.slice/session:c1.scope\n6:memory:/docker/ab:cd/init\n0::/a:b:c",
-            expect: &[],
+            expect: Some(&[("memory", "/docker/ab:cd/init"), ("", "/a:b:c")]),
         },
         Case {
-            name: "nested: last v2 line wins for the empty key",
+            name: "v2-only: last unified line wins for the empty key",
             input: "0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/init\n0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec",
-            expect: &[("", "/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec")],
+            expect: Some(&[("", "/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec")]),
         },
         Case {
-            name: "malformed: missing path field is dropped",
+            name: "malformed: missing path field is rejected",
             input: "8:memory",
-            expect: &[],
+            expect: None,
+        },
+        Case {
+            name: "malformed: one bad line rejects the whole stream",
+            input: "10:memory:/user.slice\nnot a cgroup line",
+            expect: None,
         },
     ];
 
@@ -1532,12 +1549,22 @@ mod parse_tests {
     fn test_parse_cgroup_subsystems_str_table() {
         for case in CASES {
             let got = parse_cgroup_subsystems_str(case.input);
-            let want: HashMap<String, String> = case
-                .expect
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            assert_eq!(got, want, "{}", case.name);
+            match case.expect {
+                None => assert!(
+                    matches!(got, Err(Error::Core(CoreError::ParseError { .. }))),
+                    "{}: expected a propagated parse error, got `{:?}`",
+                    case.name,
+                    got
+                ),
+                Some(expect) => {
+                    let got = got.unwrap_or_else(|err| panic!("{}: {}", case.name, err));
+                    let want: HashMap<String, String> = expect
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    assert_eq!(got, want, "{}", case.name);
+                }
+            }
         }
     }
 
@@ -1595,7 +1622,7 @@ no separator here
     #[test]
     fn test_parse_cgroup_mountinfo_str_cgroup2() {
         let cgroup_data = "0::/user.slice/user-1000.slice/session-4.scope";
-        let paths = parse_cgroup_subsystems_str(cgroup_data);
+        let paths = parse_cgroup_subsystems_str(cgroup_data).unwrap();
         assert_eq!(
             paths.get(""),
             Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
