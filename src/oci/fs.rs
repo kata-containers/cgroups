@@ -13,6 +13,10 @@ use oci_spec::runtime::{
     LinuxPids, LinuxResources,
 };
 
+use crate::core::discovery::membership::{parse_membership_bytes, CgroupMembership};
+use crate::core::discovery::mountinfo::parse_mountinfo_bytes;
+use crate::core::error::{CoreError, ParseMembershipError, ParseMountError};
+use crate::core::path::CgroupPath;
 use crate::fs::blkio::{BlkIoController, BlkIoData, IoService, IoStat};
 use crate::fs::cgroup::UNIFIED_MOUNTPOINT;
 use crate::fs::cpu::CpuController;
@@ -881,66 +885,102 @@ impl Manager for FsManager {
 }
 
 /// Parse cgroup subsystem paths from a `/proc/self/cgroup` content string.
-fn parse_cgroup_subsystems_str(input: &str) -> HashMap<String, String> {
+///
+/// Transitional view conversion over [`parse_membership_bytes`]: parse errors
+/// are propagated (preserved as the error cause), colons inside a cgroup
+/// path survive, and unified-hierarchy records keep the legacy
+/// `"" -> <path>` entry documented on [`FsManager`]. Paths that cannot be
+/// used for cgroup mutation, including namespace-relative `..` paths, fail
+/// conversion even though they remain valid procfs observations.
+#[cfg(test)]
+fn parse_cgroup_subsystems_str(input: &str) -> Result<HashMap<String, String>> {
+    parse_cgroup_subsystems_bytes(input.as_bytes())
+}
+
+fn parse_cgroup_subsystems_bytes(input: &[u8]) -> Result<HashMap<String, String>> {
+    let membership = parse_membership_bytes(input).map_err(CoreError::from)?;
+    membership_to_legacy_paths(&membership)
+}
+
+fn membership_to_legacy_paths(membership: &CgroupMembership) -> Result<HashMap<String, String>> {
     let mut cgroup_paths = HashMap::new();
-    // Expected line format: `10:memory:/user.slice`
-    for line in input.lines() {
-        let parts: Vec<&str> = line.split(':').collect();
-        if parts.len() != 3 {
-            // Ignore corrupt lines
-            continue;
+    for (index, record) in membership.records().iter().enumerate() {
+        // A membership path is only an observation until it passes the
+        // mutation-path check; FsManager exposes the converted paths to callers.
+        let path = CgroupPath::from_proc_cgroup_path(&record.path).map_err(CoreError::from)?;
+        let path = path.as_path().to_str().ok_or_else(|| {
+            CoreError::ParseMembershipError(ParseMembershipError::LegacyPathNotUtf8 {
+                line: index + 1,
+                input: record.path.clone(),
+            })
+        })?;
+        let path = format!("/{path}");
+        if record.controllers.is_empty() {
+            // Unified-hierarchy records bind no controllers; they are
+            // exposed through the legacy empty-string key.
+            cgroup_paths.insert(String::new(), path);
+        } else {
+            for controller in &record.controllers {
+                cgroup_paths.insert(controller.clone(), path.clone());
+            }
         }
-        let subsystems = parts[1].split(',');
-        let path = parts[2];
-        subsystems.for_each(|subsystem| {
-            cgroup_paths.insert(subsystem.to_string(), path.to_string());
-        });
     }
-    cgroup_paths
+    Ok(cgroup_paths)
 }
 
 /// Parse cgroup subsystem paths from `/proc/self/cgroup`.
+///
+/// Malformed content is a discovery error, not an empty map.
 fn parse_cgroup_subsystems() -> Result<HashMap<String, String>> {
-    let data = fs::read_to_string(CGROUP_PATH)
+    let data = fs::read(CGROUP_PATH)
         .map_err(|err| FsError::with_cause(FsErrorKind::FsError, err))
         .map_err(Error::Cgroupfs)?;
-    Ok(parse_cgroup_subsystems_str(&data))
+    parse_cgroup_subsystems_bytes(&data)
 }
 
 /// Parse cgroup mount information from a `/proc/self/mountinfo` content string.
+#[cfg(test)]
 fn parse_cgroup_mountinfo_str(
     data: &str,
     paths: &HashMap<String, String>,
-) -> HashMap<String, String> {
-    let mut mounts = HashMap::new();
+) -> Result<HashMap<String, String>> {
+    parse_cgroup_mountinfo_bytes(data.as_bytes(), paths)
+}
 
-    for line in data.lines() {
-        if let Some(mi) = hierarchies::parse_mountinfo_for_line(line) {
-            if mi.fs_type.0 != "cgroup" && mi.fs_type.0 != "cgroup2" {
-                continue;
-            }
-            let mountpoint = mi
-                .mount_point
-                .to_str()
-                .expect("mount_point parsed from valid UTF-8 &str must be valid UTF-8");
-            for opt in &mi.super_opts {
-                if paths.contains_key(opt) {
-                    mounts.insert(opt.clone(), mountpoint.to_string());
-                }
+fn parse_cgroup_mountinfo_bytes(
+    data: &[u8],
+    paths: &HashMap<String, String>,
+) -> Result<HashMap<String, String>> {
+    let mut mounts = HashMap::new();
+    let mountinfo = parse_mountinfo_bytes(data).map_err(CoreError::from)?;
+
+    for (index, mi) in mountinfo.records().iter().enumerate() {
+        if mi.fs_type.0 != "cgroup" && mi.fs_type.0 != "cgroup2" {
+            continue;
+        }
+        let mountpoint = mi.mount_point.to_str().ok_or_else(|| {
+            CoreError::ParseMountError(ParseMountError::LegacyMountPointNotUtf8 {
+                line: index + 1,
+                input: mi.mount_point.clone(),
+            })
+        })?;
+        for opt in &mi.super_opts {
+            if let Some(controller) = paths.keys().find(|name| name.as_bytes() == opt.as_slice()) {
+                mounts.insert(controller.to_string(), mountpoint.to_string());
             }
         }
     }
 
-    mounts
+    Ok(mounts)
 }
 
 /// Parse cgroup mount information from `/proc/self/mountinfo`.
 fn parse_cgroup_mountinfo(paths: &HashMap<String, String>) -> Result<HashMap<String, String>> {
-    let data = fs::read_to_string(MOUNTINFO_PATH)
+    let data = fs::read(MOUNTINFO_PATH)
         .map_err(|err| FsError::with_cause(FsErrorKind::FsError, err))
         .map_err(Error::Cgroupfs)?;
 
-    Ok(parse_cgroup_mountinfo_str(&data, paths))
+    parse_cgroup_mountinfo_bytes(&data, paths)
 }
 
 pub(crate) fn join_path(base: &str, path: &str) -> String {
@@ -1446,25 +1486,31 @@ mod tests {
 /// exact (controller, path) pair instead of a vague "is_empty" / "contains_key".
 #[cfg(test)]
 mod parse_tests {
-    use super::{parse_cgroup_mountinfo_str, parse_cgroup_subsystems_str};
+    use super::{
+        parse_cgroup_mountinfo_bytes, parse_cgroup_mountinfo_str, parse_cgroup_subsystems_bytes,
+        parse_cgroup_subsystems_str,
+    };
+    use crate::core::discovery::membership::parse_membership_bytes;
+    use crate::core::error::{CoreError, ParseMountError, PathError};
     use crate::fs::hierarchies;
+    use crate::oci::error::Error;
     use std::collections::HashMap;
     use std::fs;
 
     /// One `/proc/<pid>/cgroup` input plus the expected controller->path map.
-    /// `expect` is the full HashMap the parser must produce; an empty map means
-    /// every line was rejected.
+    /// `expect` is the full HashMap the parser must produce; `None` means
+    /// the input is malformed and must be rejected with a parse error.
     struct Case {
         name: &'static str,
         input: &'static str,
-        expect: &'static [(&'static str, &'static str)],
+        expect: Option<&'static [(&'static str, &'static str)]>,
     }
 
     const CASES: &[Case] = &[
         Case {
-            name: "v2-single: empty controller key maps to path",
+            name: "v2-single: unified record maps to the legacy empty key",
             input: "0::/user.slice/user-1001.slice/user@1001.service/app.slice/snap.opencode.scope",
-            expect: &[("", "/user.slice/user-1001.slice/user@1001.service/app.slice/snap.opencode.scope")],
+            expect: Some(&[("", "/user.slice/user-1001.slice/user@1001.service/app.slice/snap.opencode.scope")]),
         },
         Case {
             name: "v1-multi: multi-line file merges into one map",
@@ -1483,7 +1529,7 @@ mod parse_tests {
 2:hugetlb:/
 1:name=systemd:/user.slice/user-1000.slice/session-4.scope
 0::/user.slice/user-1000.slice/session-4.scope",
-            expect: &[
+            expect: Some(&[
                 ("pids", "/user.slice/user-1000.slice/session-4.scope"),
                 ("cpu", "/user.slice"),
                 ("cpuacct", "/user.slice"),
@@ -1500,31 +1546,30 @@ mod parse_tests {
                 ("hugetlb", "/"),
                 ("name=systemd", "/user.slice/user-1000.slice/session-4.scope"),
                 ("", "/user.slice/user-1000.slice/session-4.scope"),
-            ],
-        },
-        // TODO: deferred parser defect. `parse_cgroup_subsystems_str` splits on ':'
-        // without limiting to 3 parts (e.g. `splitn(3, ':')`), so any path
-        // containing a colon results in `parts.len() != 3` and is dropped.
-        // This characterization test records the current behavior (`expect: &[]`);
-        // the follow-up fix will update the parser and flip the expectation to
-        // retain the parsed entries:
-        //   ("", "/user.slice/session:c1.scope")
-        //   ("memory", "/docker/ab:cd/init")
-        //   ("", "/a:b:c")
-        Case {
-            name: "colon-path: known defect, colon in path breaks 3-part split (all dropped)",
-            input: "0::/user.slice/session:c1.scope\n6:memory:/docker/ab:cd/init\n0::/a:b:c",
-            expect: &[],
+            ]),
         },
         Case {
-            name: "nested: last v2 line wins for the empty key",
+            name: "colon-path: colons survive, v2 path exposed via the empty key",
+            input: "0::/user.slice/session:c1.scope\n6:memory:/docker/ab:cd/init",
+            expect: Some(&[
+                ("", "/user.slice/session:c1.scope"),
+                ("memory", "/docker/ab:cd/init"),
+            ]),
+        },
+        Case {
+            name: "malformed: duplicate unified hierarchy is rejected",
             input: "0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/init\n0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec",
-            expect: &[("", "/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec")],
+            expect: None,
         },
         Case {
-            name: "malformed: missing path field is dropped",
+            name: "malformed: missing path field is rejected",
             input: "8:memory",
-            expect: &[],
+            expect: None,
+        },
+        Case {
+            name: "malformed: one bad line rejects the whole stream",
+            input: "10:memory:/user.slice\nnot a cgroup line",
+            expect: None,
         },
     ];
 
@@ -1532,12 +1577,50 @@ mod parse_tests {
     fn test_parse_cgroup_subsystems_str_table() {
         for case in CASES {
             let got = parse_cgroup_subsystems_str(case.input);
-            let want: HashMap<String, String> = case
-                .expect
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            assert_eq!(got, want, "{}", case.name);
+            match case.expect {
+                None => assert!(
+                    matches!(got, Err(Error::Core(CoreError::ParseMembershipError(_)))),
+                    "{}: expected a propagated parse error, got `{:?}`",
+                    case.name,
+                    got
+                ),
+                Some(expect) => {
+                    let got = got.unwrap_or_else(|err| panic!("{}: {}", case.name, err));
+                    let want: HashMap<String, String> = expect
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    assert_eq!(got, want, "{}", case.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_cgroup_subsystems_bytes_preserves_trailing_carriage_return() {
+        let paths = parse_cgroup_subsystems_bytes(b"0::/scope-with-cr\r\n").unwrap();
+        assert_eq!(paths.get(""), Some(&"/scope-with-cr\r".to_string()));
+
+        assert!(matches!(
+            parse_cgroup_subsystems_bytes(b"0::/non-utf8-\xff\n"),
+            Err(Error::Core(CoreError::ParseMembershipError(_)))
+        ));
+    }
+
+    #[test]
+    fn test_parse_cgroup_subsystems_rejects_observed_parent_paths() {
+        for input in [
+            b"0::/../sibling.scope\n".as_slice(),
+            b"7:memory:/a/../sibling.scope\n".as_slice(),
+        ] {
+            let membership = parse_membership_bytes(input).unwrap();
+            let observed_path = membership.records()[0].path.clone();
+            assert!(matches!(
+                parse_cgroup_subsystems_bytes(input),
+                Err(Error::Core(CoreError::PathError(
+                    PathError::ParentComponent { input, operation }
+                ))) if input == observed_path && operation == "CgroupPath::from_proc_cgroup_path"
+            ));
         }
     }
 
@@ -1553,12 +1636,9 @@ mod parse_tests {
 31 22 0:26 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:15 - cgroup cgroup rw,memory
 32 22 0:27 / /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:16 - cgroup cgroup rw,cpu,cpuacct
 121 1731 0:42 / /shm rw,nosuid,nodev,noexec,relatime shared:68 master:66 - tmpfs shm rw,size=65536k
-1 2 3 - cgroup cgroup rw,memory
-31 22 0:26 / /sys/fs/cgroup/devices rw,nosuid - cgroup
-no separator here
 ";
 
-        let mounts = parse_cgroup_mountinfo_str(input, &paths);
+        let mounts = parse_cgroup_mountinfo_str(input, &paths).unwrap();
         assert_eq!(
             mounts.get("memory"),
             Some(&"/sys/fs/cgroup/memory".to_string())
@@ -1573,6 +1653,34 @@ no separator here
         );
         assert_eq!(mounts.get("pids"), None);
         assert_eq!(mounts.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_cgroup_mountinfo_rejects_malformed_line() {
+        let paths = HashMap::from([("memory".to_string(), "/user.slice".to_string())]);
+        let input = b"31 22 0:26 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+bad mountinfo line\n";
+
+        assert!(matches!(
+            parse_cgroup_mountinfo_bytes(input, &paths),
+            Err(Error::Core(CoreError::ParseMountError(
+                ParseMountError::MissingSeparator { line: 2 }
+            )))
+        ));
+    }
+
+    #[test]
+    fn test_parse_cgroup_mountinfo_bytes_matches_ascii_controller() {
+        let paths = HashMap::from([("memory".to_string(), "/user.slice".to_string())]);
+        let input = b"31 22 0:26 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory,release_agent=/tmp/agent-\xff\n\
+32 22 0:27 / /sys/fs/cgroup/other rw - cgroup cgroup rw,memory\xff\n";
+
+        let mounts = parse_cgroup_mountinfo_bytes(input, &paths).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            mounts.get("memory"),
+            Some(&"/sys/fs/cgroup/memory".to_string())
+        );
     }
 
     /// TODO: deferred `mounts()` contract defect.
@@ -1595,7 +1703,7 @@ no separator here
     #[test]
     fn test_parse_cgroup_mountinfo_str_cgroup2() {
         let cgroup_data = "0::/user.slice/user-1000.slice/session-4.scope";
-        let paths = parse_cgroup_subsystems_str(cgroup_data);
+        let paths = parse_cgroup_subsystems_str(cgroup_data).unwrap();
         assert_eq!(
             paths.get(""),
             Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
@@ -1604,7 +1712,7 @@ no separator here
         let mountinfo_data = "\
 47 44 0:30 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:7 - cgroup2 cgroup2 rw,nsdelegate
 ";
-        let mounts = parse_cgroup_mountinfo_str(mountinfo_data, &paths);
+        let mounts = parse_cgroup_mountinfo_str(mountinfo_data, &paths).unwrap();
 
         // Counterintuitive branch: returns no mount mapping for unified v2.
         assert_eq!(mounts.get(""), None);

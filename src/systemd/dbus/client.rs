@@ -357,7 +357,7 @@ pub mod tests {
         );
 
         // PIDs
-        let cgroup_procs_path = format!("{}/{}/cgroup.procs", full_base, &unit);
+        let cgroup_procs_path = format!("{}/{}/cgroup.procs", full_base, unit);
         for i in 0..5 {
             let content = fs::read_to_string(&cgroup_procs_path);
             if let Ok(content) = &content {

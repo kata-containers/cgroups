@@ -9,6 +9,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+use crate::core::discovery::mountinfo::parse_mountinfo_line_bytes;
+use crate::core::discovery::mountinfo::{parse_mountinfo_bytes, MountRecord};
+use crate::core::error::ParseMountError;
 use crate::fs::blkio::BlkIoController;
 use crate::fs::cpu::CpuController;
 use crate::fs::cpuacct::CpuAcctController;
@@ -27,6 +31,31 @@ use crate::fs::{Controllers, Hierarchy, Subsystem};
 
 use crate::fs::cgroup::Cgroup;
 
+const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
+
+/// Failure to read or parse the current process's mount table.
+#[derive(Debug, thiserror::Error)]
+pub enum MountinfoError {
+    /// Reading the mount table failed.
+    #[error("failed to read {path:?}: {cause}")]
+    Read {
+        /// The procfs file being read.
+        path: PathBuf,
+        /// The underlying filesystem error.
+        #[source]
+        cause: std::io::Error,
+    },
+    /// A mountinfo record was malformed.
+    #[error("failed to parse {path:?}: {cause}")]
+    Parse {
+        /// The procfs file being parsed.
+        path: PathBuf,
+        /// The line-numbered parser error.
+        #[source]
+        cause: ParseMountError,
+    },
+}
+
 /// Process mounts information.
 ///
 /// See `proc(5)` for format details.
@@ -38,56 +67,74 @@ pub struct Mountinfo {
     pub mount_point: PathBuf,
     /// Filesystem type (main type with optional sub-type).
     pub fs_type: (String, Option<String>),
-    /// Superblock options.
-    pub super_opts: Vec<String>,
+    /// Superblock options, split on literal commas and escape-decoded as bytes.
+    pub super_opts: Vec<Vec<u8>>,
 }
 
+impl From<MountRecord> for Mountinfo {
+    fn from(record: MountRecord) -> Self {
+        Mountinfo {
+            mount_root: record.mount_root,
+            mount_point: record.mount_point,
+            fs_type: record.fs_type,
+            super_opts: record.super_opts,
+        }
+    }
+}
+
+/// Parse a single mountinfo line, forwarding to the discovery parser.
+///
+/// Transitional shim over [`parse_mountinfo_line_bytes`]: the legacy
+/// `Option`-based contract cannot carry parse errors, so a malformed
+/// line degrades to `None` exactly as the previous hand-written parser
+/// skipped it. Escape decoding and strict field validation come from
+/// the discovery implementation.
+#[cfg(test)]
 pub(crate) fn parse_mountinfo_for_line(line: &str) -> Option<Mountinfo> {
-    let s_values: Vec<_> = line.split(" - ").collect();
-    if s_values.len() != 2 {
-        return None;
-    }
-
-    let s0_values: Vec<_> = s_values[0].trim().split(' ').collect();
-    let s1_values: Vec<_> = s_values[1].trim().split(' ').collect();
-    if s0_values.len() < 6 || s1_values.len() < 3 {
-        return None;
-    }
-    let mount_point = PathBuf::from(s0_values[4]);
-    let mount_root = PathBuf::from(s0_values[3]);
-    let fs_type_values: Vec<_> = s1_values[0].trim().split('.').collect();
-    let fs_type = match fs_type_values.len() {
-        1 => (fs_type_values[0].to_string(), None),
-        2 => (
-            fs_type_values[0].to_string(),
-            Some(fs_type_values[1].to_string()),
-        ),
-        _ => return None,
-    };
-
-    let super_opts: Vec<String> = s1_values[2].trim().split(',').map(String::from).collect();
-    Some(Mountinfo {
-        mount_root,
-        mount_point,
-        fs_type,
-        super_opts,
-    })
-}
-
-fn parse_v1_mountinfo_line(line: &str) -> Option<Mountinfo> {
-    parse_mountinfo_for_line(line).filter(|mount| mount.fs_type.0 == "cgroup")
+    parse_mountinfo_line_bytes(line.as_bytes(), 1)
+        .ok()
+        .map(Mountinfo::from)
 }
 
 /// Parse v1 cgroup mount lines from `/proc/self/mountinfo` content.
-fn mountinfo_file_str(input: &str) -> Vec<Mountinfo> {
-    input.lines().filter_map(parse_v1_mountinfo_line).collect()
+#[cfg(test)]
+fn mountinfo_file_str(input: &str) -> Result<Vec<Mountinfo>, ParseMountError> {
+    mountinfo_file_bytes(input.as_bytes())
+}
+
+fn mountinfo_file_bytes(input: &[u8]) -> Result<Vec<Mountinfo>, ParseMountError> {
+    let table = parse_mountinfo_bytes(input)?;
+    Ok(table
+        .cgroup_mounts()
+        .into_iter()
+        .cloned()
+        .map(Mountinfo::from)
+        .collect())
+}
+
+/// Read and parse the current process's v1 cgroup mounts.
+pub fn try_mountinfo_self() -> Result<Vec<Mountinfo>, MountinfoError> {
+    let data = fs::read(MOUNTINFO_PATH).map_err(|cause| MountinfoError::Read {
+        path: PathBuf::from(MOUNTINFO_PATH),
+        cause,
+    })?;
+    mountinfo_file_bytes(&data).map_err(|cause| MountinfoError::Parse {
+        path: PathBuf::from(MOUNTINFO_PATH),
+        cause,
+    })
 }
 
 /// Returns mounts information for the current process.
+///
+/// This legacy best-effort API logs failures and returns an empty list. Use
+/// [`try_mountinfo_self`] to distinguish an empty v1 table from an error.
 pub fn mountinfo_self() -> Vec<Mountinfo> {
-    match fs::read_to_string("/proc/self/mountinfo") {
-        Ok(data) => mountinfo_file_str(&data),
-        Err(_) => vec![],
+    match try_mountinfo_self() {
+        Ok(mounts) => mounts,
+        Err(err) => {
+            log::error!("{err}");
+            vec![]
+        }
     }
 }
 
@@ -287,15 +334,29 @@ impl Hierarchy for V2 {
 impl V1 {
     /// Finds where control groups are mounted to and returns a hierarchy in which control groups
     /// can be created.
+    ///
+    /// Use [`Self::try_new`] when discovery errors must reach the caller.
     pub fn new() -> V1 {
         V1 {
             mountinfo: mountinfo_self(),
         }
     }
 
+    /// Construct a v1 hierarchy, preserving mount-table discovery errors.
+    pub fn try_new() -> Result<V1, MountinfoError> {
+        Ok(V1 {
+            mountinfo: try_mountinfo_self()?,
+        })
+    }
+
     pub fn get_mount_point(&self, controller: Controllers) -> Option<(PathBuf, PathBuf)> {
+        let controller_name = controller.to_string();
         self.mountinfo.iter().find_map(|m| {
-            if m.fs_type.0 == "cgroup" && m.super_opts.contains(&controller.to_string()) {
+            if m.fs_type.0 == "cgroup"
+                && m.super_opts
+                    .iter()
+                    .any(|opt| opt.as_slice() == controller_name.as_bytes())
+            {
                 return Some((m.mount_point.to_owned(), m.mount_root.to_owned()));
             }
             None
@@ -350,6 +411,7 @@ pub fn auto() -> Box<dyn Hierarchy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
 
     /// One mountinfo line plus its expected parse result.
     ///
@@ -476,34 +538,34 @@ mod tests {
             line: "121 1731 0:42 / /shm rw,nosuid,nodev,noexec,relatime shared:68 master:66 - tmpfs.123 shm rw,size=65536k",
             expect: Some(("/", "/shm", "tmpfs", Some("123"), &["rw", "size=65536k"])),
         },
-        // TODO: deferred parser defect. In /proc/self/mountinfo (see proc(5)),
-        // characters such as space, tab, newline, and backslash in mount paths
-        // are octal-escaped (e.g. \040 for space, \011 for tab).
-        // `parse_mountinfo_for_line` currently does NOT unescape \040/\011.
-        // Expected values record the current literal behavior so this characterization
-        // test pins existing behavior; a follow-up fix should implement octal
-        // unescaping and flip the expectations to the decoded form:
-        //   - "/sys/fs/cgroup/my\\040dir" -> "/sys/fs/cgroup/my dir"
-        //   - "/sys/fs/cgroup/tab\\011dir" -> "/sys/fs/cgroup/tab\tdir"
+        // --- fs_type with several dots: split on the first dot only, the
+        //     rest is the subtype (the old parser rejected these lines).
         Case {
-            name: "escaped: \\040 kept literal (known defect)",
-            line: "60 26 0:26 / /sys/fs/cgroup/my\\040dir rw,nosuid,nodev,noexec,relatime shared:20 - cgroup cgroup rw,memory",
-            expect: Some(("/", "/sys/fs/cgroup/my\\040dir", "cgroup", None, &["rw", "memory"])),
+            name: "fs_type: multiple dots split on the first only",
+            line: "82 26 0:26 / /sys/fs/cgroup rw,nosuid shared:23 - cgroup.v1.extra cgroup rw,memory",
+            expect: Some(("/", "/sys/fs/cgroup", "cgroup", Some("v1.extra"), &["rw", "memory"])),
         },
         Case {
-            name: "escaped: \\011 kept literal (known defect)",
+            name: "fs_type: cgroup2 subtype containing dots",
+            line: "86 26 0:27 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:26 - cgroup2.v2.extra cgroup2 rw",
+            expect: Some(("/", "/sys/fs/cgroup", "cgroup2", Some("v2.extra"), &["rw"])),
+        },
+        // --- escaped: \040/\011 are decoded per proc(5) now that the
+        //     line parser forwards to `core::discovery::mountinfo`.
+        Case {
+            name: "escaped: \\040 decodes to a space",
+            line: "60 26 0:26 / /sys/fs/cgroup/my\\040dir rw,nosuid,nodev,noexec,relatime shared:20 - cgroup cgroup rw,memory",
+            expect: Some(("/", "/sys/fs/cgroup/my dir", "cgroup", None, &["rw", "memory"])),
+        },
+        Case {
+            name: "escaped: \\011 decodes to a tab",
             line: "61 26 0:27 / /sys/fs/cgroup/tab\\011dir rw,nosuid,nodev,noexec,relatime shared:21 - cgroup cgroup rw,memory",
-            expect: Some(("/", "/sys/fs/cgroup/tab\\011dir", "cgroup", None, &["rw", "memory"])),
+            expect: Some(("/", "/sys/fs/cgroup/tab\tdir", "cgroup", None, &["rw", "memory"])),
         },
         // --- malformed: every line below is rejected by the line parser.
         Case {
             name: "malformed: no separator",
             line: "no separator here",
-            expect: None,
-        },
-        Case {
-            name: "malformed: fs_type with two dots",
-            line: "82 26 0:26 / /sys/fs/cgroup rw,nosuid shared:23 - cgroup.v1.extra cgroup rw,memory",
             expect: None,
         },
         Case {
@@ -519,11 +581,6 @@ mod tests {
         Case {
             name: "malformed: cgroup2 with fewer than 3 fields after separator",
             line: "85 26 0:27 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:25 - cgroup2 cgroup2",
-            expect: None,
-        },
-        Case {
-            name: "malformed: cgroup2 fs_type with two dots",
-            line: "86 26 0:27 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:26 - cgroup2.v2.extra cgroup2 rw",
             expect: None,
         },
     ];
@@ -560,7 +617,9 @@ mod tests {
                     assert_eq!(mi.fs_type.1.as_deref(), fst_sub, "{}: fs_type.1", case.name);
                     assert_eq!(
                         mi.super_opts,
-                        opts.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                        opts.iter()
+                            .map(|s| s.as_bytes().to_vec())
+                            .collect::<Vec<_>>(),
                         "{}: super_opts",
                         case.name
                     );
@@ -581,7 +640,7 @@ mod tests {
 48 33 0:43 / /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:25 - cgroup cgroup rw,cpu,cpuacct
 49 33 0:44 / /sys/fs/cgroup/pids rw,nosuid,nodev,noexec,relatime shared:26 - cgroup cgroup rw,pids";
 
-        let kept = mountinfo_file_str(hybrid);
+        let kept = mountinfo_file_str(hybrid).unwrap();
         assert_eq!(kept.len(), 4, "tmpfs and cgroup2 must be dropped");
         for mi in &kept {
             assert_eq!(
@@ -606,24 +665,63 @@ mod tests {
     }
 
     #[test]
+    fn test_mountinfo_file_bytes_preserves_non_utf8_paths() {
+        let mounts = mountinfo_file_bytes(
+            b"35 33 0:30 /root-\xff /sys/fs/cgroup/memory-\xfe rw - cgroup cgroup rw,memory\n",
+        )
+        .unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].mount_root.as_os_str().as_bytes(), b"/root-\xff");
+        assert_eq!(
+            mounts[0].mount_point.as_os_str().as_bytes(),
+            b"/sys/fs/cgroup/memory-\xfe"
+        );
+    }
+
+    #[test]
+    fn test_mountinfo_file_bytes_rejects_malformed_line() {
+        let input = b"35 33 0:30 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+bad mountinfo line\n";
+        assert!(matches!(
+            mountinfo_file_bytes(input),
+            Err(ParseMountError::MissingSeparator { line: 2 })
+        ));
+    }
+
+    #[test]
+    fn test_v1_controller_match_with_non_utf8_super_option() {
+        let mountinfo = mountinfo_file_bytes(
+            b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory,release_agent=/tmp/agent-\xff\n",
+        )
+        .unwrap();
+        assert_eq!(mountinfo[0].super_opts[2], b"release_agent=/tmp/agent-\xff");
+
+        let hierarchy = V1 { mountinfo };
+        assert_eq!(
+            hierarchy.get_mount_point(Controllers::Mem),
+            Some((PathBuf::from("/sys/fs/cgroup/memory"), PathBuf::from("/"),))
+        );
+    }
+
+    #[test]
     fn test_parse_mount() {
         let mountinfo = vec![
             ("29 26 0:26 / /sys/fs/cgroup/cpuset,cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:10 - cgroup cgroup rw,cpuset,cpu,cpuacct",
              Mountinfo{mount_root: PathBuf::from("/"), mount_point: PathBuf::from("/sys/fs/cgroup/cpuset,cpu,cpuacct"), fs_type: ("cgroup".to_string(), None), super_opts: vec![
-                "rw".to_string(),
-                "cpuset".to_string(),
-                "cpu".to_string(),
-                "cpuacct".to_string(),
+                b"rw".to_vec(),
+                b"cpuset".to_vec(),
+                b"cpu".to_vec(),
+                b"cpuacct".to_vec(),
              ]}),
             ("121 1731 0:42 / /shm rw,nosuid,nodev,noexec,relatime shared:68 master:66 - tmpfs shm rw,size=65536k",
              Mountinfo{mount_root: PathBuf::from("/"), mount_point: PathBuf::from("/shm"), fs_type: ("tmpfs".to_string(), None), super_opts: vec![
-                "rw".to_string(),
-                "size=65536k".to_string(),
+                b"rw".to_vec(),
+                b"size=65536k".to_vec(),
              ]}),
             ("121 1731 0:42 / /shm rw,nosuid,nodev,noexec,relatime shared:68 master:66 - tmpfs.123 shm rw,size=65536k",
              Mountinfo{mount_root: PathBuf::from("/"), mount_point: PathBuf::from("/shm"), fs_type: ("tmpfs".to_string(), Some("123".to_string())), super_opts: vec![
-                "rw".to_string(),
-                "size=65536k".to_string(),
+                b"rw".to_vec(),
+                b"size=65536k".to_vec(),
              ]}),
         ];
 
