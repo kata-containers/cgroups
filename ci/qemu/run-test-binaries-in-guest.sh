@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 #
+# Copyright (c) 2026 Kata Contributors
+#
+# SPDX-License-Identifier: Apache-2.0 or MIT
+#
+#
 # Run the compiled Rust test harnesses inside a cgroup test VM.
 
 set -euo pipefail

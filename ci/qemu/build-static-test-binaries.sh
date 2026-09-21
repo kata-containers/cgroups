@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 #
+# Copyright (c) 2026 Kata Contributors
+#
+# SPDX-License-Identifier: Apache-2.0 or MIT
+#
+#
 # Build portable test executables on the GitHub runner.  The executables are
 # copied into the cgroup VM and run there, avoiding a Rust build under QEMU
 # software emulation.

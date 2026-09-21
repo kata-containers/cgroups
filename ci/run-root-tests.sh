@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 #
+# Copyright (c) 2026 Kata Contributors
+#
+# SPDX-License-Identifier: Apache-2.0 or MIT
+#
+#
 # Build Rust test binaries unprivileged, then run them as root.
 #
 # `sudo cargo test` runs cargo itself as root, which leaves root-owned files in

@@ -1,4 +1,7 @@
+// Copyright (c) 2026 Kata Contributors
+//
 // SPDX-License-Identifier: Apache-2.0 or MIT
+//
 
 //! Integration tests for controlled cgroup environments created by the QEMU suite.
 
