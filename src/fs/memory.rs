@@ -1131,20 +1131,26 @@ impl MemController {
         })
     }
 
-    pub fn disable_oom_killer(&self) -> Result<()> {
+    /// Enable or disable the cgroup v1 OOM killer for this cgroup.
+    pub fn set_oom_killer_disabled(&self, disabled: bool) -> Result<()> {
         if self.v2 {
             Err(Error::new(CgroupVersion))
         } else {
             self.open_path("memory.oom_control", true)
                 .and_then(|mut file| {
-                    file.write_all("1".to_string().as_ref()).map_err(|e| {
+                    let value = if disabled { "1" } else { "0" };
+                    file.write_all(value.as_bytes()).map_err(|e| {
                         Error::with_cause(
-                            WriteFailed("memory.oom_control".to_string(), "1".to_string()),
+                            WriteFailed("memory.oom_control".to_string(), value.to_string()),
                             e,
                         )
                     })
                 })
         }
+    }
+
+    pub fn disable_oom_killer(&self) -> Result<()> {
+        self.set_oom_killer_disabled(true)
     }
 
     pub fn register_oom_event(&self, key: &str) -> Result<Receiver<String>> {
@@ -1454,6 +1460,26 @@ total_unevictable 81920
             c.disable_oom_killer().unwrap_err().kind(),
             &ErrorKind::CgroupVersion
         );
+    }
+
+    #[test]
+    fn test_set_oom_killer_disabled_writes_both_states() {
+        let path = std::env::temp_dir().join(format!(
+            "cgroups-memory-oom-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        let control = path.join("memory.oom_control");
+        fs::write(&control, "").unwrap();
+        let controller = MemController::new(path.clone(), path.clone(), false);
+
+        controller.set_oom_killer_disabled(true).unwrap();
+        assert_eq!(fs::read_to_string(&control).unwrap(), "1");
+        controller.set_oom_killer_disabled(false).unwrap();
+        assert_eq!(fs::read_to_string(&control).unwrap(), "0");
+
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
