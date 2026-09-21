@@ -3,23 +3,19 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
-// The hierarchy and cgroup compatibility entry points are deprecated in this
-// PR, while the manager migrates to their checked replacements in the next PR.
-#![allow(deprecated)]
-
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use oci_spec::runtime::{
     LinuxBlockIo, LinuxCpu, LinuxDeviceCgroup, LinuxHugepageLimit, LinuxMemory, LinuxNetwork,
     LinuxPids, LinuxResources,
 };
 
-use crate::discovery::membership::parse_membership;
+use crate::discovery::membership::Membership;
+use crate::discovery::topology::{discover, CgroupTopology, HostPaths};
 use crate::fs::blkio::{BlkIoController, BlkIoData, IoService, IoStat};
-use crate::fs::cgroup::UNIFIED_MOUNTPOINT;
 use crate::fs::cpu::CpuController;
 use crate::fs::cpuacct::CpuAcctController;
 use crate::fs::cpuset::CpuSetController;
@@ -34,14 +30,12 @@ use crate::fs::pid::PidController;
 use crate::fs::{hierarchies, Cgroup, ControllIdentifier, Controller, MaxValue, Subsystem};
 use crate::manager::error::Error;
 use crate::manager::{conv, Manager, Result};
+use crate::model::CgroupPath;
 use crate::stats::{
     BlkioCgroupStats, BlkioStat, CpuAcctStats, CpuCgroupStats, CpuThrottlingStats,
     HugeTlbCgroupStats, HugeTlbStat, MemoryCgroupStats, MemoryStats, PidsCgroupStats,
 };
 use crate::{CgroupPid, CgroupStats, FreezerState};
-
-const CGROUP_PATH: &str = "/proc/self/cgroup";
-const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
 
 /// FsManager manages cgroups using the cgroup filesystem (cgroupfs).
 ///
@@ -55,10 +49,14 @@ pub struct FsManager {
     paths: HashMap<String, String>,
     /// Cgroup mountpoints read from `/proc/self/mountinfo`.
     mounts: HashMap<String, String>,
-    /// Base path of the cgroup filesystem, the complete path would be:
-    /// - cgroup v1: "/sys/fs/cgroup/<subsystem>/<base>"
-    /// - cgroup v2: "/sys/fs/cgroup/<base>"
-    base: String,
+    /// The discovered host topology, shared with the managed cgroup and
+    /// every clone of this manager.
+    topology: Arc<CgroupTopology>,
+    /// Base path of the cgroup filesystem in validated relative form;
+    /// the complete path would be:
+    /// - cgroup v1: "<cgroupfs_root>/<subsystem>/<base>"
+    /// - cgroup v2: "<cgroupfs_root>/<base>"
+    base: CgroupPath,
     /// Cgroup managed by this manager.
     cgroup: Cgroup,
 }
@@ -71,18 +69,41 @@ impl FsManager {
 
     /// Create an instance of FsManager. The cgroups won't be created until
     /// `apply()` is called.
+    ///
+    /// The base is validated through [`CgroupPath`]: an absolute,
+    /// escaping, or otherwise invalid base is rejected with a
+    /// [`CoreError`](crate::error::CoreError) instead of being silently
+    /// mangled. Host discovery runs exactly once and its topology is
+    /// shared by the manager and the managed cgroup.
     pub fn new(base: &str) -> Result<Self> {
-        let paths = parse_cgroup_subsystems()?;
-        let mounts = parse_cgroup_mountinfo(&paths)?;
-        let cgroup = Cgroup::load(hierarchies::auto(), base);
-        let base = base.to_string();
+        Self::with_host_paths(base, &HostPaths::default())
+    }
+
+    /// Create an instance of FsManager with explicit [`HostPaths`].
+    pub fn with_host_paths(base: &str, host_paths: &HostPaths) -> Result<Self> {
+        let topology = discover(host_paths)?;
+        Self::with_topology(base, topology)
+    }
+
+    /// Create an instance of FsManager with an already-discovered [`CgroupTopology`].
+    pub fn with_topology(base: &str, topology: Arc<CgroupTopology>) -> Result<Self> {
+        let base = crate::fs::cgroup::parse_cgroup_path(base)?;
+        let paths = membership_to_subsystem_paths(&topology.membership);
+        let mounts = controller_mounts(&topology, &paths);
+        let cgroup = Cgroup::load_validated_with_topology(topology.clone(), base.clone());
 
         Ok(Self {
             paths,
             mounts,
+            topology,
             base,
             cgroup,
         })
+    }
+
+    /// Return the topology snapshot held by this manager.
+    pub fn topology(&self) -> &Arc<CgroupTopology> {
+        &self.topology
     }
 }
 
@@ -105,9 +126,10 @@ impl FsManager {
         // 1. We're using cgroups v2 (which restricts direct process control)
         // 2. An "init" subdirectory exists (used by DinD for process
         //    delegation)
-        let init_exists = hierarchies::auto()
-            .root()
-            .join(&self.base)
+        let init_exists = self
+            .topology
+            .cgroupfs_root
+            .join(self.base.as_path())
             .join("init")
             .exists();
         let is_dind = self.v2() && init_exists;
@@ -462,12 +484,11 @@ impl FsManager {
         T: Controller + ControllIdentifier,
         for<'a> F: Fn(&'a T) -> Result<()>,
     {
-        let root = hierarchies::auto().root_control_group();
+        let root = hierarchies::auto_with_topology(self.topology.clone()).root_control_group();
         let controller: &T = root
             .controller_of()
             .ok_or(FsError::new(FsErrorKind::SubsystemsEmpty))?;
         let root_path = Path::new(controller.path());
-        let root_path_str = root_path.to_string_lossy().to_string();
 
         let controller: &T = self.controller()?;
         let path = Path::new(controller.path());
@@ -485,12 +506,12 @@ impl FsManager {
         // Pop from the stack
         while let Some(p) = path_stack.pop() {
             let relative_path = p
-                .to_str()
-                .unwrap()
-                .trim_start_matches(&root_path_str)
-                // Makes sure the starting slash is removed
-                .trim_start_matches("/");
-            let cgroup = Cgroup::new(hierarchies::auto(), relative_path)?;
+                .strip_prefix(root_path)
+                .map_err(|e| FsError::with_cause(FsErrorKind::InvalidPath, e))?;
+            let cgroup = Cgroup::new(
+                hierarchies::auto_with_topology(self.topology.clone()),
+                relative_path,
+            )?;
             let controller: &T = cgroup
                 .controller_of()
                 .ok_or(FsError::new(FsErrorKind::SubsystemsEmpty))?;
@@ -831,7 +852,8 @@ impl Manager for FsManager {
 
     fn cgroup_path(&self, subsystem: Option<&str>) -> Result<String> {
         if self.v2() {
-            return Ok(join_path(UNIFIED_MOUNTPOINT, &self.base));
+            let full = join_cgroup_path(&self.topology.cgroupfs_root, &self.base);
+            return Ok(full.to_string_lossy().into_owned());
         }
 
         let subsystem = subsystem
@@ -885,81 +907,76 @@ impl Manager for FsManager {
     }
 }
 
-/// Parse cgroup subsystem paths from a `/proc/self/cgroup` content string.
+/// Convert membership records into the legacy subsystem path map.
 ///
-/// Transitional view conversion over [`parse_membership`]: parse errors
-/// are propagated (preserved as the error cause), colons inside a cgroup
-/// path survive, and unified-hierarchy records keep the legacy
+/// View conversion over [`Membership`]: colons inside a cgroup path
+/// survive, and unified-hierarchy records keep the legacy
 /// `"" -> <path>` entry documented on [`FsManager`].
-fn parse_cgroup_subsystems_str(input: &str) -> Result<HashMap<String, String>> {
-    let membership = parse_membership(input)?;
+fn membership_to_subsystem_paths(membership: &Membership) -> HashMap<String, String> {
     let mut cgroup_paths = HashMap::new();
     for record in membership.records() {
+        let path = record.path.to_string_lossy().into_owned();
         if record.controllers.is_empty() {
             // Unified-hierarchy records bind no controllers; they are
             // exposed through the legacy empty-string key.
-            cgroup_paths.insert(String::new(), record.path.to_string_lossy().into_owned());
+            cgroup_paths.insert(String::new(), path);
         } else {
             for controller in &record.controllers {
-                cgroup_paths.insert(
-                    controller.clone(),
-                    record.path.to_string_lossy().into_owned(),
-                );
+                cgroup_paths.insert(controller.clone(), path.clone());
             }
         }
     }
-    Ok(cgroup_paths)
+    cgroup_paths
 }
 
-/// Parse cgroup subsystem paths from `/proc/self/cgroup`.
-///
-/// Malformed content is a discovery error, not an empty map.
-fn parse_cgroup_subsystems() -> Result<HashMap<String, String>> {
-    let data = fs::read_to_string(CGROUP_PATH)
-        .map_err(|err| FsError::with_cause(FsErrorKind::FsError, err))
-        .map_err(Error::Cgroupfs)?;
-    parse_cgroup_subsystems_str(&data)
-}
-
-/// Parse cgroup mount information from a `/proc/self/mountinfo` content string.
-fn parse_cgroup_mountinfo_str(
-    data: &str,
+/// Convert the parsed mount table into the legacy controller mountpoint
+/// map, restricted to controllers present in `paths`.
+fn controller_mounts(
+    topology: &CgroupTopology,
     paths: &HashMap<String, String>,
 ) -> HashMap<String, String> {
-    let mut mounts = HashMap::new();
-
-    for line in data.lines() {
-        if let Some(mi) = hierarchies::parse_mountinfo_for_line(line) {
-            if mi.fs_type.0 != "cgroup" && mi.fs_type.0 != "cgroup2" {
-                continue;
-            }
-            let mountpoint = mi
-                .mount_point
-                .to_str()
-                .expect("mount_point parsed from valid UTF-8 &str must be valid UTF-8");
-            for opt in &mi.super_opts {
-                if paths.contains_key(opt) {
-                    mounts.insert(opt.clone(), mountpoint.to_string());
-                }
+    let mut controller_mounts = HashMap::new();
+    for record in topology
+        .mounts
+        .cgroup_mounts()
+        .iter()
+        .chain(topology.mounts.unified_mounts().iter())
+    {
+        let mut resolved = None;
+        for opt in &record.super_opts {
+            // If opt matches one of the cgroup subsystems
+            if paths.contains_key(opt) {
+                let point = resolved.get_or_insert_with(|| {
+                    topology
+                        .resolve_mount_point(&record.mount_point)
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                controller_mounts.insert(opt.clone(), point.clone());
             }
         }
     }
-
-    mounts
+    controller_mounts
 }
 
-/// Parse cgroup mount information from `/proc/self/mountinfo`.
-fn parse_cgroup_mountinfo(paths: &HashMap<String, String>) -> Result<HashMap<String, String>> {
-    let data = fs::read_to_string(MOUNTINFO_PATH)
-        .map_err(|err| FsError::with_cause(FsErrorKind::FsError, err))
-        .map_err(Error::Cgroupfs)?;
-
-    Ok(parse_cgroup_mountinfo_str(&data, paths))
+/// Join a base path with a validated [`CgroupPath`].
+pub(crate) fn join_cgroup_path(base: &Path, rel: &CgroupPath) -> PathBuf {
+    base.join(rel.as_path())
 }
 
-pub(crate) fn join_path(base: &str, path: &str) -> String {
-    let base = Path::new(base);
-    base.join(path).to_string_lossy().to_string()
+/// Join a base path string with a relative cgroup path string safely,
+/// preventing leading slashes from discarding the base path and rejecting
+/// path traversal components like `..`.
+pub(crate) fn join_path(base: &str, path: &str) -> crate::error::CoreResult<String> {
+    let base_path = Path::new(base);
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Ok(base.to_string());
+    }
+    let cpath = CgroupPath::new(trimmed)?;
+    Ok(join_cgroup_path(base_path, &cpath)
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// Parse the value of an item from a tuple string split by whitespace.
@@ -1117,10 +1134,14 @@ mod tests {
     use nix::unistd::Pid;
     use oci_spec::runtime::{LinuxCpuBuilder, LinuxMemoryBuilder, LinuxResourcesBuilder};
 
+    use crate::discovery::CgroupVersion;
+    use crate::fs::cgroup::UNIFIED_MOUNTPOINT;
     use crate::manager::fs::*;
     use crate::manager::tests::{MEMORY_1G, MEMORY_2G, MEMORY_512M};
     use crate::tests::spawn_sleep_inf;
+
     use crate::{skip_if_cgroups_v1, skip_if_cgroups_v2, skip_if_not_root};
+    use std::fs;
 
     const TEST_BASE: &str = "cgroupsrs/pod";
 
@@ -1140,12 +1161,14 @@ mod tests {
             acc
         });
 
-        for dir in dirs.iter().rev() {
-            let paths = parse_cgroup_subsystems().unwrap();
-            let mounts = parse_cgroup_mountinfo(&paths).unwrap();
+        let topology = discover(&HostPaths::default()).unwrap();
+        let paths = membership_to_subsystem_paths(&topology.membership);
+        let mounts = controller_mounts(&topology, &paths);
+        let is_v2 = topology.version == CgroupVersion::V2;
 
-            if hierarchies::is_cgroup2_unified_mode() {
-                let full = join_path(UNIFIED_MOUNTPOINT, dir);
+        for dir in dirs.iter().rev() {
+            if is_v2 {
+                let full = join_path(UNIFIED_MOUNTPOINT, dir).unwrap();
                 let path = Path::new(&full);
                 if path.exists() {
                     // kill processes in cgroup.procs
@@ -1161,8 +1184,8 @@ mod tests {
                 }
             } else {
                 for (subsystem, mountpoint) in mounts.iter() {
-                    let full = join_path(mountpoint, paths.get(subsystem).unwrap());
-                    let full = join_path(&full, dir);
+                    let full = join_path(mountpoint, paths.get(subsystem).unwrap()).unwrap();
+                    let full = join_path(&full, dir).unwrap();
                     let path = Path::new(&full);
                     if path.exists() {
                         // kill processes in the cgroup, by going through
@@ -1187,8 +1210,9 @@ mod tests {
     }
 
     fn managed_cgroup_path(manager: &FsManager, subsystem: Option<&str>) -> String {
+        let base = manager.base.as_path().to_string_lossy();
         if manager.v2() {
-            return join_path(UNIFIED_MOUNTPOINT, &manager.base);
+            return join_path(UNIFIED_MOUNTPOINT, &base).unwrap();
         }
 
         let subsystem = subsystem.expect("cgroup v1 requires a subsystem");
@@ -1196,7 +1220,7 @@ mod tests {
             .mounts
             .get(subsystem)
             .expect("cgroup v1 subsystem mountpoint should exist");
-        join_path(mountpoint, &manager.base)
+        join_path(mountpoint, &base).unwrap()
     }
 
     fn run_set_resources_failed(resources: LinuxResources) {
@@ -1231,6 +1255,48 @@ mod tests {
         child.wait().unwrap();
     }
 
+    /// Kernel-drift canary: read the real `/proc/self/mountinfo` and confirm
+    /// the parser still copes with whatever the running kernel produces.
+    ///
+    /// Fixtures lock our changes to the parser; this locks the parser against
+    /// the live host. The realistic risk is not format breakage (`/proc` is
+    /// userspace ABI) but additions: new controllers, new fields. If a kernel
+    /// change makes `parse_mountinfo_for_line` reject every cgroup line, this
+    /// fails at the source instead of surfacing indirectly as "couldn't find
+    /// the memory controller" in a downstream integration test.
+    ///
+    /// `mountinfo_self()` keeps only v1 `cgroup` mounts (it drops `cgroup2`),
+    /// so it is legitimately empty on a unified v2 host; on v1/hybrid it must
+    /// be non-empty. The line-parser canary covers both versions.
+    #[test]
+    fn test_live_mountinfo_canary() {
+        let data = fs::read_to_string("/proc/self/mountinfo")
+            .expect("canary: /proc/self/mountinfo must be readable");
+
+        let table = crate::discovery::parse_mountinfo(&data)
+            .expect("canary: /proc/self/mountinfo must parse cleanly");
+        assert!(
+            !table.cgroup_mounts().is_empty() || !table.unified_mounts().is_empty(),
+            "canary: no cgroup/cgroup2 mounts parsed from live /proc/self/mountinfo; \
+             parser may have regressed on a kernel format change"
+        );
+
+        let mounts = hierarchies::mountinfo_self();
+        if hierarchies::is_cgroup2_unified_mode() {
+            assert!(
+                mounts.is_empty(),
+                "canary: mountinfo_self() drops cgroup2 on a unified v2 host, got {:?}",
+                mounts
+            );
+        } else {
+            assert!(
+                !mounts.is_empty(),
+                "canary: mountinfo_self() found no v1 cgroup mounts on a v1/hybrid host; \
+                 parser may have regressed"
+            );
+        }
+    }
+
     #[test]
     fn test_parse_value_from_tuples() {
         let tuple_str = "system 100000\nuser 200000";
@@ -1253,7 +1319,7 @@ mod tests {
 
         for (subsystem, mountpoint) in manager.mounts() {
             let path = manager.paths().get(subsystem).unwrap();
-            let path = join_path(mountpoint, path.trim_start_matches('/'));
+            let path = join_path(mountpoint, path.trim_start_matches('/')).unwrap();
             assert!(Path::new(&path).exists(), "Cgroup {} does not exist", path);
         }
 
@@ -1430,7 +1496,7 @@ mod tests {
             .unwrap();
         run_set_resources(linux_resources, |manager| {
             let managed_path = managed_cgroup_path(manager, (!manager.v2()).then_some("cpuset"));
-            let cpuset_cpus_path = join_path(&managed_path, "cpuset.cpus");
+            let cpuset_cpus_path = join_path(&managed_path, "cpuset.cpus").unwrap();
             let cpus1 = fs::read_to_string(&cpuset_cpus_path).unwrap();
             let cpus1 = parse_cpu_list(&cpus1);
             assert_eq!(cpus[..1], cpus1);
@@ -1454,13 +1520,14 @@ mod tests {
     }
 }
 
-/// Host-independent parser tests for `parse_cgroup_subsystems_str`.
+/// Host-independent parser tests for the discovery-backed compatibility views.
 ///
 /// Input and expectation are kept adjacent in inline tables so failures pin an
 /// exact (controller, path) pair instead of a vague "is_empty" / "contains_key".
 #[cfg(test)]
 mod parse_tests {
-    use super::{parse_cgroup_mountinfo_str, parse_cgroup_subsystems_str};
+    use super::{controller_mounts, membership_to_subsystem_paths};
+    use crate::discovery::{CgroupTopology, CgroupVersion, ControllerSet};
     use crate::error::CoreError;
     use crate::fs::hierarchies;
     use crate::manager::error::Error;
@@ -1518,15 +1585,6 @@ mod parse_tests {
                 ("", "/user.slice/user-1000.slice/session-4.scope"),
             ]),
         },
-        // TODO: deferred parser defect. `parse_cgroup_subsystems_str` splits on ':'
-        // without limiting to 3 parts (e.g. `splitn(3, ':')`), so any path
-        // containing a colon results in `parts.len() != 3` and is dropped.
-        // This characterization test records the current behavior (`expect: &[]`);
-        // the follow-up fix will update the parser and flip the expectation to
-        // retain the parsed entries:
-        //   ("", "/user.slice/session:c1.scope")
-        //   ("memory", "/docker/ab:cd/init")
-        //   ("", "/a:b:c")
         Case {
             name: "colon-path: colons survive, v2 path exposed via the empty key",
             input: "0::/user.slice/session:c1.scope\n6:memory:/docker/ab:cd/init\n0::/a:b:c",
@@ -1552,7 +1610,9 @@ mod parse_tests {
     #[test]
     fn test_parse_cgroup_subsystems_str_table() {
         for case in CASES {
-            let got = parse_cgroup_subsystems_str(case.input);
+            let got = crate::discovery::parse_membership(case.input)
+                .map(|m| membership_to_subsystem_paths(&m))
+                .map_err(Error::Core);
             match case.expect {
                 None => assert!(
                     matches!(got, Err(Error::Core(CoreError::ParseError { .. }))),
@@ -1573,7 +1633,7 @@ mod parse_tests {
     }
 
     #[test]
-    fn test_parse_cgroup_mountinfo_str() {
+    fn test_controller_mounts() {
         let mut paths = HashMap::new();
         paths.insert("memory".to_string(), "/user.slice".to_string());
         paths.insert("cpu".to_string(), "/user.slice".to_string());
@@ -1583,13 +1643,18 @@ mod parse_tests {
         let input = "\
 31 22 0:26 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:15 - cgroup cgroup rw,memory
 32 22 0:27 / /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:16 - cgroup cgroup rw,cpu,cpuacct
-121 1731 0:42 / /shm rw,nosuid,nodev,noexec,relatime shared:68 master:66 - tmpfs shm rw,size=65536k
-1 2 3 - cgroup cgroup rw,memory
-31 22 0:26 / /sys/fs/cgroup/devices rw,nosuid - cgroup
-no separator here
 ";
 
-        let mounts = parse_cgroup_mountinfo_str(input, &paths);
+        let topology = CgroupTopology {
+            version: CgroupVersion::V1,
+            v2_available: false,
+            mounts: crate::discovery::parse_mountinfo(input).unwrap(),
+            membership: crate::discovery::parse_membership("1:memory:/user.slice").unwrap(),
+            controllers: ControllerSet::default(),
+            cgroupfs_root: "/sys/fs/cgroup".into(),
+            hugepages: "/sys/kernel/mm/hugepages".into(),
+        };
+        let mounts = controller_mounts(&topology, &paths);
         assert_eq!(
             mounts.get("memory"),
             Some(&"/sys/fs/cgroup/memory".to_string())
@@ -1606,17 +1671,15 @@ no separator here
         assert_eq!(mounts.len(), 3);
     }
 
-    /// TODO: deferred `mounts()` contract defect.
-    ///
     /// In cgroup v2 (unified hierarchy), `/proc/self/cgroup` contains `0::<path>`,
-    /// which `parse_cgroup_subsystems_str` parses into the key `""`.
+    /// which the compatibility view exposes through the empty key.
     /// However, a normal cgroup2 mount in `/proc/self/mountinfo`:
     ///   `47 44 0:30 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:7 - cgroup2 cgroup2 rw,nsdelegate`
     /// has super-options such as `rw,nsdelegate` (never `""`).
     ///
-    /// Because `parse_cgroup_mountinfo_str` matches mount super-options against
+    /// Because `controller_mounts` matches mount super-options against
     /// keys in `paths` (`paths.contains_key(opt)`), it never matches the `""`
-    /// key. Therefore, `parse_cgroup_mountinfo_str` currently returns no mount
+    /// key. Therefore, `controller_mounts` currently returns no mount
     /// mapping for unified v2, even though `cgroup2` is explicitly recognized in
     /// `mi.fs_type.0`.
     ///
@@ -1624,9 +1687,10 @@ no separator here
     /// any future fix to the `mounts()` contract for cgroup v2 can flip this
     /// expectation intentionally.
     #[test]
-    fn test_parse_cgroup_mountinfo_str_cgroup2() {
+    fn test_controller_mounts_cgroup2() {
         let cgroup_data = "0::/user.slice/user-1000.slice/session-4.scope";
-        let paths = parse_cgroup_subsystems_str(cgroup_data).unwrap();
+        let membership = crate::discovery::parse_membership(cgroup_data).unwrap();
+        let paths = membership_to_subsystem_paths(&membership);
         assert_eq!(
             paths.get(""),
             Some(&"/user.slice/user-1000.slice/session-4.scope".to_string())
@@ -1635,7 +1699,16 @@ no separator here
         let mountinfo_data = "\
 47 44 0:30 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:7 - cgroup2 cgroup2 rw,nsdelegate
 ";
-        let mounts = parse_cgroup_mountinfo_str(mountinfo_data, &paths);
+        let topology = CgroupTopology {
+            version: CgroupVersion::V2,
+            v2_available: true,
+            mounts: crate::discovery::parse_mountinfo(mountinfo_data).unwrap(),
+            membership,
+            controllers: ControllerSet::default(),
+            cgroupfs_root: "/sys/fs/cgroup".into(),
+            hugepages: "/sys/kernel/mm/hugepages".into(),
+        };
+        let mounts = controller_mounts(&topology, &paths);
 
         // Counterintuitive branch: returns no mount mapping for unified v2.
         assert_eq!(mounts.get(""), None);
@@ -1648,7 +1721,7 @@ no separator here
     /// Fixtures lock our changes to the parser; this locks the parser against
     /// the live host. The realistic risk is not format breakage (`/proc` is
     /// userspace ABI) but additions: new controllers, new fields. If a kernel
-    /// change makes `parse_mountinfo_for_line` reject every cgroup line, this
+    /// change makes the discovery parser reject every cgroup line, this
     /// fails at the source instead of surfacing indirectly as "couldn't find
     /// the memory controller" in a downstream integration test.
     ///
@@ -1661,9 +1734,11 @@ no separator here
         let data = fs::read_to_string("/proc/self/mountinfo")
             .expect("canary: /proc/self/mountinfo must be readable");
 
-        let cgroup_mounts: Vec<_> = data
-            .lines()
-            .filter_map(hierarchies::parse_mountinfo_for_line)
+        let mount_table = crate::discovery::parse_mountinfo(&data)
+            .expect("canary: /proc/self/mountinfo must parse cleanly");
+        let cgroup_mounts: Vec<_> = mount_table
+            .records()
+            .iter()
             .filter(|mi| mi.fs_type.0 == "cgroup" || mi.fs_type.0 == "cgroup2")
             .collect();
         assert!(
@@ -1686,5 +1761,72 @@ no separator here
                  parser may have regressed"
             );
         }
+    }
+
+    #[test]
+    fn test_fs_manager_with_topology() {
+        use super::FsManager;
+        use crate::discovery::CgroupTopology;
+        use std::path::{Path, PathBuf};
+        use std::sync::Arc;
+
+        struct TempGuard(PathBuf);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!("fs-mgr-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _guard = TempGuard(temp_dir.clone());
+        let custom_cgroupfs = temp_dir.join("cgroupfs");
+        std::fs::create_dir_all(&custom_cgroupfs).unwrap();
+
+        let mountinfo = "\
+43 33 0:38 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:20 - cgroup cgroup rw,memory";
+        let mounts = crate::discovery::parse_mountinfo(mountinfo).unwrap();
+        let membership = crate::discovery::parse_membership("1:memory:/user.slice").unwrap();
+
+        let topology = Arc::new(CgroupTopology {
+            version: crate::discovery::CgroupVersion::V1,
+            v2_available: false,
+            mounts,
+            membership,
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root: custom_cgroupfs.clone(),
+            hugepages: PathBuf::from("/nonexistent"),
+        });
+
+        let manager = FsManager::with_topology("test/subgroup", topology).unwrap();
+        assert_eq!(manager.base.as_path(), Path::new("test/subgroup"));
+        assert_eq!(
+            manager.mounts.get("memory").unwrap(),
+            &custom_cgroupfs.join("memory").to_string_lossy().to_string()
+        );
+    }
+
+    #[test]
+    fn test_join_path_safe_from_leading_slash() {
+        use super::{join_cgroup_path, join_path};
+        use crate::model::CgroupPath;
+        use std::path::Path;
+
+        // Standard Path::join discards base when second operand starts with slash:
+        // Path::new("/sys/fs/cgroup").join("/mycgroup") -> "/mycgroup"
+        // join_path MUST NOT discard the base:
+        let joined = join_path("/sys/fs/cgroup", "/mycgroup/sub").unwrap();
+        assert_eq!(joined, "/sys/fs/cgroup/mycgroup/sub");
+
+        let joined_empty = join_path("/sys/fs/cgroup", "").unwrap();
+        assert_eq!(joined_empty, "/sys/fs/cgroup");
+
+        // Traversal paths MUST be rejected:
+        assert!(join_path("/sys/fs/cgroup", "../escape").is_err());
+        assert!(join_path("/sys/fs/cgroup", "sub/../escape").is_err());
+
+        let cp = CgroupPath::new("mycgroup/sub").unwrap();
+        let typed = join_cgroup_path(Path::new("/sys/fs/cgroup"), &cp);
+        assert_eq!(typed, Path::new("/sys/fs/cgroup/mycgroup/sub"));
     }
 }

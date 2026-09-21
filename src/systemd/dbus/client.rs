@@ -344,20 +344,24 @@ pub mod tests {
 
         let base = expand_slice(TEST_SLICE).unwrap();
 
-        // Check if the cgroup exists in the filesystem
+        let topology = crate::discovery::discover(&crate::discovery::HostPaths::default()).unwrap();
+        let base_cpath = crate::model::CgroupPath::new(&base).unwrap();
         let full_base = if v2 {
-            format!("/sys/fs/cgroup/{}", base)
+            topology.cgroupfs_root.join(base_cpath.as_path())
         } else {
-            format!("/sys/fs/cgroup/memory/{}", base)
+            topology
+                .resolve_mount_point(Path::new("/sys/fs/cgroup/memory"))
+                .join(base_cpath.as_path())
         };
         assert!(
-            Path::new(&full_base).exists(),
-            "Cgroup base path does not exist: {}",
+            full_base.exists(),
+            "Cgroup base path does not exist: {:?}",
             full_base
         );
 
         // PIDs
-        let cgroup_procs_path = format!("{}/{}/cgroup.procs", full_base, unit);
+        let unit_cpath = crate::model::CgroupPath::new(&unit).unwrap();
+        let cgroup_procs_path = full_base.join(unit_cpath.as_path()).join("cgroup.procs");
         for i in 0..5 {
             let content = fs::read_to_string(&cgroup_procs_path);
             if let Ok(content) = &content {
@@ -615,14 +619,17 @@ pub mod tests {
         let pid1 = CgroupPid::from(child1.id() as u64);
         cgroup.add_process(pid1, "/").unwrap();
 
+        let topology = crate::discovery::discover(&crate::discovery::HostPaths::default()).unwrap();
         let cgroup_root = if v2 {
-            Path::new("/sys/fs/cgroup")
+            topology.cgroupfs_root.clone()
         } else {
-            Path::new("/sys/fs/cgroup/memory")
+            topology.resolve_mount_point(Path::new("/sys/fs/cgroup/memory"))
         };
+        let slice_cpath = crate::model::CgroupPath::new(expand_slice(TEST_SLICE).unwrap()).unwrap();
+        let unit_cpath = crate::model::CgroupPath::new(&unit).unwrap();
         let cgroup_procs_path = cgroup_root
-            .join(expand_slice(TEST_SLICE).unwrap())
-            .join(&unit)
+            .join(slice_cpath.as_path())
+            .join(unit_cpath.as_path())
             .join("cgroup.procs");
         for i in 0..5 {
             let content = fs::read_to_string(&cgroup_procs_path);

@@ -4,10 +4,12 @@
 //
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use oci_spec::runtime::{LinuxCpu, LinuxMemory, LinuxPids, LinuxResources};
 use zbus::zvariant::Value as ZbusValue;
 
+use crate::discovery::{discover, CgroupTopology, CgroupVersion, HostPaths};
 use crate::manager::conv;
 use crate::manager::error::{Error, Result};
 use crate::manager::fs::{join_path, FsManager};
@@ -62,12 +64,24 @@ impl SystemdManager<'_> {
     /// * `path` - A string slice that holds the cgroup path in the format
     ///   "parent:scope_prefix:name".
     pub fn new(path: &str) -> Result<Self> {
+        Self::with_host_paths(path, &HostPaths::default())
+    }
+
+    /// Create a `SystemdManager` from a cgroup path using explicit host paths for discovery.
+    pub fn with_host_paths(path: &str, host_paths: &HostPaths) -> Result<Self> {
+        let topology = discover(host_paths).map_err(Error::Core)?;
+        Self::with_topology(path, topology)
+    }
+
+    /// Create a `SystemdManager` using an already-discovered topology snapshot.
+    pub fn with_topology(path: &str, topology: Arc<CgroupTopology>) -> Result<Self> {
         let (slice, unit) = Self::parse_slice_and_unit(path)?;
-        let props = PropertiesBuilder::default_cgroup(&slice, &unit).build();
+        let v2 = topology.version == CgroupVersion::V2;
+        let props = PropertiesBuilder::default_cgroup(&slice, &unit).build_with_v2(v2);
         let slice_base = expand_slice(&slice)?;
 
-        let fs_base = join_path(&slice_base, &unit);
-        let fs_manager = FsManager::new(&fs_base)?;
+        let fs_base = join_path(&slice_base, &unit)?;
+        let fs_manager = FsManager::with_topology(&fs_base, topology)?;
 
         let cgroup = SystemdClient::new(&unit, props)?;
 
@@ -77,6 +91,11 @@ impl SystemdManager<'_> {
             fs_manager,
             systemd_client: cgroup,
         })
+    }
+
+    /// Return the topology snapshot held by this manager.
+    pub fn topology(&self) -> &Arc<CgroupTopology> {
+        self.fs_manager.topology()
     }
 }
 
@@ -381,7 +400,7 @@ mod tests {
             .get(subsystem)
             .expect("cgroup v1 subsystem mountpoint should exist");
         let slice_base = expand_slice(manager.slice()).unwrap();
-        join_path(mountpoint, &join_path(&slice_base, manager.unit()))
+        join_path(mountpoint, &join_path(&slice_base, manager.unit()).unwrap()).unwrap()
     }
 
     fn run_set_resources_failed(resources: LinuxResources) {
@@ -584,5 +603,57 @@ mod tests {
             let memory_stat = controller.memory_stat();
             assert_eq!(memory_stat.limit_in_bytes, MEMORY_512M);
         });
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::SystemdManager;
+    use crate::discovery::{CgroupTopology, CgroupVersion};
+    use crate::Manager;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_systemd_manager_with_topology() {
+        struct TempGuard(PathBuf);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("systemd-mgr-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _guard = TempGuard(temp_dir.clone());
+        let custom_cgroupfs = temp_dir.join("cgroupfs");
+        std::fs::create_dir_all(&custom_cgroupfs).unwrap();
+
+        let mountinfo = "\
+43 33 0:38 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:20 - cgroup cgroup rw,memory";
+        let mounts = crate::discovery::parse_mountinfo(mountinfo).unwrap();
+        let membership = crate::discovery::parse_membership("1:memory:/user.slice").unwrap();
+
+        let topology = Arc::new(CgroupTopology {
+            version: CgroupVersion::V1,
+            v2_available: false,
+            mounts,
+            membership,
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root: custom_cgroupfs.clone(),
+            hugepages: PathBuf::from("/nonexistent"),
+        });
+
+        // Path format: parent:scope_prefix:name
+        let manager =
+            SystemdManager::with_topology("test.slice:scope:unit", topology.clone()).unwrap();
+        assert_eq!(manager.slice(), "test.slice");
+        assert_eq!(manager.unit(), "scope-unit.scope");
+        assert_eq!(
+            manager.mounts().get("memory").unwrap(),
+            &custom_cgroupfs.join("memory").to_string_lossy().to_string()
+        );
+        assert!(Arc::ptr_eq(manager.topology(), &topology));
     }
 }
