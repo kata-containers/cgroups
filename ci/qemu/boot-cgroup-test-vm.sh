@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 #
+# Copyright (c) 2026 Kata Contributors
+#
+# SPDX-License-Identifier: Apache-2.0 or MIT
+#
+#
 # Start an Ubuntu 22.04 VM in an explicit cgroup layout. TCG is the default
 # accelerator because standard GitHub-hosted runners do not promise
 # general-purpose nested virtualization. Set QEMU_ACCEL=kvm explicitly when

@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 #
+# Copyright (c) 2026 Kata Contributors
+#
+# SPDX-License-Identifier: Apache-2.0 or MIT
+#
+#
 # Build Rust test targets and use Cargo's artifact messages to record each
 # executable as:
 #   <target kind> TAB <target name> TAB <executable path>

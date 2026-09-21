@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 #
+# Copyright (c) 2026 Kata Contributors
+#
+# SPDX-License-Identifier: Apache-2.0 or MIT
+#
+#
 # Copy statically linked test executables into a cgroup VM and run them
 # sequentially.  Running every executable covers library and integration tests.
 
