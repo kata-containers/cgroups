@@ -9,6 +9,7 @@ use std::process::Command;
 use cgroups_rs::fs::hierarchies;
 use cgroups_rs::fs::pid::PidController;
 use cgroups_rs::fs::{Cgroup, Hierarchy, MaxValue, Subsystem};
+use cgroups_rs::model::CgroupPath;
 use cgroups_rs::CgroupPid;
 
 #[derive(Clone, Debug)]
@@ -36,12 +37,17 @@ impl Hierarchy for DelegatedV2Hierarchy {
     }
 
     fn root_control_group(&self) -> Cgroup {
-        Cgroup::load(Box::new(self.clone()), "")
+        Cgroup::load_validated(Box::new(self.clone()), CgroupPath::root().unwrap())
     }
 
     fn parent_control_group(&self, path: &str) -> Cgroup {
         let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
-        Cgroup::load(Box::new(self.clone()), parent)
+        let cpath = if parent.as_os_str().is_empty() {
+            CgroupPath::root().unwrap()
+        } else {
+            CgroupPath::new(parent).unwrap_or_else(|_| CgroupPath::root().unwrap())
+        };
+        Cgroup::load_validated(Box::new(self.clone()), cpath)
     }
 
     fn v2(&self) -> bool {

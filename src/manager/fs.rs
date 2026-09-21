@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
+// The hierarchy and cgroup compatibility entry points are deprecated in this
+// PR, while the manager migrates to their checked replacements in the next PR.
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
