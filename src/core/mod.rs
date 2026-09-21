@@ -12,9 +12,12 @@ pub mod resources;
 
 pub use attachment::CgroupPid;
 pub use discovery::{
-    parse_membership, parse_membership_bytes, parse_mountinfo, parse_mountinfo_bytes,
-    CgroupMembership, CgroupMountTable, MembershipRecord, MountRecord,
+    discover, parse_membership, parse_membership_bytes, parse_mountinfo, parse_mountinfo_bytes,
+    CgroupMembership, CgroupMountTable, CgroupTopology, CgroupVersion, ControllerIter,
+    ControllerSet, HostPaths, MembershipRecord, MountRecord,
 };
-pub use error::{CoreError, CoreResult, ParseMembershipError, ParseMountError, PathError};
+pub use error::{
+    CoreError, CoreResult, LayoutError, ParseMembershipError, ParseMountError, PathError,
+};
 pub use path::CgroupPath;
 pub use resources::{FreezerState, CPU_SHARES_V1_MAX, CPU_WEIGHT_V2_MAX};

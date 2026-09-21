@@ -8,6 +8,8 @@ license = "MIT OR Apache-2.0"
 version = "0.5.1"
 authors = ["The Kata Containers community <kata-dev@lists.katacontainers.io>", "Levente Kurusa <lkurusa@acm.org>", "Sam Wilson <tecywiz121@hotmail.com>"]
 edition = "2018"
+# Keep fixture features from dev-dependencies out of normal library builds.
+resolver = "2"
 homepage = "https://github.com/kata-containers/cgroups-rs"
 readme = "README.md"
 
@@ -24,10 +26,13 @@ zbus = "5.8"
 bit-vec = "0.6"
 
 [dev-dependencies]
+cgroups-rs = { path = ".", default-features = false, features = ["fixtures"] }
 libc = "0.2.76"
 rand = "0.8"
 nix = "0.31"
 
 [features]
 default = []
+# Expose ordinary-filesystem cgroup trees for unprivileged fixture tests.
+fixtures = []
 oci = ["oci-spec"]
