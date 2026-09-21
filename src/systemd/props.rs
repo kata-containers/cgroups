@@ -5,8 +5,7 @@
 
 use zbus::zvariant::Value as ZbusValue;
 
-use crate::core::error::CoreResult;
-use crate::fs::hierarchies;
+use crate::core::CgroupVersion;
 use crate::systemd::utils::is_slice_unit;
 use crate::systemd::{
     BLOCK_IO_ACCOUNTING, CPU_ACCOUNTING, DEFAULT_DEPENDENCIES, DEFAULT_DESCRIPTION, DELEGATE,
@@ -113,18 +112,10 @@ impl PropertiesBuilder {
         self
     }
 
-    /// Build the unit properties, detecting the hierarchy for I/O accounting.
+    /// Build unit properties for a known primary cgroup version. Performs no I/O.
     ///
-    /// Discovery errors propagate rather than selecting the v1 accounting
-    /// property by default. Without I/O accounting, building performs no I/O.
-    pub fn build(self) -> CoreResult<Vec<Property<'static>>> {
-        self.build_with_detector(hierarchies::is_cgroup2_unified_mode)
-    }
-
-    fn build_with_detector(
-        self,
-        unified_mode: impl FnOnce() -> CoreResult<bool>,
-    ) -> CoreResult<Vec<Property<'static>>> {
+    /// Hybrid hosts use [`CgroupVersion::V1`] and `BlockIOAccounting`.
+    pub fn build(self, version: CgroupVersion) -> Vec<Property<'static>> {
         let mut props = vec![];
 
         if let Some(cpu_accounting) = self.cpu_accounting {
@@ -140,11 +131,11 @@ impl PropertiesBuilder {
         }
 
         if let Some(io_accounting) = self.io_accounting {
-            if unified_mode()? {
-                props.push((IO_ACCOUNTING, ZbusValue::Bool(io_accounting)));
-            } else {
-                props.push((BLOCK_IO_ACCOUNTING, ZbusValue::Bool(io_accounting)));
-            }
+            let property = match version {
+                CgroupVersion::V1 => BLOCK_IO_ACCOUNTING,
+                CgroupVersion::V2 => IO_ACCOUNTING,
+            };
+            props.push((property, ZbusValue::Bool(io_accounting)));
         }
 
         if let Some(default_dependencies) = self.default_dependencies {
@@ -177,63 +168,57 @@ impl PropertiesBuilder {
             props.push((TIMEOUT_STOP_USEC, ZbusValue::U64(timeout)));
         }
 
-        Ok(props)
+        props
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::error::CoreError;
-    use std::error::Error as _;
-    use std::path::PathBuf;
 
     #[test]
-    fn test_io_accounting_selects_the_property_for_the_detected_hierarchy() {
-        for unified in [false, true] {
-            let props = PropertiesBuilder::default()
-                .io_accounting(true)
-                .build_with_detector(|| Ok(unified))
-                .unwrap();
-            let (selected, other) = if unified {
-                (IO_ACCOUNTING, BLOCK_IO_ACCOUNTING)
-            } else {
-                (BLOCK_IO_ACCOUNTING, IO_ACCOUNTING)
-            };
-            assert!(props.contains(&(selected, ZbusValue::Bool(true))));
-            assert!(!props.iter().any(|(name, _)| *name == other));
+    fn test_io_accounting_uses_primary_version() {
+        for (version, selected, other) in [
+            (CgroupVersion::V1, BLOCK_IO_ACCOUNTING, IO_ACCOUNTING),
+            (CgroupVersion::V2, IO_ACCOUNTING, BLOCK_IO_ACCOUNTING),
+        ] {
+            for enabled in [false, true] {
+                let props = PropertiesBuilder::default()
+                    .io_accounting(enabled)
+                    .build(version);
+                assert!(props.contains(&(selected, ZbusValue::Bool(enabled))));
+                assert!(!props.iter().any(|(name, _)| *name == other));
+            }
         }
     }
 
     #[test]
-    fn test_io_accounting_preserves_discovery_error_context() {
-        let path = PathBuf::from("/fixture/cgroup.controllers");
-        let error = PropertiesBuilder::default()
-            .io_accounting(true)
-            .build_with_detector(|| {
-                Err(CoreError::ReadControllers {
-                    path: path.clone(),
-                    cause: std::io::Error::from_raw_os_error(libc::EACCES),
-                })
-            })
-            .unwrap_err();
-        assert!(
-            matches!(&error, CoreError::ReadControllers { path: failed, .. } if failed == &path)
+    fn test_default_cgroup_uses_v1_accounting_on_hybrid_hosts() {
+        let fixture = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+              47 44 0:30 / /sys/fs/cgroup/unified rw - cgroup2 cgroup2 rw\n",
+            b"1:memory:/\n0::/\n",
+            "",
         );
-        let source = error
-            .source()
-            .unwrap()
-            .downcast_ref::<std::io::Error>()
-            .unwrap();
-        assert_eq!(source.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(fixture.topology.version(), CgroupVersion::V1);
+        assert!(fixture.topology.v2_available());
+
+        let props = PropertiesBuilder::default_cgroup("test.slice", "test.scope")
+            .build(fixture.topology.version());
+        assert!(props.contains(&(BLOCK_IO_ACCOUNTING, ZbusValue::Bool(true))));
+        assert!(!props.iter().any(|(name, _)| *name == IO_ACCOUNTING));
     }
 
     #[test]
-    fn test_build_without_io_accounting_does_not_detect_the_host() {
-        let props = PropertiesBuilder::default()
-            .cpu_accounting(true)
-            .build_with_detector(|| panic!("no I/O accounting was requested"))
-            .unwrap();
-        assert!(props.contains(&(CPU_ACCOUNTING, ZbusValue::Bool(true))));
+    fn test_build_without_io_accounting_omits_both_properties() {
+        for version in [CgroupVersion::V1, CgroupVersion::V2] {
+            let props = PropertiesBuilder::default()
+                .cpu_accounting(true)
+                .build(version);
+            assert!(props.contains(&(CPU_ACCOUNTING, ZbusValue::Bool(true))));
+            assert!(!props
+                .iter()
+                .any(|(name, _)| matches!(*name, IO_ACCOUNTING | BLOCK_IO_ACCOUNTING)));
+        }
     }
 }

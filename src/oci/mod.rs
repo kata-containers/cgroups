@@ -5,6 +5,7 @@
 
 mod error;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub use error::{Error, Result};
 mod fs;
@@ -15,6 +16,7 @@ mod conv;
 
 use oci_spec::runtime::LinuxResources;
 
+use crate::core::CgroupMembership;
 use crate::systemd::SLICE_SUFFIX;
 use crate::{CgroupPid, CgroupStats, FreezerState};
 
@@ -44,13 +46,19 @@ pub trait Manager: Send + Sync {
     /// Set the resources to the cgroups.
     fn set(&mut self, resources: &LinuxResources) -> Result<()>;
 
-    /// Get the cgroup path.
+    /// Get a cgroup path without converting its bytes to UTF-8.
+    ///
+    /// On v1, this returns the selected controller's process membership from
+    /// the discovery snapshot, retaining its leading `/` and possible `..`
+    /// components. It is not a mutation-safe path or the managed cgroup's
+    /// filesystem path. On v2, this returns the unified filesystem mount
+    /// joined with the managed base.
     ///
     /// # Arguments
     ///
     /// - `subsystem`: cgroup subsystem, for cgroup v1 the value should not
     ///   be empty, while for cgroup v2 the only valid value is `None`.
-    fn cgroup_path(&self, subsystem: Option<&str>) -> Result<String>;
+    fn cgroup_path(&self, subsystem: Option<&str>) -> Result<PathBuf>;
 
     /// Enable CPUs, topdown from root in cgroup hierarchy, this would be
     /// useful for CPU hotplug in the guest.
@@ -68,15 +76,21 @@ pub trait Manager: Send + Sync {
     /// Get cgroup stats.
     fn stats(&self) -> CgroupStats;
 
-    /// Get the mappings of subsystems to their relative path. The full
-    /// path would be something like "{mountpoint}/{relative_path}". The
-    /// mappings of mountpoints see "mounts()".
-    fn paths(&self) -> &HashMap<String, String>;
+    /// Borrow the process membership records captured by discovery.
+    ///
+    /// Records retain their hierarchy IDs, controller groups, and original
+    /// path bytes, including a leading `/` and possible namespace-relative
+    /// `..`. These are observations, not validated mutation paths. This
+    /// snapshot does not reflect later process migration.
+    fn memberships(&self) -> &CgroupMembership;
 
-    /// Get the mappings of subsystems to their mountpoints. The full
-    /// path would be something like "{mountpoint}/{relative_path}". The
-    /// mappings of relative paths see "paths()".
-    fn mounts(&self) -> &HashMap<String, String>;
+    /// Build a mapping from observed v1 controllers to filesystem mount points.
+    ///
+    /// Each call derives an owned map from the topology without I/O. Duplicate
+    /// controller mounts select the first match in mountinfo order, consistent
+    /// with cgroup handles. A pure unified-v2 topology has no v1 controller
+    /// entries; use `cgroup_path(None)` for its managed filesystem path.
+    fn mounts(&self) -> HashMap<String, PathBuf>;
 
     /// Indicate whether the cgroup manager is using systemd.
     fn systemd(&self) -> bool;

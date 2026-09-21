@@ -4,13 +4,18 @@
 //
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use oci_spec::runtime::{LinuxCpu, LinuxMemory, LinuxPids, LinuxResources};
 use zbus::zvariant::Value as ZbusValue;
 
+use crate::core::discovery::{CgroupMembership, CgroupTopology};
+use crate::core::error::CoreError;
+use crate::core::CgroupPath;
 use crate::oci::conv;
 use crate::oci::error::{Error, Result};
-use crate::oci::fs::{join_path, FsManager};
+use crate::oci::fs::FsManager;
 use crate::systemd::props::PropertiesBuilder;
 use crate::systemd::utils::expand_slice;
 use crate::systemd::{
@@ -55,19 +60,26 @@ impl SystemdManager<'_> {
         Ok((slice, unit))
     }
 
-    /// Create a new `SystemdManager` from a cgroup path.
+    /// Create a new `SystemdManager` from a shared topology and systemd path.
+    ///
+    /// Discover the topology explicitly with [`crate::core::discovery::discover`]
+    /// and share its [`Arc`] with other managers. This constructor performs no
+    /// discovery and does not start the unit.
     ///
     /// # Arguments
     ///
+    /// * `topology` - An already-discovered topology snapshot.
     /// * `path` - A string slice that holds the cgroup path in the format
     ///   "parent:scope_prefix:name".
-    pub fn new(path: &str) -> Result<Self> {
+    pub fn new(topology: Arc<CgroupTopology>, path: &str) -> Result<Self> {
         let (slice, unit) = Self::parse_slice_and_unit(path)?;
-        let props = PropertiesBuilder::default_cgroup(&slice, &unit).build()?;
+        let props = PropertiesBuilder::default_cgroup(&slice, &unit).build(topology.version());
         let slice_base = expand_slice(&slice)?;
 
-        let fs_base = join_path(&slice_base, &unit);
-        let fs_manager = FsManager::new(&fs_base)?;
+        let fs_base = CgroupPath::new(&slice_base)
+            .map_err(CoreError::from)?
+            .join(&CgroupPath::new(&unit).map_err(CoreError::from)?);
+        let fs_manager = FsManager::new(topology, fs_base)?;
 
         let cgroup = SystemdClient::new(&unit, props)?;
 
@@ -77,6 +89,11 @@ impl SystemdManager<'_> {
             fs_manager,
             systemd_client: cgroup,
         })
+    }
+
+    /// Return the topology snapshot held by this manager.
+    pub fn topology(&self) -> &Arc<CgroupTopology> {
+        self.fs_manager.topology()
     }
 }
 
@@ -225,7 +242,7 @@ impl Manager for SystemdManager<'_> {
         self.add_proc(pid)
     }
 
-    fn cgroup_path(&self, subsystem: Option<&str>) -> Result<String> {
+    fn cgroup_path(&self, subsystem: Option<&str>) -> Result<PathBuf> {
         self.fs_manager.cgroup_path(subsystem)
     }
 
@@ -284,11 +301,11 @@ impl Manager for SystemdManager<'_> {
         self.fs_manager.stats()
     }
 
-    fn paths(&self) -> &HashMap<String, String> {
-        self.fs_manager.paths()
+    fn memberships(&self) -> &CgroupMembership {
+        self.fs_manager.memberships()
     }
 
-    fn mounts(&self) -> &HashMap<String, String> {
+    fn mounts(&self) -> HashMap<String, PathBuf> {
         self.fs_manager.mounts()
     }
 
@@ -336,7 +353,7 @@ mod tests {
     //! Don't run tests in parallel, use `--test-threads=1`!
     //!
 
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::thread::sleep;
     use std::time::Duration;
 
@@ -344,6 +361,8 @@ mod tests {
     use rand::distributions::Alphanumeric;
     use rand::Rng;
 
+    use crate::core::error::PathError;
+    use crate::core::{discover, CgroupVersion, HostPaths};
     use crate::fs::cpu::CpuController;
     use crate::fs::memory::MemController;
     use crate::fs::{ControllIdentifier, Controller, Subsystem};
@@ -367,21 +386,29 @@ mod tests {
 
     fn new_systemd_manager<'a>() -> SystemdManager<'a> {
         let (slice, scope_prefix, name) = new_cgroups_path();
-        SystemdManager::new(&format!("{}:{}:{}", slice, scope_prefix, name)).unwrap()
+        let topology = discover(&HostPaths::default()).unwrap();
+        SystemdManager::new(topology, &format!("{}:{}:{}", slice, scope_prefix, name)).unwrap()
     }
 
-    fn managed_cgroup_path(manager: &SystemdManager<'_>, subsystem: Option<&str>) -> String {
-        if manager.v2() {
-            return manager.cgroup_path(None).unwrap();
-        }
-
-        let subsystem = subsystem.expect("cgroup v1 requires a subsystem");
-        let mountpoint = manager
-            .mounts()
-            .get(subsystem)
-            .expect("cgroup v1 subsystem mountpoint should exist");
+    fn managed_cgroup_path(manager: &SystemdManager<'_>, subsystem: Option<&str>) -> PathBuf {
         let slice_base = expand_slice(manager.slice()).unwrap();
-        join_path(mountpoint, &join_path(&slice_base, manager.unit()))
+        let base = CgroupPath::new(&slice_base)
+            .unwrap()
+            .join(&CgroupPath::new(manager.unit()).unwrap());
+        if manager.v2() {
+            manager
+                .topology()
+                .cgroupfs_root()
+                .unwrap()
+                .join(base.as_path())
+        } else {
+            let subsystem = subsystem.expect("cgroup v1 requires a subsystem");
+            manager
+                .mounts()
+                .get(subsystem)
+                .expect("cgroup v1 subsystem mountpoint should exist")
+                .join(base.as_path())
+        }
     }
 
     fn run_set_resources_failed(resources: LinuxResources) {
@@ -438,17 +465,58 @@ mod tests {
     }
 
     #[test]
+    fn test_new_uses_relative_slice_and_unit_paths() {
+        for version in [CgroupVersion::V1, CgroupVersion::V2] {
+            let fixture = crate::tests::topology_fixture(version, "memory");
+            let root = fixture.topology.fixture_root().unwrap();
+            let mount = match version {
+                CgroupVersion::V1 => root.join("memory"),
+                CgroupVersion::V2 => root.to_path_buf(),
+            };
+            for (input, expected) in [
+                ("-.slice:scope:unit", "scope-unit.scope"),
+                (
+                    "test-child.slice:scope:unit",
+                    "test.slice/test-child.slice/scope-unit.scope",
+                ),
+            ] {
+                let manager = SystemdManager::new(fixture.topology.clone(), input).unwrap();
+                let memory: &MemController = manager.fs_manager.cgroup().controller_of().unwrap();
+                assert_eq!(memory.path(), mount.join(expected));
+                assert!(Arc::ptr_eq(manager.topology(), &fixture.topology));
+            }
+        }
+    }
+
+    #[test]
+    fn test_new_rejects_absolute_unit_path() {
+        for version in [CgroupVersion::V1, CgroupVersion::V2] {
+            let fixture = crate::tests::topology_fixture(version, "memory");
+            for input in ["-.slice::/outside", "test.slice::/outside"] {
+                assert!(matches!(
+                    SystemdManager::new(fixture.topology.clone(), input),
+                    Err(Error::Core(CoreError::PathError(PathError::AbsolutePath {
+                        input,
+                        operation,
+                    }))) if input == Path::new("/outside.scope") && operation == "CgroupPath::new"
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn test_destory() {
         skip_if_not_root!();
         skip_if_no_systemd!();
 
         let (slice, scope_prefix, name) = new_cgroups_path();
+        let topology = discover(&HostPaths::default()).unwrap();
         let mut manager =
-            SystemdManager::new(&format!("{}:{}:{}", slice, scope_prefix, name)).unwrap();
+            SystemdManager::new(topology, &format!("{}:{}:{}", slice, scope_prefix, name)).unwrap();
 
         let cgroup_path = managed_cgroup_path(&manager, (!manager.v2()).then_some("memory"));
         // Before starting the unit, no cgroup should exist.
-        assert!(!Path::new(&cgroup_path).exists());
+        assert!(!cgroup_path.exists());
 
         let mut child = spawn_sleep_inf();
         manager
@@ -458,7 +526,7 @@ mod tests {
             .unwrap();
 
         // Now cgroup should exist.
-        assert!(Path::new(&cgroup_path).exists());
+        assert!(cgroup_path.exists());
 
         manager.destroy().unwrap();
 
@@ -468,12 +536,12 @@ mod tests {
         // No cgroup should exist after destroy, retry 5 times at 1-second
         // intervals.
         for _ in 0..5 {
-            if !Path::new(&cgroup_path).exists() {
+            if !cgroup_path.exists() {
                 break;
             }
             sleep(Duration::from_secs(1));
         }
-        assert!(!Path::new(&cgroup_path).exists());
+        assert!(!cgroup_path.exists());
         // Unit should be stopped.
         assert!(!manager.systemd_client.exists());
     }
@@ -584,5 +652,48 @@ mod tests {
             let memory_stat = controller.memory_stat();
             assert_eq!(memory_stat.limit_in_bytes, MEMORY_512M);
         });
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::SystemdManager;
+    use crate::core::{CgroupPath, CgroupVersion};
+    use crate::oci::FsManager;
+    use crate::Manager;
+    use std::fs;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_managers_share_topology_without_rediscovery() {
+        for version in [CgroupVersion::V1, CgroupVersion::V2] {
+            let fixture = crate::tests::topology_fixture(version, "memory");
+            fs::remove_dir_all(fixture.topology.mountinfo_path().parent().unwrap()).unwrap();
+
+            let fs_manager = FsManager::new(
+                fixture.topology.clone(),
+                CgroupPath::new("workloads").unwrap(),
+            )
+            .unwrap();
+            let manager =
+                SystemdManager::new(fixture.topology.clone(), "test.slice:scope:unit").unwrap();
+            assert_eq!(manager.slice(), "test.slice");
+            assert_eq!(manager.unit(), "scope-unit.scope");
+            assert_eq!(manager.v2(), version == CgroupVersion::V2);
+            let root = fixture.topology.fixture_root().unwrap();
+            if version == CgroupVersion::V1 {
+                assert_eq!(
+                    manager.mounts().get("memory").unwrap(),
+                    &root.join("memory")
+                );
+            } else {
+                assert_eq!(
+                    manager.cgroup_path(None).unwrap(),
+                    root.join("test.slice/scope-unit.scope")
+                );
+            }
+            assert!(Arc::ptr_eq(manager.topology(), &fixture.topology));
+            assert!(Arc::ptr_eq(manager.topology(), fs_manager.topology()));
+        }
     }
 }

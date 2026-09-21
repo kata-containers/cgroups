@@ -249,6 +249,7 @@ pub mod tests {
     use rand::distributions::Alphanumeric;
     use rand::Rng;
 
+    use crate::core::{discover, HostPaths};
     use crate::fs::hierarchies::{self, V1};
     use crate::fs::Controllers;
     use crate::skip_if_not_root;
@@ -317,9 +318,9 @@ pub mod tests {
     }
 
     fn start_default_cgroup(pid: CgroupPid, unit: &'_ str) -> SystemdClient<'_> {
-        let mut props = PropertiesBuilder::default_cgroup(TEST_SLICE, unit)
-            .build()
-            .unwrap();
+        let topology = discover(&HostPaths::default()).unwrap();
+        let mut props =
+            PropertiesBuilder::default_cgroup(TEST_SLICE, unit).build(topology.version());
         props.push((PIDS, Value::Array(vec![pid.pid as u32].into())));
         let cgroup = SystemdClient::new(unit, props).unwrap();
         // Stop the unit if it exists.
