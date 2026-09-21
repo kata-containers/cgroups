@@ -148,6 +148,25 @@ impl Cgroup {
         }
     }
 
+    /// Create a subgroup directory inside an already-delegated cgroup.
+    ///
+    /// Unlike [`Cgroup::create`], the cgroup v2 path does not enable
+    /// controllers on any ancestor.  A newly-started systemd scope initially
+    /// contains its required process in the unit root, so writing
+    /// `cgroup.subtree_control` there would fail with `EBUSY` under the
+    /// no-internal-process rule.  Creating the leaf and moving the process are
+    /// separate operations; controllers can be enabled after the parent is
+    /// empty.
+    #[cfg(feature = "oci")]
+    pub(crate) fn create_delegated_subgroup(&self) -> Result<()> {
+        if self.v2() {
+            let path = self.hier.root().join(self.path.as_path());
+            fs::create_dir_all(path).map_err(|e| Error::with_cause(ErrorKind::FsError, e))
+        } else {
+            self.create()
+        }
+    }
+
     /// Create a new control group in the hierarchy `hier`, with name `path`.
     ///
     /// Returns a handle to the control group that can be used to manipulate it.

@@ -4,6 +4,8 @@
 
 //! Core cgroup domain model: pure types and validation.
 
+pub mod attachment;
 pub mod path;
 
+pub use attachment::AttachDestination;
 pub use path::CgroupPath;

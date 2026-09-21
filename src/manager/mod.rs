@@ -15,6 +15,7 @@ mod conv;
 
 use oci_spec::runtime::LinuxResources;
 
+pub use crate::model::AttachDestination;
 use crate::systemd::SLICE_SUFFIX;
 use crate::{CgroupPid, CgroupStats, FreezerState};
 
@@ -26,11 +27,17 @@ pub fn is_systemd_cgroup(cgroups_path: &str) -> bool {
 
 /// Manage cgroups designed for OCI containers.
 pub trait Manager: Send + Sync {
-    /// Add a process specified by its tgid.
+    /// Add a process specified by its tgid using the default destination.
     fn add_proc(&mut self, tgid: CgroupPid) -> Result<()>;
 
-    /// Add a thread specified by its pid.
+    /// Add a process specified by its tgid to an explicit attachment destination.
+    fn add_proc_to(&mut self, tgid: CgroupPid, destination: &AttachDestination) -> Result<()>;
+
+    /// Add a thread specified by its pid using the default destination.
     fn add_thread(&mut self, pid: CgroupPid) -> Result<()>;
+
+    /// Add a thread specified by its pid to an explicit attachment destination.
+    fn add_thread_to(&mut self, pid: CgroupPid, destination: &AttachDestination) -> Result<()>;
 
     /// Get the list of pids joint to the cgroups.
     fn pids(&self) -> Result<Vec<CgroupPid>>;
