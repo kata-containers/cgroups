@@ -248,6 +248,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    use crate::fs::blkio::BlkIoController;
     use crate::fs::cpuacct::CpuAcctController;
     use crate::fs::cpuset::CpuSetController;
     use crate::fs::{Controller, CpuResources, Resources};
@@ -348,6 +349,36 @@ mod tests {
         // Verify content of first file was indeed written
         let cpus_content = fs::read_to_string(&cpus_path).unwrap();
         assert_eq!(cpus_content.trim(), "0-1");
+    }
+
+    #[test]
+    fn test_blkio_apply_missing_file_fails() {
+        crate::skip_if_root!();
+
+        let ro_fixture = TestDir::new("blkio_ro_dir");
+        let ro_dir = ro_fixture.path();
+        fs::set_permissions(ro_dir, Permissions::from_mode(0o555)).unwrap();
+
+        let ro_controller = BlkIoController::new(ro_dir.clone(), ro_dir.clone(), false);
+        let mut resources = Resources::default();
+        resources.blkio.weight = Some(500);
+
+        let ro_result = ro_controller.apply(&resources);
+        assert!(
+            ro_result.is_err(),
+            "apply should fail when file cannot be created in read-only dir"
+        );
+
+        let err = ro_result.unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                ErrorKind::WriteFailed(..) | ErrorKind::PartialWriteFailed { .. }
+            ),
+            "expected write error, got {:?}",
+            err.kind()
+        );
+        assert!(err.succeeded().is_empty(), "no files should have succeeded");
     }
 
     #[test]

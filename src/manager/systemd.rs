@@ -3,9 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
-// Systemd statistics migrate to the fallible memory readers in the next PR.
-#![allow(deprecated)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -306,6 +303,10 @@ impl Manager for SystemdManager<'_> {
         self.fs_manager.stats()
     }
 
+    fn try_stats(&self) -> Result<CgroupStats> {
+        self.fs_manager.try_stats()
+    }
+
     fn paths(&self) -> &HashMap<String, String> {
         self.fs_manager.paths()
     }
@@ -577,8 +578,8 @@ mod tests {
             .unwrap();
         run_set_resources(linux_resources, |manager| {
             let controller: &MemController = controller(&manager.fs_manager);
-            let memory_stat = controller.memory_stat();
-            let memory_swap_stat = controller.memswap();
+            let memory_stat = controller.try_memory_stat().unwrap();
+            let memory_swap_stat = controller.try_memswap().unwrap();
 
             assert_eq!(memory_stat.limit_in_bytes, MEMORY_512M);
             assert_eq!(memory_swap_stat.limit_in_bytes, MEMORY_512M);
@@ -603,7 +604,7 @@ mod tests {
             .unwrap();
         run_set_resources(linux_resources, |manager| {
             let controller: &MemController = controller(&manager.fs_manager);
-            let memory_stat = controller.memory_stat();
+            let memory_stat = controller.try_memory_stat().unwrap();
             assert_eq!(memory_stat.limit_in_bytes, MEMORY_512M);
         });
     }
