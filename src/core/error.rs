@@ -223,9 +223,6 @@ pub enum ParseMembershipError {
         controller: String,
         first_line: usize,
     },
-    /// The legacy OCI string API cannot represent the parsed path.
-    #[error("invalid cgroup membership at line {line}: path {input:?} is not valid UTF-8 for the legacy OCI Manager API")]
-    LegacyPathNotUtf8 { line: usize, input: PathBuf },
 }
 
 impl ParseMembershipError {
@@ -245,8 +242,7 @@ impl ParseMembershipError {
             | Self::CurrentPathComponent { line, .. }
             | Self::NulPathComponent { line, .. }
             | Self::DuplicateHierarchyId { line, .. }
-            | Self::DuplicateController { line, .. }
-            | Self::LegacyPathNotUtf8 { line, .. } => *line,
+            | Self::DuplicateController { line, .. } => *line,
         }
     }
 }
@@ -307,9 +303,6 @@ pub enum ParseMountError {
         field: &'static str,
         input: OsString,
     },
-    /// The legacy OCI string API cannot represent the parsed mount point.
-    #[error("invalid mountinfo at line {line}: mount point {input:?} is not valid UTF-8 for the legacy OCI Manager API")]
-    LegacyMountPointNotUtf8 { line: usize, input: PathBuf },
 }
 
 impl ParseMountError {
@@ -330,8 +323,7 @@ impl ParseMountError {
             | Self::InvalidFilesystemTypeEncoding { line, .. }
             | Self::EmptyFilesystemTypeBeforeSubtype { line }
             | Self::EmptyFilesystemSubtype { line }
-            | Self::InvalidEscape { line, .. }
-            | Self::LegacyMountPointNotUtf8 { line, .. } => *line,
+            | Self::InvalidEscape { line, .. } => *line,
         }
     }
 }

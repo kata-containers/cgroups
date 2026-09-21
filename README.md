@@ -123,8 +123,12 @@ cg.delete();
   topology. The fallible `V1::try_new()`, `MountinfoError`, and
   `try_mountinfo_self()` APIs introduced during the discovery migration are
   superseded by `discover(...)` and `CoreError`; they were not in the `v0.5.1`
-  release. `is_cgroup2_unified_mode()` and `PropertiesBuilder::build()` now
-  return `CoreResult` so hierarchy-discovery failures remain diagnosable.
+  release. `is_cgroup2_unified_mode()` now returns `CoreResult` so
+  hierarchy-discovery failures remain diagnosable.
+- `PropertiesBuilder::build()` now requires the primary `CgroupVersion` and
+  returns `Vec<Property<'static>>` without discovery or other I/O. Pass
+  `topology.version()`; hybrid hosts use `CgroupVersion::V1` and
+  `BlockIOAccounting`, while unified v2 uses `IOAccounting`.
 - `ControllerSelection::All` is the default. Creation rejects `Only(vec![])`
   with `EmptyControllerSelection` and rejects unavailable names with
   `UnsupportedController { controller, path }`, replacing
@@ -145,12 +149,37 @@ cg.delete();
   kernel hierarchy constraints. Controller-state read errors and directory
   creation errors propagate for both selections. Creation and resource
   application do not roll back earlier changes when a later operation fails.
-- `oci::FsManager::new(base)` (also re-exported as `FsManager` with the `oci`
-  feature) validates `base` as a `CgroupPath`. Absolute bases and paths
-  containing `..` are rejected instead of being passed through to filesystem
-  operations; pass a validated relative base, or `""` for the hierarchy root.
-  `FsManager::subcgroup()` now returns `oci::Result<&str>` so v2 root lookup
+- With the `oci` feature, manager construction now requires explicit dependencies:
+  `FsManager::new(topology: Arc<CgroupTopology>, base: CgroupPath)` and
+  `SystemdManager::new(topology: Arc<CgroupTopology>, path: &str)`, both returning
+  `oci::Result<Self>`. Call `discover(&HostPaths::default())?` once and pass
+  clones of the returned `Arc` to share the topology. The `with_host_paths` and
+  `with_topology` constructor variants have been removed. For `FsManager`, use
+  `CgroupPath::new(base)?` or `CgroupPath::root()`; absolute bases and paths
+  containing `..` are rejected during path construction. `SystemdManager` keeps
+  the `"slice:prefix:name"` string format.
+- `Manager::paths()` is replaced by `memberships() -> &CgroupMembership`,
+  borrowing the discovery snapshot's records with their hierarchy IDs,
+  controller groups, and original path bytes. Leading `/`, namespace-relative
+  `..`, and non-UTF-8 names remain observations, not validated `CgroupPath`
+  values. The snapshot does not update after process migration.
+  `Manager::mounts()` now returns an owned `HashMap<String, PathBuf>`, computed
+  on demand from the same topology without I/O. It maps observed v1 controllers;
+  a pure unified-v2 topology returns an empty map. Manager construction no
+  longer builds string maps or rejects valid non-UTF-8 observations. The
+  `LegacyPathNotUtf8` and `LegacyMountPointNotUtf8` parser errors are removed.
+- `Manager::cgroup_path()` now returns `oci::Result<PathBuf>` and preserves
+  path bytes. Its existing coordinates remain distinct: v1 returns the selected
+  controller's process membership from the discovery snapshot; v2 returns the
+  discovered unified mount joined with the managed base, correcting the
+  hard-coded `/sys/fs/cgroup` prefix used in 0.5.1.
+- `FsManager::subcgroup()` now returns `oci::Result<&str>` so v2 root lookup
   errors propagate; use `manager.subcgroup()?`.
+- On v1, `Manager::mounts()` for both `FsManager` and `SystemdManager` now
+  selects the first matching mount in `/proc/self/mountinfo` order when a
+  controller has duplicate mounts, replacing 0.5.1's last-match behavior.
+  This matches cgroup handle selection; callers constructing paths from
+  this map may observe a different mount point or bind mount view.
 
 ## Disclaimer
 
