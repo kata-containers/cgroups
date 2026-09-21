@@ -15,7 +15,11 @@ mod conv;
 
 use oci_spec::runtime::LinuxResources;
 
-pub use crate::model::AttachDestination;
+pub use crate::model::{
+    AttachDestination, BlkIoPatch, BlockDeviceThrottle, BlockDeviceWeight, CpuPatch, CpuSetPatch,
+    DevicePatch, DeviceRule, HugePageLimit, HugePagePatch, InterfacePriority, MemoryPatch,
+    NetworkPatch, PidsPatch, ResourcePatch, Update,
+};
 use crate::systemd::SLICE_SUFFIX;
 use crate::{CgroupPid, CgroupStats, FreezerState};
 

@@ -259,6 +259,39 @@ fn segment_reason(seg: &[u8]) -> Option<PathReason> {
     }
 }
 
+/// Validate that an attribute name is a safe, single-component control file name.
+///
+/// Attribute names (such as those in `custom_attributes` / OCI `unified`) must
+/// represent a single filename within the cgroup directory. They must not be
+/// absolute paths, contain directory separators (`/`), parent components (`..`),
+/// current directory (`.`), empty components, or NUL bytes.
+pub fn validate_attribute_name(name: &str, operation: &'static str) -> CoreResult<()> {
+    let bytes = name.as_bytes();
+    let input = Path::new(name).to_path_buf();
+    if bytes.starts_with(b"/") {
+        return Err(CoreError::InvalidPath {
+            input,
+            reason: Absolute,
+            operation,
+        });
+    }
+    if let Some(reason) = segment_reason(bytes) {
+        return Err(CoreError::InvalidPath {
+            input,
+            reason,
+            operation,
+        });
+    }
+    if bytes.contains(&b'/') {
+        return Err(CoreError::InvalidPath {
+            input,
+            reason: Separator,
+            operation,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,5 +896,62 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn test_validate_attribute_name() {
+        assert!(validate_attribute_name("memory.high", "test").is_ok());
+        assert!(validate_attribute_name("cpu.weight", "test").is_ok());
+        assert!(validate_attribute_name("cgroup.subtree_control", "test").is_ok());
+
+        assert!(matches!(
+            validate_attribute_name("/tmp/file", "test"),
+            Err(CoreError::InvalidPath {
+                reason: PathReason::Absolute,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_attribute_name("../../escape", "test"),
+            Err(CoreError::InvalidPath {
+                reason: PathReason::Separator,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_attribute_name("a/b", "test"),
+            Err(CoreError::InvalidPath {
+                reason: PathReason::Separator,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_attribute_name("..", "test"),
+            Err(CoreError::InvalidPath {
+                reason: PathReason::ParentComponent,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_attribute_name(".", "test"),
+            Err(CoreError::InvalidPath {
+                reason: PathReason::CurrentComponent,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_attribute_name("", "test"),
+            Err(CoreError::InvalidPath {
+                reason: PathReason::EmptyComponent,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_attribute_name("a\0b", "test"),
+            Err(CoreError::InvalidPath {
+                reason: PathReason::NulByte,
+                ..
+            })
+        ));
     }
 }

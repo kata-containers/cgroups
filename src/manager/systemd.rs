@@ -1,4 +1,3 @@
-use crate::model::AttachDestination;
 // Copyright (c) 2025 Ant Group
 //
 // SPDX-License-Identifier: Apache-2.0 or MIT
@@ -7,13 +6,16 @@ use crate::model::AttachDestination;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use oci_spec::runtime::{LinuxCpu, LinuxMemory, LinuxPids, LinuxResources};
+use oci_spec::runtime::LinuxResources;
 use zbus::zvariant::Value as ZbusValue;
 
 use crate::discovery::{discover, CgroupTopology, CgroupVersion, HostPaths};
 use crate::manager::conv;
 use crate::manager::error::{Error, Result};
 use crate::manager::fs::{join_path, FsManager};
+use crate::model::{
+    AttachDestination, CpuPatch, CpuSetPatch, MemoryPatch, PidsPatch, ResourcePatch, Update,
+};
 use crate::systemd::props::PropertiesBuilder;
 use crate::systemd::utils::expand_slice;
 use crate::systemd::{
@@ -38,7 +40,7 @@ pub struct SystemdManager<'a> {
     systemd_client: SystemdClient<'a>,
     /// Cgroupfs manager
     fs_manager: FsManager,
-    /// Default destination
+    /// Default attachment destination for processes and threads.
     default_destination: AttachDestination,
 }
 
@@ -111,7 +113,9 @@ impl SystemdManager<'_> {
     pub fn topology(&self) -> &Arc<CgroupTopology> {
         self.fs_manager.topology()
     }
+}
 
+impl SystemdManager<'_> {
     /// Set the default attachment destination used by [`Manager::add_proc`]
     /// and [`Manager::add_thread`].
     pub fn set_default_destination(&mut self, destination: AttachDestination) {
@@ -128,9 +132,7 @@ impl SystemdManager<'_> {
     pub fn default_destination(&self) -> &AttachDestination {
         &self.default_destination
     }
-}
 
-impl SystemdManager<'_> {
     /// Get the slice name.
     pub fn slice(&self) -> &str {
         &self.slice
@@ -141,13 +143,18 @@ impl SystemdManager<'_> {
         &self.unit
     }
 
-    fn set_cpuset(&self, props: &mut Vec<Property>, linux_cpu: &LinuxCpu) -> Result<()> {
-        if let Some(cpus) = linux_cpu.cpus().as_ref() {
+    fn set_cpuset_patch(&self, props: &mut Vec<Property>, patch: &CpuSetPatch) -> Result<()> {
+        if matches!(&patch.cpus, Update::Max) || matches!(&patch.mems, Update::Max) {
+            return Err(Error::Unsupported(
+                "cpuset values do not support Update::Max".to_string(),
+            ));
+        }
+        if let Update::Set(ref cpus) = patch.cpus {
             let (id, value) = cpuset::cpus(cpus)?;
             props.push((id, value.into()));
         }
 
-        if let Some(mems) = linux_cpu.mems().as_ref() {
+        if let Update::Set(ref mems) = patch.mems {
             let (id, value) = cpuset::mems(mems)?;
             props.push((id, value.into()));
         }
@@ -155,8 +162,19 @@ impl SystemdManager<'_> {
         Ok(())
     }
 
-    fn set_cpu(&self, props: &mut Vec<Property>, linux_cpu: &LinuxCpu) -> Result<()> {
-        if let Some(shares) = linux_cpu.shares() {
+    fn set_cpu_patch(&self, props: &mut Vec<Property>, patch: &CpuPatch) -> Result<()> {
+        if !patch.realtime_runtime.is_unchanged() || !patch.realtime_period.is_unchanged() {
+            return Err(Error::Unsupported(
+                "cpu realtime scheduling is not supported by systemd manager".to_string(),
+            ));
+        }
+        if matches!(patch.shares, Update::Max) || matches!(patch.period, Update::Max) {
+            return Err(Error::Unsupported(
+                "cpu shares and period do not support Update::Max".to_string(),
+            ));
+        }
+
+        if let Update::Set(shares) = patch.shares {
             let shares = if self.v2() {
                 conv::cpu_shares_to_cgroup_v2(shares)
             } else {
@@ -166,33 +184,32 @@ impl SystemdManager<'_> {
             props.push((id, value.into()));
         }
 
-        let period = linux_cpu.period().unwrap_or(0);
-        let quota = linux_cpu.quota().unwrap_or(0);
+        let period = match patch.period {
+            Update::Set(0) => return Err(Error::InvalidArgument),
+            Update::Set(period) => Some(period),
+            Update::Unchanged => None,
+            Update::Max => unreachable!("validated above"),
+        };
 
-        if period != 0 {
+        if let Some(period) = period {
             let (id, value) = cpu::period(period)?;
             props.push((id, value.into()));
         }
 
-        if period != 0 || quota != 0 {
-            // Corresponds to USEC_INFINITY in systemd
-            let mut quota_systemd = u64::MAX;
-            let mut period = period;
-            if quota > 0 {
-                if period == 0 {
-                    period = DEFAULT_CPU_QUOTA_PERIOD;
+        if !patch.quota.is_unchanged() {
+            let quota_systemd = match patch.quota {
+                Update::Set(quota) if quota > 0 => {
+                    let period = period.unwrap_or(DEFAULT_CPU_QUOTA_PERIOD);
+                    let mut value = ((quota as u64) * s_to_us(1)) / period;
+                    if !value.is_multiple_of(ms_to_us(10)) {
+                        value = (value / ms_to_us(10) + 1) * ms_to_us(10);
+                    }
+                    value
                 }
-                // systemd converts CPUQuotaPerSecUSec (microseconds per
-                // CPU second) to CPUQuota (integer percentage of CPU)
-                // internally. This means that if a fractional percent of
-                // CPU is indicated by Resources.CpuQuota, we need to round
-                // up to the nearest 10ms (1% of a second) such that child
-                // cgroups can set the cpu.cfs_quota_us they expect.
-                quota_systemd = ((quota as u64) * s_to_us(1)) / period;
-                if quota_systemd % ms_to_us(10) != 0 {
-                    quota_systemd = (quota_systemd / ms_to_us(10) + 1) * ms_to_us(10);
-                }
-            }
+                Update::Set(_) => return Err(Error::InvalidArgument),
+                Update::Max => u64::MAX,
+                Update::Unchanged => unreachable!("checked above"),
+            };
             let (id, value) = cpu::quota(quota_systemd)?;
             props.push((id, value.into()));
         }
@@ -200,24 +217,64 @@ impl SystemdManager<'_> {
         Ok(())
     }
 
-    fn set_memory(&self, props: &mut Vec<Property>, linux_memory: &LinuxMemory) -> Result<()> {
+    fn set_memory_patch(&self, props: &mut Vec<Property>, patch: &MemoryPatch) -> Result<()> {
         let v2 = self.v2();
 
-        let mem_limit = linux_memory.limit().unwrap_or(0);
-        if mem_limit != 0 {
+        if !patch.kernel.is_unchanged()
+            || !patch.kernel_tcp.is_unchanged()
+            || !patch.swappiness.is_unchanged()
+            || !patch.disable_oom_killer.is_unchanged()
+        {
+            return Err(Error::Unsupported(
+                "kernel/tcp/swappiness/oom_killer memory settings are not supported by systemd manager".to_string(),
+            ));
+        }
+
+        if !v2 {
+            if !patch.soft_limit.is_unchanged() {
+                return Err(Error::Unsupported(
+                    "memory soft_limit is not supported on cgroup v1 by systemd manager"
+                        .to_string(),
+                ));
+            }
+            if !patch.swap.is_unchanged() {
+                return Err(Error::Unsupported(
+                    "memory swap is not supported on cgroup v1 by systemd manager".to_string(),
+                ));
+            }
+        }
+        if matches!(patch.soft_limit, Update::Max) {
+            return Err(Error::Unsupported(
+                "memory soft_limit does not support Update::Max through systemd".to_string(),
+            ));
+        }
+
+        if !patch.limit.is_unchanged() {
+            let mem_limit = match patch.limit {
+                Update::Set(v) if v >= 0 => v,
+                Update::Set(_) => return Err(Error::InvalidArgument),
+                Update::Max => -1,
+                Update::Unchanged => unreachable!("checked above"),
+            };
             let (id, value) = memory::limit(mem_limit, v2)?;
             props.push((id, value.into()));
         }
 
-        let reservation = linux_memory.reservation().unwrap_or(0);
-        if reservation != 0 && v2 {
+        if let Update::Set(reservation) = patch.soft_limit {
+            if reservation < 0 {
+                return Err(Error::InvalidArgument);
+            }
             let (id, value) = memory::low(reservation, v2)?;
             props.push((id, value.into()));
         }
 
-        let memswap_limit = linux_memory.swap().unwrap_or(0);
-        if memswap_limit != 0 && v2 {
-            let memswap_limit = conv::memory_swap_to_cgroup_v2(memswap_limit, mem_limit)?;
+        if !patch.swap.is_unchanged() {
+            let memswap_limit = match patch.swap {
+                Update::Set(v) if v >= 0 => v,
+                Update::Set(_) => return Err(Error::InvalidArgument),
+                Update::Max => -1,
+                Update::Unchanged => unreachable!("checked above"),
+            };
             let (id, value) = memory::swap(memswap_limit, v2)?;
             props.push((id, value.into()));
         }
@@ -225,12 +282,18 @@ impl SystemdManager<'_> {
         Ok(())
     }
 
-    fn set_pids(&self, props: &mut Vec<Property>, linux_pids: &LinuxPids) -> Result<()> {
-        let limit = linux_pids.limit();
-        if limit == -1 || limit > 0 {
-            let (id, value) = pids::max(limit)?;
-            props.push((id, value.into()));
+    fn set_pids_patch(&self, props: &mut Vec<Property>, patch: &PidsPatch) -> Result<()> {
+        if patch.limit.is_unchanged() {
+            return Ok(());
         }
+        let limit = match patch.limit {
+            Update::Set(v) if v >= 0 => v,
+            Update::Set(_) => return Err(Error::InvalidArgument),
+            Update::Max => -1,
+            Update::Unchanged => unreachable!("checked above"),
+        };
+        let (id, value) = pids::max(limit)?;
+        props.push((id, value.into()));
 
         Ok(())
     }
@@ -247,6 +310,57 @@ impl SystemdManager<'_> {
         let timeout_in_usec = timeout_in_sec * 1_000_000;
         let prop = (TIMEOUT_STOP_USEC, ZbusValue::U64(timeout_in_usec));
         self.systemd_client.set_properties(&[prop])?;
+        Ok(())
+    }
+
+    fn set_resources(&mut self, resources: &ResourcePatch) -> Result<()> {
+        let blkio = &resources.blkio;
+        if !blkio.weight.is_unchanged()
+            || !blkio.leaf_weight.is_unchanged()
+            || !blkio.weight_device.is_empty()
+            || !blkio.throttle_read_bps_device.is_empty()
+            || !blkio.throttle_write_bps_device.is_empty()
+            || !blkio.throttle_read_iops_device.is_empty()
+            || !blkio.throttle_write_iops_device.is_empty()
+        {
+            return Err(Error::Unsupported(
+                "blkio resources are not supported by systemd manager".to_string(),
+            ));
+        }
+
+        if !resources.hugepages.limits.is_empty() {
+            return Err(Error::Unsupported(
+                "hugetlb resources are not supported by systemd manager".to_string(),
+            ));
+        }
+
+        if !resources.network.class_id.is_unchanged() || !resources.network.priorities.is_empty() {
+            return Err(Error::Unsupported(
+                "network resources are not supported by systemd manager".to_string(),
+            ));
+        }
+
+        if !resources.devices.rules.is_empty() {
+            return Err(Error::Unsupported(
+                "devices resources are not supported by systemd manager".to_string(),
+            ));
+        }
+
+        if !resources.custom_attributes.is_empty() {
+            return Err(Error::Unsupported(
+                "custom_attributes are not supported by systemd manager".to_string(),
+            ));
+        }
+
+        let mut props = vec![];
+
+        self.set_cpuset_patch(&mut props, &resources.cpuset)?;
+        self.set_cpu_patch(&mut props, &resources.cpu)?;
+        self.set_memory_patch(&mut props, &resources.memory)?;
+        self.set_pids_patch(&mut props, &resources.pids)?;
+
+        self.systemd_client.set_properties(&props)?;
+
         Ok(())
     }
 }
@@ -349,24 +463,8 @@ impl Manager for SystemdManager<'_> {
     }
 
     fn set(&mut self, resources: &LinuxResources) -> Result<()> {
-        let mut props = vec![];
-
-        if let Some(linux_cpu) = resources.cpu() {
-            self.set_cpuset(&mut props, linux_cpu)?;
-            self.set_cpu(&mut props, linux_cpu)?;
-        }
-
-        if let Some(linux_memory) = resources.memory() {
-            self.set_memory(&mut props, linux_memory)?;
-        }
-
-        if let Some(linux_pids) = resources.pids() {
-            self.set_pids(&mut props, linux_pids)?;
-        }
-
-        self.systemd_client.set_properties(&props)?;
-
-        Ok(())
+        let patch = conv::oci_to_resource_patch(resources, self.v2())?;
+        self.set_resources(&patch)
     }
 
     fn stats(&self) -> CgroupStats {
@@ -732,7 +830,8 @@ mod tests {
 mod topology_tests {
     use super::SystemdManager;
     use crate::discovery::{CgroupTopology, CgroupVersion, HostPaths};
-    use crate::model::AttachDestination;
+    use crate::manager::conv;
+    use crate::model::{AttachDestination, MemoryPatch, PidsPatch, Update};
     use crate::CgroupPid;
     use crate::Manager;
     use std::path::PathBuf;
@@ -838,6 +937,64 @@ mod topology_tests {
     }
 
     #[test]
+    fn test_systemd_native_zero_updates_become_properties() {
+        let topology = Arc::new(CgroupTopology {
+            version: CgroupVersion::V2,
+            v2_available: true,
+            mounts: crate::discovery::MountTable::default(),
+            membership: crate::discovery::Membership::default(),
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root: PathBuf::from("/sys/fs/cgroup"),
+            hugepages: PathBuf::from("/nonexistent"),
+        });
+        let manager = SystemdManager::with_topology("test.slice:scope:unit", topology).unwrap();
+        let mut props = Vec::new();
+
+        manager
+            .set_memory_patch(
+                &mut props,
+                &MemoryPatch {
+                    limit: Update::Set(0),
+                    swap: Update::Set(0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        manager
+            .set_pids_patch(
+                &mut props,
+                &PidsPatch {
+                    limit: Update::Set(0),
+                },
+            )
+            .unwrap();
+
+        assert!(props
+            .iter()
+            .any(|(name, value)| *name == "MemoryMax"
+                && matches!(value, &zbus::zvariant::Value::U64(0))));
+        assert!(props.iter().any(|(name, value)| *name == "MemorySwapMax"
+            && matches!(value, &zbus::zvariant::Value::U64(0))));
+        assert!(props
+            .iter()
+            .any(|(name, value)| *name == "TasksMax"
+                && matches!(value, &zbus::zvariant::Value::U64(0))));
+
+        props.clear();
+        manager
+            .set_memory_patch(
+                &mut props,
+                &MemoryPatch {
+                    swap: Update::Set(4096),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(props.iter().any(|(name, value)| *name == "MemorySwapMax"
+            && matches!(value, &zbus::zvariant::Value::U64(4096))));
+    }
+
+    #[test]
     fn test_systemd_add_thread_unsupported() {
         let topology = Arc::new(CgroupTopology {
             version: CgroupVersion::V2,
@@ -863,5 +1020,143 @@ mod topology_tests {
             }
             other => panic!("expected Unsupported error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_systemd_set_resources_unsupported() {
+        use crate::manager::error::Error;
+        use crate::model::{ResourcePatch, Update};
+
+        let topology = Arc::new(CgroupTopology {
+            version: CgroupVersion::V2,
+            v2_available: true,
+            mounts: crate::discovery::MountTable::default(),
+            membership: crate::discovery::Membership::default(),
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root: PathBuf::from("/sys/fs/cgroup"),
+            hugepages: PathBuf::from("/nonexistent"),
+        });
+
+        let mut manager = SystemdManager::with_topology("test.slice:scope:unit", topology).unwrap();
+
+        // blkio weight
+        let mut patch = ResourcePatch::default();
+        patch.blkio.weight = Update::Set(500);
+        assert!(
+            matches!(manager.set_resources(&patch), Err(Error::Unsupported(ref msg)) if msg.contains("blkio"))
+        );
+
+        // hugetlb
+        let mut patch = ResourcePatch::default();
+        patch.hugepages.limits.push(crate::model::HugePageLimit {
+            page_size: "2MB".to_string(),
+            limit: 1024,
+        });
+        assert!(
+            matches!(manager.set_resources(&patch), Err(Error::Unsupported(ref msg)) if msg.contains("hugetlb"))
+        );
+
+        // network
+        let mut patch = ResourcePatch::default();
+        patch.network.class_id = Update::Set(10);
+        assert!(
+            matches!(manager.set_resources(&patch), Err(Error::Unsupported(ref msg)) if msg.contains("network"))
+        );
+
+        // devices
+        let mut patch = ResourcePatch::default();
+        patch.devices.rules.push(crate::model::DeviceRule {
+            allow: true,
+            dev_type: Some('c'),
+            major: Some(1),
+            minor: Some(3),
+            access: "r".to_string(),
+        });
+        assert!(
+            matches!(manager.set_resources(&patch), Err(Error::Unsupported(ref msg)) if msg.contains("devices"))
+        );
+
+        // custom attributes
+        let mut patch = ResourcePatch::default();
+        patch
+            .custom_attributes
+            .insert("cgroup.procs".to_string(), "1".to_string());
+        assert!(
+            matches!(manager.set_resources(&patch), Err(Error::Unsupported(ref msg)) if msg.contains("custom_attributes"))
+        );
+
+        // realtime cpu
+        let mut patch = ResourcePatch::default();
+        patch.cpu.realtime_runtime = Update::Set(1000);
+        assert!(
+            matches!(manager.set_resources(&patch), Err(Error::Unsupported(ref msg)) if msg.contains("realtime"))
+        );
+
+        // kernel memory
+        let mut patch = ResourcePatch::default();
+        patch.memory.kernel = Update::Set(1024);
+        assert!(
+            matches!(manager.set_resources(&patch), Err(Error::Unsupported(ref msg)) if msg.contains("kernel"))
+        );
+    }
+
+    #[test]
+    fn test_systemd_set_resources_v1_memory_unsupported() {
+        use crate::manager::error::Error;
+        use crate::model::{ResourcePatch, Update};
+
+        let topology = Arc::new(CgroupTopology {
+            version: CgroupVersion::V1,
+            v2_available: false,
+            mounts: crate::discovery::MountTable::default(),
+            membership: crate::discovery::Membership::default(),
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root: PathBuf::from("/sys/fs/cgroup"),
+            hugepages: PathBuf::from("/nonexistent"),
+        });
+
+        let mut manager = SystemdManager::with_topology("test.slice:scope:unit", topology).unwrap();
+
+        // soft limit on v1
+        let mut patch = ResourcePatch::default();
+        patch.memory.soft_limit = Update::Set(1024);
+        assert!(
+            matches!(manager.set_resources(&patch), Err(Error::Unsupported(ref msg)) if msg.contains("soft_limit"))
+        );
+
+        // swap on v1
+        let mut patch = ResourcePatch::default();
+        patch.memory.swap = Update::Set(2048);
+        assert!(
+            matches!(manager.set_resources(&patch), Err(Error::Unsupported(ref msg)) if msg.contains("swap"))
+        );
+    }
+
+    #[test]
+    fn test_systemd_v1_unlimited_memory_does_not_synthesize_swap() {
+        use oci_spec::runtime::{LinuxMemoryBuilder, LinuxResourcesBuilder};
+
+        let topology = Arc::new(CgroupTopology {
+            version: CgroupVersion::V1,
+            v2_available: false,
+            mounts: crate::discovery::MountTable::default(),
+            membership: crate::discovery::Membership::default(),
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root: PathBuf::from("/sys/fs/cgroup"),
+            hugepages: PathBuf::from("/nonexistent"),
+        });
+        let manager = SystemdManager::with_topology("test.slice:scope:unit", topology).unwrap();
+        let resources = LinuxResourcesBuilder::default()
+            .memory(LinuxMemoryBuilder::default().limit(-1i64).build().unwrap())
+            .build()
+            .unwrap();
+        let patch = conv::oci_to_resource_patch(&resources, false).unwrap();
+        let mut props = Vec::new();
+
+        manager.set_memory_patch(&mut props, &patch.memory).unwrap();
+
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].0, "MemoryLimit");
+        assert!(matches!(&props[0].1, zbus::zvariant::Value::U64(u64::MAX)));
     }
 }
