@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
+// Systemd statistics migrate to the fallible memory readers in the next PR.
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

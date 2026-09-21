@@ -19,7 +19,7 @@ use crate::fs::{parse_max_value, read_i64_from, read_u64_from};
 
 use crate::fs::{
     ControllIdentifier, ControllerInternal, Controllers, CpuResources, CustomizedAttribute,
-    MaxValue, Resources, Subsystem,
+    MaxValue, Resources, Subsystem, UpdateTracker,
 };
 
 /// A controller that allows controlling the `cpu` subsystem of a Cgroup.
@@ -35,7 +35,7 @@ pub struct CpuController {
 }
 
 /// The current state of the control group and its processes.
-#[derive(Debug)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cpu {
     /// Reports CPU time statistics.
@@ -74,14 +74,35 @@ impl ControllerInternal for CpuController {
     fn apply(&self, res: &Resources) -> Result<()> {
         // get the resources that apply to this controller
         let res: &CpuResources = &res.cpu;
+        let mut tracker = UpdateTracker::new();
 
-        update_and_test!(self, set_shares, res.shares, shares);
-        update_and_test!(self, set_cfs_period, res.period, cfs_period);
-        update_and_test!(self, set_cfs_quota, res.quota, cfs_quota);
+        tracker.step_opt("cpu.shares", res.shares, |shares| {
+            self.set_shares(shares)?;
+            if self.shares()? != shares {
+                return Err(Error::new(Other));
+            }
+            Ok(())
+        })?;
 
-        res.attrs.iter().for_each(|(k, v)| {
-            let _ = self.set(k, v);
-        });
+        tracker.step_opt("cpu.cfs_period_us", res.period, |period| {
+            self.set_cfs_period(period)?;
+            if self.cfs_period()? != period {
+                return Err(Error::new(Other));
+            }
+            Ok(())
+        })?;
+
+        tracker.step_opt("cpu.cfs_quota_us", res.quota, |quota| {
+            self.set_cfs_quota(quota)?;
+            if self.cfs_quota()? != quota {
+                return Err(Error::new(Other));
+            }
+            Ok(())
+        })?;
+
+        for (k, v) in &res.attrs {
+            tracker.step(k, || self.set(k, v))?;
+        }
 
         // TODO: rt properties (CONFIG_RT_GROUP_SCHED) are not yet supported
 
@@ -121,20 +142,32 @@ impl CpuController {
     }
 
     /// Returns CPU time statistics based on the processes in the control group.
+    #[deprecated(note = "use `try_cpu` instead")]
     pub fn cpu(&self) -> Cpu {
         Cpu {
             stat: self
                 .open_path("cpu.stat", false)
                 .and_then(|mut file| {
-                    let mut s = String::new();
-                    let res = file.read_to_string(&mut s);
-                    match res {
-                        Ok(_) => Ok(s),
-                        Err(e) => Err(Error::with_cause(ReadFailed("cpu.stat".to_string()), e)),
-                    }
+                    let mut value = String::new();
+                    file.read_to_string(&mut value)
+                        .map(|_| value)
+                        .map_err(|e| Error::with_cause(ReadFailed("cpu.stat".to_string()), e))
                 })
                 .unwrap_or_default(),
         }
+    }
+
+    /// Returns CPU time statistics based on the processes in the control group, or an error if reading failed.
+    pub fn try_cpu(&self) -> Result<Cpu> {
+        let stat = self.open_path("cpu.stat", false).and_then(|mut file| {
+            let mut s = String::new();
+            let res = file.read_to_string(&mut s);
+            match res {
+                Ok(_) => Ok(s),
+                Err(e) => Err(Error::with_cause(ReadFailed("cpu.stat".to_string()), e)),
+            }
+        })?;
+        Ok(Cpu { stat })
     }
 
     /// Configures the CPU bandwidth (in relative relation to other control groups and this control

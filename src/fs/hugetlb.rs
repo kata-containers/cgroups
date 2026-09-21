@@ -18,6 +18,7 @@ use crate::fs::{flat_keyed_to_vec, read_u64_from};
 
 use crate::fs::{
     ControllIdentifier, ControllerInternal, Controllers, HugePageResources, Resources, Subsystem,
+    UpdateTracker,
 };
 
 /// A controller that allows controlling the `hugetlb` subsystem of a Cgroup.
@@ -53,12 +54,17 @@ impl ControllerInternal for HugeTlbController {
     fn apply(&self, res: &Resources) -> Result<()> {
         // get the resources that apply to this controller
         let res: &HugePageResources = &res.hugepages;
+        let mut tracker = UpdateTracker::new();
 
         for i in &res.limits {
-            let _ = self.set_limit_in_bytes(&i.size, i.limit);
-            if self.limit_in_bytes(&i.size)? != i.limit {
-                return Err(Error::new(Other));
-            }
+            let name = format!("hugetlb.{}.limit_in_bytes", i.size);
+            tracker.step(&name, || {
+                self.set_limit_in_bytes(&i.size, i.limit)?;
+                if self.limit_in_bytes(&i.size)? != i.limit {
+                    return Err(Error::new(Other));
+                }
+                Ok(())
+            })?;
         }
 
         Ok(())
