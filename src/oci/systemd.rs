@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use oci_spec::runtime::{LinuxCpu, LinuxMemory, LinuxPids, LinuxResources};
 use zbus::zvariant::Value as ZbusValue;
 
-use crate::manager::conv;
-use crate::manager::error::{Error, Result};
-use crate::manager::fs::{join_path, FsManager};
+use crate::oci::conv;
+use crate::oci::error::{Error, Result};
+use crate::oci::fs::{join_path, FsManager};
 use crate::systemd::props::PropertiesBuilder;
 use crate::systemd::utils::expand_slice;
 use crate::systemd::{
@@ -347,8 +347,8 @@ mod tests {
     use crate::fs::cpu::CpuController;
     use crate::fs::memory::MemController;
     use crate::fs::{ControllIdentifier, Controller, Subsystem};
-    use crate::manager::systemd::*;
-    use crate::manager::tests::{MEMORY_1G, MEMORY_2G, MEMORY_512M};
+    use crate::oci::systemd::*;
+    use crate::oci::tests::{MEMORY_1G, MEMORY_2G, MEMORY_512M};
     use crate::tests::spawn_sleep_inf;
     use crate::{skip_if_cgroups_v1, skip_if_cgroups_v2, skip_if_no_systemd, skip_if_not_root};
 

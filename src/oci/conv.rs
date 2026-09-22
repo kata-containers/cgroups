@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
-use crate::manager::error::{Error, Result};
+use crate::oci::error::{Error, Result};
 use crate::{CPU_SHARES_V1_MAX, CPU_WEIGHT_V2_MAX};
 
 // Converts CPU shares, used by cgroup v1, to CPU weight, used by cgroup
@@ -70,7 +70,7 @@ pub(crate) fn memory_swap_to_cgroup_v2(memswap_limit: i64, mem_limit: i64) -> Re
 
 #[cfg(test)]
 mod tests {
-    use crate::manager::conv::*;
+    use crate::oci::conv::*;
 
     #[test]
     fn test_cpu_shares_to_cgroup_v2() {

@@ -88,8 +88,8 @@ run_test "${library_test}"
 
 # This ignored canary depends on the guest's controlled cgroup hierarchy, not
 # on root privileges, so keep its environment requirement explicit.
-require_test "${library_test}" manager::fs::parse_tests::test_live_mountinfo_canary
-run_test "${library_test}" manager::fs::parse_tests::test_live_mountinfo_canary --exact --ignored
+require_test "${library_test}" oci::fs::parse_tests::test_live_mountinfo_canary
+run_test "${library_test}" oci::fs::parse_tests::test_live_mountinfo_canary --exact --ignored
 
 for test_binary in "${integration_tests[@]}"; do
     run_test "${test_binary}"
