@@ -77,6 +77,9 @@ check: fmt clippy
 fmt:
 	cargo fmt --all -- --check
 
+# All-target builds enable fixture dev-dependencies; lint the library alone
+# in the second pass to also check the build with fixtures disabled.
 .PHONY: clippy
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --lib --no-default-features -- -D warnings
