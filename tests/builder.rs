@@ -5,8 +5,8 @@
 //
 
 //! Some simple tests covering the builder pattern for control groups.
+use cgroups_rs::core::CgroupPath;
 use cgroups_rs::fs::blkio::*;
-use cgroups_rs::fs::cgroup_builder::*;
 use cgroups_rs::fs::cpu::*;
 use cgroups_rs::fs::devices::*;
 use cgroups_rs::fs::hugetlb::*;
@@ -19,13 +19,13 @@ use cgroups_rs::fs::*;
 pub fn test_cpu_res_build() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg: Cgroup = CgroupBuilder::new("test_cpu_res_build")
-        .cpu()
-        .shares(85)
-        .done()
-        .build(h)
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::builder(h, CgroupPath::new("test_cpu_res_build").unwrap())
+        .create()
         .unwrap();
+    let mut resources = Resources::default();
+    resources.cpu.shares = Some(85);
+    cg.apply(&resources).unwrap();
 
     {
         let cpu: &CpuController = cg.controller_of().unwrap();
@@ -40,15 +40,15 @@ pub fn test_cpu_res_build() {
 pub fn test_memory_res_build() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg: Cgroup = CgroupBuilder::new("test_memory_res_build")
-        .memory()
-        .kernel_memory_limit(128 * 1024 * 1024)
-        .swappiness(70)
-        .memory_hard_limit(1024 * 1024 * 1024)
-        .done()
-        .build(h)
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::builder(h, CgroupPath::new("test_memory_res_build").unwrap())
+        .create()
         .unwrap();
+    let mut resources = Resources::default();
+    resources.memory.kernel_memory_limit = Some(128 * 1024 * 1024);
+    resources.memory.swappiness = Some(70);
+    resources.memory.memory_hard_limit = Some(1024 * 1024 * 1024);
+    cg.apply(&resources).unwrap();
 
     {
         let c: &MemController = cg.controller_of().unwrap();
@@ -67,13 +67,13 @@ pub fn test_memory_res_build() {
 pub fn test_pid_res_build() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg: Cgroup = CgroupBuilder::new("test_pid_res_build")
-        .pid()
-        .maximum_number_of_processes(MaxValue::Value(123))
-        .done()
-        .build(h)
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::builder(h, CgroupPath::new("test_pid_res_build").unwrap())
+        .create()
         .unwrap();
+    let mut resources = Resources::default();
+    resources.pid.maximum_number_of_processes = Some(MaxValue::Value(123));
+    cg.apply(&resources).unwrap();
 
     {
         let c: &PidController = cg.controller_of().unwrap();
@@ -89,13 +89,19 @@ pub fn test_pid_res_build() {
 pub fn test_devices_res_build() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg: Cgroup = CgroupBuilder::new("test_devices_res_build")
-        .devices()
-        .device(1, 6, DeviceType::Char, true, vec![DevicePermissions::Read])
-        .done()
-        .build(h)
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::builder(h, CgroupPath::new("test_devices_res_build").unwrap())
+        .create()
         .unwrap();
+    let mut resources = Resources::default();
+    resources.devices.devices.push(DeviceResource {
+        allow: true,
+        devtype: DeviceType::Char,
+        major: 1,
+        minor: 6,
+        access: vec![DevicePermissions::Read],
+    });
+    cg.apply(&resources).unwrap();
 
     {
         let c: &DevicesController = cg.controller_of().unwrap();
@@ -119,13 +125,13 @@ pub fn test_network_res_build() {
     cgroups_rs::skip_if_not_root!();
     cgroups_rs::skip_if_cgroups_v2!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg: Cgroup = CgroupBuilder::new("test_network_res_build")
-        .network()
-        .class_id(1337)
-        .done()
-        .build(h)
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::builder(h, CgroupPath::new("test_network_res_build").unwrap())
+        .create()
         .unwrap();
+    let mut resources = Resources::default();
+    resources.network.class_id = Some(1337);
+    cg.apply(&resources).unwrap();
 
     {
         let c: &NetClsController = cg.controller_of().unwrap();
@@ -140,13 +146,16 @@ pub fn test_hugepages_res_build() {
     cgroups_rs::skip_if_not_root!();
     cgroups_rs::skip_if_cgroups_v2!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg: Cgroup = CgroupBuilder::new("test_hugepages_res_build")
-        .hugepages()
-        .limit("2MB".to_string(), 4 * 2 * 1024 * 1024)
-        .done()
-        .build(h)
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::builder(h, CgroupPath::new("test_hugepages_res_build").unwrap())
+        .create()
         .unwrap();
+    let mut resources = Resources::default();
+    resources.hugepages.limits.push(HugePageResource {
+        size: "2MB".to_string(),
+        limit: 4 * 2 * 1024 * 1024,
+    });
+    cg.apply(&resources).unwrap();
 
     {
         let c: &HugeTlbController = cg.controller_of().unwrap();
@@ -161,13 +170,13 @@ pub fn test_hugepages_res_build() {
 pub fn test_blkio_res_build() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg: Cgroup = CgroupBuilder::new("test_blkio_res_build")
-        .blkio()
-        .weight(100)
-        .done()
-        .build(h)
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::builder(h, CgroupPath::new("test_blkio_res_build").unwrap())
+        .create()
         .unwrap();
+    let mut resources = Resources::default();
+    resources.blkio.weight = Some(100);
+    cg.apply(&resources).unwrap();
 
     {
         let c: &BlkIoController = cg.controller_of().unwrap();

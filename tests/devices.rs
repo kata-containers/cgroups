@@ -6,6 +6,7 @@
 
 //! Integration tests about the devices subsystem
 
+use cgroups_rs::core::CgroupPath;
 use cgroups_rs::fs::devices::{DevicePermissions, DeviceType, DevicesController};
 use cgroups_rs::fs::{Cgroup, DeviceResource};
 
@@ -14,8 +15,8 @@ fn test_devices_parsing() {
     cgroups_rs::skip_if_not_root!();
     cgroups_rs::skip_if_cgroups_v2!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("test_devices_parsing")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("test_devices_parsing").unwrap()).unwrap();
     {
         let devices: &DevicesController = cg.controller_of().unwrap();
 

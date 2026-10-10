@@ -42,11 +42,9 @@ macro_rules! skip_if_not_root {
 #[macro_export]
 macro_rules! skip_if_cgroups_v1 {
     () => {
-        match $crate::fs::hierarchies::is_cgroup2_unified_mode_with_paths(
-            &$crate::core::discovery::HostPaths::default(),
-        ) {
-            Ok(true) => {} // unified v2 — proceed
-            Ok(false) => {
+        match $crate::core::discover(&$crate::core::discovery::HostPaths::default()) {
+            Ok(topology) if topology.version() == $crate::core::CgroupVersion::V2 => {}
+            Ok(_) => {
                 eprintln!("Skipping test in cgroups v1 mode");
                 return;
             }
@@ -66,11 +64,9 @@ macro_rules! skip_if_cgroups_v1 {
 #[macro_export]
 macro_rules! skip_if_cgroups_v2 {
     () => {
-        match $crate::fs::hierarchies::is_cgroup2_unified_mode_with_paths(
-            &$crate::core::discovery::HostPaths::default(),
-        ) {
-            Ok(false) => {} // v1 or hybrid — proceed
-            Ok(true) => {
+        match $crate::core::discover(&$crate::core::discovery::HostPaths::default()) {
+            Ok(topology) if topology.version() == $crate::core::CgroupVersion::V1 => {}
+            Ok(_) => {
                 eprintln!("Skipping test in cgroups v2 mode");
                 return;
             }
@@ -109,6 +105,7 @@ pub mod tests {
             fs::write(root.join("proc/self/mountinfo"), mountinfo).unwrap();
             fs::write(root.join("proc/self/cgroup"), membership).unwrap();
             fs::write(root.join("cgroup/cgroup.controllers"), controllers).unwrap();
+            fs::write(root.join("cgroup/cgroup.subtree_control"), b"").unwrap();
             let paths = crate::core::HostPaths::new(root.join("proc"), root.join("hugepages"))
                 .with_fixture_root(root.join("cgroup"));
             let topology = crate::core::discover(&paths).unwrap();

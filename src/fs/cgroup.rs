@@ -10,8 +10,9 @@ use crate::fs::error::ErrorKind::*;
 use crate::fs::error::*;
 
 use crate::core::CgroupPath;
-use crate::fs::hierarchies::V1;
-use crate::fs::{CgroupPid, ControllIdentifier, Controller, Hierarchy, Resources, Subsystem};
+use crate::fs::{
+    CgroupPid, CgroupReader, ControllIdentifier, Controller, Hierarchy, Resources, Subsystem,
+};
 
 use std::collections::HashMap;
 use std::convert::From;
@@ -25,6 +26,42 @@ pub const CGROUP_MODE_DOMAIN: &str = "domain";
 pub const CGROUP_MODE_DOMAIN_THREADED: &str = "domain threaded";
 pub const CGROUP_MODE_DOMAIN_INVALID: &str = "domain invalid";
 pub const CGROUP_MODE_THREADED: &str = "threaded";
+
+/// The controllers managed by a cgroup handle.
+///
+/// This selection does not describe every controller the kernel has enabled
+/// for the cgroup. Selecting fewer controllers does not disable other
+/// controllers enabled by the parent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ControllerSelection {
+    /// Manage every controller reported by the hierarchy.
+    ///
+    /// On v2, creation tries available controllers one by one in each
+    /// ancestor, ignoring individual enabling write errors. Each level's
+    /// current `cgroup.controllers` determines which controllers are offered.
+    /// Controller-state read and directory-creation errors still propagate.
+    #[default]
+    All,
+    /// Manage only the named controllers.
+    ///
+    /// Names use the hierarchy's kernel spelling, such as `blkio` on v1 and
+    /// `io` on v2. On v2, `freezer` selects the core freezing interface and
+    /// is never enabled through `cgroup.subtree_control`.
+    /// Creation requires every selected resource controller to be available
+    /// through the target and propagates controller-enabling write errors.
+    ///
+    /// An empty list loads a handle with no subsystems, but creation rejects
+    /// it with [`ErrorKind::EmptyControllerSelection`].
+    Only(Vec<String>),
+}
+
+fn selection_controller_name(subsystem: &Subsystem, v2: bool) -> String {
+    if v2 && matches!(subsystem, Subsystem::BlkIo(_)) {
+        "io".to_string()
+    } else {
+        subsystem.controller_name()
+    }
+}
 
 /// A control group is the central structure to this crate.
 ///
@@ -45,48 +82,143 @@ pub struct Cgroup {
 
     /// The hierarchy.
     hier: Arc<dyn Hierarchy>,
+    /// The managed path beneath the v1 prefixes or the unified v2 mount.
     path: CgroupPath,
-    /// Pre-rendered lossy string representation of `path` to satisfy the
-    /// legacy `fn path(&self) -> &str` borrow without per-call allocation.
-    /// Slated for deprecation and removal in Phase 2 in favor of [`CgroupPath`].
-    path_str: String,
 
-    /// List of controllers specifically enabled in the control group.
-    specified_controllers: Option<Vec<String>>,
+    /// The controllers managed by this handle.
+    controllers: ControllerSelection,
 
-    /// Topology snapshot from host discovery, if available.
-    pub(crate) topology: Option<Arc<CgroupTopology>>,
+    /// Prefixes beneath each v1 controller's mount, keyed by
+    /// [`Subsystem::controller_name`]. Each prefix is prepended to `path` and
+    /// bounds parent traversal when `path` is empty. Ignored on v2.
+    v1_prefixes: HashMap<String, CgroupPath>,
 }
 
 /// Cloning preserves the hierarchy snapshot and the full selection
 /// state: the underlying topology is shared through `Arc` instead of
-/// re-discovered, and `specified_controllers` is carried over, so a
-/// clone behaves identically to the original.
+/// re-discovered, and controller selection and v1 path prefixes are carried
+/// over, so a clone behaves identically to the original.
 impl Clone for Cgroup {
     fn clone(&self) -> Self {
         Cgroup {
             subsystems: self.subsystems.clone(),
             hier: self.hier.clone(),
             path: self.path.clone(),
-            path_str: self.path_str.clone(),
-            specified_controllers: self.specified_controllers.clone(),
-            topology: self.topology.clone(),
+            controllers: self.controllers.clone(),
+            v1_prefixes: self.v1_prefixes.clone(),
         }
     }
 }
 
-impl Default for Cgroup {
-    fn default() -> Self {
-        let hier: Arc<dyn Hierarchy> = crate::fs::hierarchies::auto().into();
-        let topology = hier.topology();
-        Cgroup {
-            subsystems: Vec::new(),
-            hier,
-            path: CgroupPath::root().unwrap(),
-            path_str: String::new(),
-            specified_controllers: None,
-            topology,
-        }
+/// Configure a cgroup handle before loading it or creating its directories.
+///
+/// Finish with [`Self::load`], [`Self::try_load`], or [`Self::create`]. Configure
+/// resource limits separately using [`Resources`] and [`Cgroup::apply`].
+/// On v1, [`Self::v1_prefixes`] sets each controller's base directory; `path`
+/// names cgroups beneath those bases. On v2, `path` is relative to the unified
+/// mount and v1 prefixes are ignored.
+pub struct CgroupBuilder {
+    hier: Arc<dyn Hierarchy>,
+    /// The managed path beneath the v1 prefixes or the unified v2 mount.
+    path: CgroupPath,
+    controllers: ControllerSelection,
+    /// Prefixes beneath each v1 controller's mount, keyed by
+    /// [`Subsystem::controller_name`]. Each prefix is prepended to `path` and
+    /// bounds parent traversal when `path` is empty. Ignored on v2.
+    v1_prefixes: HashMap<String, CgroupPath>,
+}
+
+impl CgroupBuilder {
+    /// Which controllers this handle manages. Defaults to every controller
+    /// the hierarchy reports.
+    ///
+    /// [`ControllerSelection::Only`] restricts the handle and, on v2, limits
+    /// what creation enables in the ancestors' `cgroup.subtree_control` files.
+    /// It does not disable controllers already enabled by the parent. This
+    /// matters for threaded cgroups, whose subtree cannot enable domain
+    /// controllers. Selecting threaded controllers does not itself change
+    /// `cgroup.type` or remove existing domain controllers.
+    ///
+    /// The selection applies at every path, including the root. Loading an
+    /// empty selection yields no subsystems; creation rejects it before any
+    /// filesystem changes. Unavailable names are rejected by
+    /// [`Self::try_load`] and creation.
+    pub fn controllers(mut self, selection: ControllerSelection) -> Self {
+        self.controllers = selection;
+        self
+    }
+
+    /// Set per-controller v1 prefixes to prepend to the managed `path`.
+    ///
+    /// Keys are controller names returned by [`Subsystem::controller_name`].
+    /// For controller `c`, the directory is
+    /// `<mount of c>/<v1_prefixes[c]>/<path>` when a prefix is set, otherwise
+    /// `<mount of c>/<path>`. Prefixes default to an empty map. On v2 the map
+    /// is ignored: the directory is always `<unified mount>/<path>`.
+    ///
+    /// Use prefixes for where the process already lives in each v1 hierarchy,
+    /// derived from `/proc/<pid>/cgroup` and expressed relative to the visible
+    /// controller mount. Put cgroups the caller creates in `path`.
+    /// [`CgroupReader::memberships`] returns raw procfs observations, which
+    /// require explicit conversion before use as prefixes; see that method's
+    /// documentation.
+    ///
+    /// Each prefix is a boundary for [`Cgroup::parent`]: traversal changes only
+    /// `path` and stops when it is empty, even if a prefix has more parents.
+    /// [`Cgroup::remove_task`] and [`Cgroup::remove_task_by_tgid`] move tasks
+    /// back to these prefixes.
+    /// The caller chooses the split between prefix and path; the filesystem
+    /// cannot recover it. For example, prefix `kubepods/pod1` with path `ctr1`
+    /// and prefix `kubepods` with path `pod1/ctr1` reach the same directory.
+    /// The first handle can walk up only to `kubepods/pod1`; the second can
+    /// continue to `kubepods`.
+    pub fn v1_prefixes(mut self, prefixes: HashMap<String, CgroupPath>) -> Self {
+        self.v1_prefixes = prefixes;
+        self
+    }
+
+    /// Construct the handle without creating or checking its directories.
+    ///
+    /// Unavailable controller names are silently filtered out. Use
+    /// [`Self::try_load`] to reject them; creation also validates names before
+    /// making filesystem changes.
+    pub fn load(self) -> Cgroup {
+        Cgroup::load_internal(self.hier, self.path, self.controllers, self.v1_prefixes)
+    }
+
+    /// Construct a handle after validating the requested controller names.
+    ///
+    /// Returns [`ErrorKind::UnsupportedController`] for any name the hierarchy
+    /// does not report. Built-in hierarchies use their topology snapshot; this
+    /// name validation adds no filesystem I/O. It does not check directory
+    /// existence, permissions, or current controller availability at the target.
+    /// `Only(Vec::new())` is valid here and loads a handle with no subsystems;
+    /// creation still rejects it.
+    ///
+    /// ```no_run
+    /// use cgroups_rs::core::CgroupPath;
+    /// use cgroups_rs::fs::{hierarchies, Cgroup, ControllerSelection};
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let hierarchy = hierarchies::auto()?;
+    /// let cgroup = Cgroup::builder(hierarchy, CgroupPath::new("workloads/a")?)
+    ///     .controllers(ControllerSelection::Only(vec!["cpu".to_string()]))
+    ///     .try_load()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_load(self) -> Result<Cgroup> {
+        let cgroup = self.load();
+        cgroup.validate_controller_selection()?;
+        Ok(cgroup)
+    }
+
+    /// Construct the handle and create its cgroup directories.
+    ///
+    /// See [`Cgroup::create`] for controller validation and failure semantics.
+    pub fn create(self) -> Result<Cgroup> {
+        let cgroup = self.load();
+        cgroup.create()?;
+        Ok(cgroup)
     }
 }
 
@@ -95,50 +227,59 @@ impl Cgroup {
         self.hier.v2()
     }
 
-    /// Return the topology snapshot held by this control group, if available.
+    /// Return the topology snapshot supplied by this control group's hierarchy, if available.
     pub fn topology(&self) -> Option<Arc<CgroupTopology>> {
-        self.topology.clone()
+        self.hier.topology()
     }
 
-    /// Return the path the cgroup is located at as a string slice.
-    pub fn path(&self) -> &str {
-        &self.path_str
+    /// Reuse the handle's hierarchy for related OCI manager operations.
+    #[cfg(feature = "oci")]
+    pub(crate) fn hierarchy(&self) -> &Arc<dyn Hierarchy> {
+        &self.hier
     }
 
-    /// Return the path the cgroup is located at as a `&Path`.
-    pub fn as_path(&self) -> &Path {
-        self.path.as_path()
-    }
-
-    /// Return the path as a string slice if it is valid UTF-8.
-    pub fn path_str(&self) -> Option<&str> {
-        self.path.as_path().to_str()
-    }
-
-    /// Return the validated [`CgroupPath`] for this control group.
-    pub fn cgroup_path(&self) -> &CgroupPath {
+    /// Borrow the validated path relative to this control group's hierarchy root.
+    ///
+    /// The root path is the boundary for parent traversal. On v1 this excludes
+    /// per-controller prefixes: each controller directory is
+    /// `<mount>/<prefix>/<path>`.
+    pub fn path(&self) -> &CgroupPath {
         &self.path
     }
 
     /// Create this control group.
+    ///
+    /// Rejects an explicitly empty selection or names absent from the
+    /// hierarchy before making filesystem changes. On v2, reads each
+    /// ancestor's current `cgroup.controllers` and `cgroup.subtree_control`,
+    /// writing only selected resource controllers that are available but not
+    /// already enabled.
+    /// `Only` requires every selected resource controller to be available,
+    /// including at the target, and propagates enabling write errors. `All`
+    /// tries the available subset of the hierarchy's discovered controllers
+    /// one by one at each level, ignoring individual enabling write errors.
+    /// A non-root target's own `cgroup.subtree_control` is left unchanged;
+    /// an explicit root handle enables controllers at that root.
+    ///
+    /// Controller-state read errors and directory-creation errors propagate
+    /// for both selections. A later failure can leave earlier directories or
+    /// controller settings in place.
     pub fn create(&self) -> Result<()> {
+        if let ControllerSelection::Only(controllers) = &self.controllers {
+            if controllers.is_empty() {
+                return Err(Error::new(EmptyControllerSelection {
+                    path: self.path.as_path().to_path_buf(),
+                }));
+            }
+        }
+        self.validate_controller_selection()?;
         if self.hier.v2() {
-            let hier_topo;
-            let topo_ref = match self.topology.as_deref() {
-                Some(t) => Some(t),
-                None => {
-                    hier_topo = self.hier.topology();
-                    if hier_topo.is_none() {
-                        log::warn!("cgroup hierarchy has no topology snapshot; falling back to dynamic controllers read");
-                    }
-                    hier_topo.as_deref()
-                }
-            };
+            let topology = self.topology();
             create_v2_cgroup(
-                self.hier.root(),
+                self.hier.root()?,
                 &self.path,
-                &self.specified_controllers,
-                topo_ref,
+                &self.controllers,
+                topology.as_deref(),
             )
         } else {
             self.subsystems
@@ -148,249 +289,119 @@ impl Cgroup {
         }
     }
 
-    /// Create a new control group in the hierarchy `hier`, with name `path`.
+    /// Create a control group at a validated relative path.
     ///
-    /// Returns a handle to the control group that can be used to manipulate it.
-    pub fn new<P: AsRef<Path>>(hier: Box<dyn Hierarchy>, path: P) -> Result<Cgroup> {
-        let cpath = parse_cgroup_path(path).map_err(|e| Error::with_cause(InvalidPath, e))?;
-        Self::new_validated(hier, cpath)
+    /// The hierarchy is shared with other handles. Filesystem and kernel
+    /// creation errors still propagate even though the path is already valid.
+    pub fn new(hier: Arc<dyn Hierarchy>, path: CgroupPath) -> Result<Cgroup> {
+        Self::builder(hier, path).create()
     }
 
-    /// Create a new control group in the hierarchy `hier`, with name `path`.
+    /// Construct a handle at a validated relative path without creating it.
     ///
-    /// Returns a handle to the control group that can be used to manipulate it.
-    pub fn new_with_specified_controllers<P: AsRef<Path>>(
-        hier: Box<dyn Hierarchy>,
-        path: P,
-        specified_controllers: Option<Vec<String>>,
-    ) -> Result<Cgroup> {
-        let cpath = parse_cgroup_path(path).map_err(|e| Error::with_cause(InvalidPath, e))?;
-        let cg = match specified_controllers {
-            Some(sc) => Self::load_with_specified_controllers_validated(hier, cpath, sc),
-            None => Self::load_validated(hier, cpath),
-        };
-        cg.create()?;
-        Ok(cg)
+    /// Path validation does not establish existence or ownership of the cgroup.
+    /// Cloning the supplied `Arc` lets callers load different paths on the
+    /// same hierarchy, including custom hierarchies that do not implement Clone.
+    ///
+    /// ```no_run
+    /// use cgroups_rs::core::{discover, CgroupPath, HostPaths};
+    /// use cgroups_rs::fs::{hierarchies, Cgroup};
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let hierarchy = hierarchies::from_topology(discover(&HostPaths::default())?);
+    /// let a = Cgroup::load(hierarchy.clone(), CgroupPath::new("workloads/a")?);
+    /// let b = Cgroup::load(hierarchy, CgroupPath::new("workloads/b")?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn load(hier: Arc<dyn Hierarchy>, path: CgroupPath) -> Cgroup {
+        Self::builder(hier, path).load()
     }
 
-    /// Create a new control group in the hierarchy `hier`, with name `path` and `relative_paths`
+    /// Configure controller selection and per-controller v1 prefixes.
     ///
-    /// Returns a handle to the control group that can be used to manipulate it.
-    ///
-    /// Note that this method is only meaningful for cgroup v1, call it is equivalent to call `new` in the v2 mode.
-    pub fn new_with_relative_paths<P: AsRef<Path>>(
-        hier: Box<dyn Hierarchy>,
-        path: P,
-        relative_paths: HashMap<String, String>,
-    ) -> Result<Cgroup> {
-        let cpath = parse_cgroup_path(path).map_err(|e| Error::with_cause(InvalidPath, e))?;
-        let mut validated_rel = HashMap::with_capacity(relative_paths.len());
-        for (k, v) in relative_paths {
-            let rp = cgroup_path_from_legacy_relative(&v)
-                .map_err(|e| Error::with_cause(InvalidPath, e))?;
-            validated_rel.insert(k, rp);
+    /// Finalize with [`CgroupBuilder::try_load`] to validate controller names
+    /// and construct a handle, [`CgroupBuilder::load`] to filter unavailable
+    /// names, or [`CgroupBuilder::create`] to also create the cgroup.
+    pub fn builder(hier: Arc<dyn Hierarchy>, path: CgroupPath) -> CgroupBuilder {
+        CgroupBuilder {
+            hier,
+            path,
+            controllers: ControllerSelection::All,
+            v1_prefixes: HashMap::new(),
         }
-        let cg = Self::load_with_relative_paths_validated(hier, cpath, validated_rel);
-        cg.create()?;
-        Ok(cg)
     }
 
-    /// Create a handle for a control group in the hierarchy `hier`, with name `path`.
-    ///
-    /// Returns a handle to the control group (that possibly does not exist until `create()` has
-    /// been called on the cgroup).
-    #[deprecated(since = "0.5.0", note = "use Cgroup::load_validated instead")]
-    pub fn load<P: AsRef<Path>>(hier: Box<dyn Hierarchy>, path: P) -> Cgroup {
-        let cpath = parse_cgroup_path(path).expect(
-            "Cgroup::load called with invalid cgroup path; use Cgroup::load_validated or Cgroup::new",
-        );
-        Self::load_validated(hier, cpath)
-    }
-
-    /// Create a handle for a specified control group in the hierarchy `hier`, with name `path`.
-    ///
-    /// Returns a handle to the control group (that possibly does not exist until `create()` has
-    /// been called on the cgroup).
-    #[deprecated(
-        since = "0.5.0",
-        note = "use Cgroup::load_with_specified_controllers_validated instead"
-    )]
-    pub fn load_with_specified_controllers<P: AsRef<Path>>(
-        hier: Box<dyn Hierarchy>,
-        path: P,
-        specified_controllers: Vec<String>,
-    ) -> Cgroup {
-        let cpath = parse_cgroup_path(path).expect(
-            "Cgroup::load_with_specified_controllers called with invalid cgroup path; use Cgroup::load_with_specified_controllers_validated",
-        );
-        Self::load_with_specified_controllers_validated(hier, cpath, specified_controllers)
-    }
-
-    /// Create a handle for a control group in the hierarchy `hier`, with name `path` and `relative_paths`
-    ///
-    /// Returns a handle to the control group (that possibly does not exist until `create()` has
-    /// been called on the cgroup).
-    ///
-    /// Note that this method is only meaningful for cgroup v1, call it is equivalent to call `load` in the v2 mode
-    #[deprecated(
-        since = "0.5.0",
-        note = "use Cgroup::load_with_relative_paths_validated instead"
-    )]
-    pub fn load_with_relative_paths<P: AsRef<Path>>(
-        hier: Box<dyn Hierarchy>,
-        path: P,
-        relative_paths: HashMap<String, String>,
-    ) -> Cgroup {
-        let cpath = parse_cgroup_path(path).expect(
-            "Cgroup::load_with_relative_paths called with invalid cgroup path; use Cgroup::load_with_relative_paths_validated",
-        );
-        let mut validated_rel = HashMap::with_capacity(relative_paths.len());
-        for (k, v) in relative_paths {
-            let rp = cgroup_path_from_legacy_relative(&v)
-                .expect("Cgroup::load_with_relative_paths called with invalid relative path");
-            validated_rel.insert(k, rp);
-        }
-        Self::load_with_relative_paths_validated(hier, cpath, validated_rel)
-    }
-
-    /// The list of subsystems that this control group supports.
-    pub fn subsystems(&self) -> &Vec<Subsystem> {
+    /// Return the subsystems represented by this control group handle.
+    pub fn subsystems(&self) -> &[Subsystem] {
         &self.subsystems
     }
 
-    /// Internal shared constructor for validated cgroup handles.
     fn load_internal(
-        hier: Box<dyn Hierarchy>,
+        hier: Arc<dyn Hierarchy>,
         path: CgroupPath,
-        specified_controllers: Option<Vec<String>>,
+        controllers: ControllerSelection,
+        v1_prefixes: HashMap<String, CgroupPath>,
     ) -> Cgroup {
-        let hier: Arc<dyn Hierarchy> = hier.into();
-        let topology = hier.topology();
-        if topology.is_none() {
-            log::warn!(
-                "cgroup loaded with hierarchy lacking topology snapshot; operations may fall back to host discovery"
-            );
-        }
         let rel = path.as_path();
-        let path_str = rel.to_string_lossy().into_owned();
         let mut subsystems = hier.subsystems();
-        if !rel.as_os_str().is_empty() {
-            if let Some(ref sc) = specified_controllers {
-                subsystems.retain(|x| sc.contains(&x.controller_name()));
-            }
-            subsystems = subsystems
-                .into_iter()
-                .map(|x| x.enter(rel))
-                .collect::<Vec<_>>();
+        if let ControllerSelection::Only(selected) = &controllers {
+            subsystems.retain(|subsystem| {
+                selected.contains(&selection_controller_name(subsystem, hier.v2()))
+            });
         }
-
-        Cgroup {
-            path,
-            path_str,
-            subsystems,
-            hier,
-            specified_controllers,
-            topology,
-        }
-    }
-
-    /// Create a handle for a control group from a validated
-    /// [`CgroupPath`].
-    ///
-    /// The validated variant of [`Cgroup::load`]: the path is already
-    /// checked (relative, no `..`/`.`/empty components), so entering
-    /// subsystems cannot be redirected by an absolute or escaping path.
-    /// The stored `path_str` is a lossy rendering for the legacy string API.
-    pub fn load_validated(hier: Box<dyn Hierarchy>, path: CgroupPath) -> Cgroup {
-        Self::load_internal(hier, path, None)
-    }
-
-    /// Create and apply a new control group from a validated
-    /// [`CgroupPath`].
-    ///
-    /// The validated variant of [`Cgroup::new`]: the underlying
-    /// `create()` may still fail, so this remains fallible.
-    pub fn new_validated(hier: Box<dyn Hierarchy>, path: CgroupPath) -> Result<Cgroup> {
-        let cg = Self::load_validated(hier, path);
-        cg.create()?;
-        Ok(cg)
-    }
-
-    /// Load with an explicit controller subset and a validated
-    /// [`CgroupPath`].
-    ///
-    /// For compatibility with [`Cgroup::load_with_specified_controllers`],
-    /// the subset is applied only to non-root paths. Root handles retain all
-    /// subsystems.
-    pub fn load_with_specified_controllers_validated(
-        hier: Box<dyn Hierarchy>,
-        path: CgroupPath,
-        specified_controllers: Vec<String>,
-    ) -> Cgroup {
-        Self::load_internal(hier, path, Some(specified_controllers))
-    }
-
-    /// Load with per-controller relative paths, each a validated
-    /// [`CgroupPath`].
-    ///
-    /// Only meaningful for cgroup v1; on v2 this delegates to
-    /// [`Cgroup::load_validated`].
-    pub fn load_with_relative_paths_validated(
-        hier: Box<dyn Hierarchy>,
-        path: CgroupPath,
-        relative_paths: HashMap<String, CgroupPath>,
-    ) -> Cgroup {
-        // relative_paths only valid for cgroup v1
-        if hier.v2() {
-            return Self::load_validated(hier, path);
-        }
-
-        let hier: Arc<dyn Hierarchy> = hier.into();
-        let topology = hier.topology();
-        let rel = path.as_path();
-        let path_str = rel.to_string_lossy().into_owned();
-        let mut subsystems = hier.subsystems();
-        if !rel.as_os_str().is_empty() {
-            subsystems = subsystems
-                .into_iter()
-                .map(|x| {
-                    let controller = x.controller_name();
-                    match relative_paths.get(&controller) {
-                        Some(relative) => {
-                            let joined = relative.join(&path);
-                            x.enter(joined.as_path())
-                        }
-                        None => x.enter(rel),
+        subsystems = subsystems
+            .into_iter()
+            .map(|subsystem| {
+                if !hier.v2() {
+                    if let Some(prefix) = v1_prefixes.get(&subsystem.controller_name()) {
+                        return subsystem.enter(prefix.join(&path).as_path());
                     }
-                })
-                .collect::<Vec<_>>();
-        }
+                }
+                subsystem.enter(rel)
+            })
+            .collect();
 
         Cgroup {
             path,
-            path_str,
             subsystems,
             hier,
-            specified_controllers: None,
-            topology,
+            controllers,
+            v1_prefixes,
         }
     }
 
-    /// Create a control group handle from an already-discovered topology snapshot and a path.
-    #[deprecated(
-        since = "0.5.0",
-        note = "use Cgroup::load_validated_with_topology instead"
-    )]
-    pub fn load_with_topology<P: AsRef<Path>>(topology: Arc<CgroupTopology>, path: P) -> Cgroup {
-        let cpath = parse_cgroup_path(path).expect(
-            "Cgroup::load_with_topology called with invalid cgroup path; use Cgroup::load_validated_with_topology",
-        );
-        Self::load_validated_with_topology(topology, cpath)
+    // Validate against the handle's reported subsystems without probing the
+    // filesystem. Keep loading and creation diagnostics identical.
+    fn validate_controller_selection(&self) -> Result<()> {
+        if let ControllerSelection::Only(controllers) = &self.controllers {
+            for controller in controllers {
+                if !self
+                    .subsystems
+                    .iter()
+                    .any(|subsystem| selection_controller_name(subsystem, self.v2()) == *controller)
+                {
+                    return Err(Error::new(UnsupportedController {
+                        controller: controller.clone(),
+                        path: if self.v2() {
+                            Some(self.hier.root()?.join("cgroup.controllers"))
+                        } else {
+                            None
+                        },
+                    }));
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Create a control group handle from an already-discovered topology snapshot and a validated [`CgroupPath`].
-    pub fn load_validated_with_topology(topology: Arc<CgroupTopology>, path: CgroupPath) -> Cgroup {
-        Self::load_validated(crate::fs::hierarchies::auto_with_topology(topology), path)
+    // Retain controller selection while using the operation's v1 root prefixes.
+    fn root_handle(&self, v1_prefixes: HashMap<String, CgroupPath>) -> Cgroup {
+        Self::load_internal(
+            self.hier.clone(),
+            CgroupPath::root(),
+            self.controllers.clone(),
+            v1_prefixes,
+        )
     }
 
     /// Deletes the control group.
@@ -402,7 +413,7 @@ impl Cgroup {
     pub fn delete(&self) -> Result<()> {
         if self.v2() {
             if !self.path.is_root() {
-                let p = self.hier.root().join(self.path.as_path());
+                let p = self.hier.root()?.join(self.path.as_path());
                 return fs::remove_dir(p).map_err(|e| Error::with_cause(RemoveFailed, e));
             }
             return Ok(());
@@ -460,35 +471,49 @@ impl Cgroup {
 
     /// Removes tasks from the control group by thread group id.
     ///
-    /// Note that this means that the task will be moved back to the root control group in the
-    /// hierarchy and any rules applied to that control group will _still_ apply to the proc.
+    /// Moves the process to the handle's root: each selected controller's
+    /// configured prefix directory on v1, or its hierarchy root if no prefix
+    /// is set. On v2, prefixes are ignored and the destination is the unified
+    /// hierarchy root. Kernel migration restrictions still apply.
     pub fn remove_task_by_tgid(&self, tgid: CgroupPid) -> Result<()> {
-        self.hier.root_control_group().add_task_by_tgid(tgid)
+        self.root_handle(self.v1_prefixes.clone())
+            .add_task_by_tgid(tgid)
     }
 
     /// Removes a task from the control group.
     ///
-    /// Note that this means that the task will be moved back to the root control group in the
-    /// hierarchy and any rules applied to that control group will _still_ apply to the task.
+    /// Moves the task to the handle's root: each selected controller's
+    /// configured prefix directory on v1, or its hierarchy root if no prefix
+    /// is set. On v2, prefixes are ignored and the destination is the unified
+    /// hierarchy root. Kernel migration restrictions still apply.
     pub fn remove_task(&self, tid: CgroupPid) -> Result<()> {
-        self.hier.root_control_group().add_task(tid)
+        self.root_handle(self.v1_prefixes.clone()).add_task(tid)
     }
 
-    /// Return a handle to the parent control group in the hierarchy.
+    /// Derive and load a handle to the immediate parent control group.
     ///
-    /// Fails closed if this control group is the root control group (which has no parent)
-    /// or if resolving the parent fails.
+    /// Preserves the shared hierarchy, controller selection, and v1 path
+    /// prefixes, including when the parent's relative path is empty. Loading
+    /// the handle does not create or check the parent directory.
+    ///
+    /// Returns an error if this handle's relative path is empty. Parent
+    /// traversal never goes above the configured per-controller v1 prefixes.
     pub fn parent(&self) -> Result<Cgroup> {
-        if self.path.is_root() {
-            return Err(Error::with_cause(
+        let parent_path = self.path.parent().ok_or_else(|| {
+            Error::with_cause(
                 ErrorKind::InvalidPath,
                 crate::core::error::PathError::RootPath {
                     input: self.path.as_path().to_path_buf(),
                     operation: "Cgroup::parent",
                 },
-            ));
-        }
-        self.hier.parent_control_group_path(self.path.as_path())
+            )
+        })?;
+        Ok(Self::load_internal(
+            self.hier.clone(),
+            parent_path,
+            self.controllers.clone(),
+            self.v1_prefixes.clone(),
+        ))
     }
 
     /// Moves tasks to the parent control group by thread group id.
@@ -503,28 +528,13 @@ impl Cgroup {
         parent.add_task(tid)
     }
 
-    /// Return a handle to the parent control group in the hierarchy.
-    ///
-    /// # Panics
-    ///
-    /// Panics if this is the hierarchy root or if parent resolution fails.
-    /// For fail-closed, fallible parent resolution, use [`Cgroup::parent`].
-    pub fn parent_control_group(&self) -> Cgroup {
-        self.parent()
-            .expect("cannot resolve parent cgroup; use Cgroup::parent for fallible resolution")
-    }
-
     /// Kill every process in the control group. Only supported for v2 cgroups and on
     /// kernels 5.14+. This will fail with InvalidOperation if the 'cgroup.kill' file does
     /// not exist.
     pub fn kill(&self) -> Result<()> {
-        if !self.v2() {
-            return Err(Error::new(CgroupVersion));
-        }
-
         let val = "1";
         let file_name = "cgroup.kill";
-        let p = self.hier.root().join(self.path.as_path()).join(file_name);
+        let p = self.hier.root()?.join(self.path.as_path()).join(file_name);
 
         // If cgroup.kill doesn't exist they're not on 5.14+ so lets
         // surface some error the caller can check against.
@@ -621,10 +631,13 @@ impl Cgroup {
             .try_for_each(|sub| sub.to_controller().set_notify_on_release(enable))
     }
 
-    /// Set release_agent
+    /// Set the release agent for the selected v1 hierarchies.
+    ///
+    /// Ignores per-controller path prefixes because `release_agent` exists
+    /// only at each hierarchy's true root. Controllers sharing a hierarchy
+    /// share its release agent.
     pub fn set_release_agent(&self, path: &str) -> Result<()> {
-        self.hier
-            .root_control_group()
+        self.root_handle(HashMap::new())
             .subsystems()
             .iter()
             .try_for_each(|sub| sub.to_controller().set_release_agent(path))
@@ -692,45 +705,72 @@ impl Cgroup {
     }
 }
 
-/// Convert a path accepted by the legacy per-controller API into the
-/// validated representation.
-///
-/// `/proc/<pid>/cgroup` paths have one leading slash, while callers have
-/// historically also supplied already-relative paths. Accept both forms,
-/// preserve `/` as the explicit cgroup root, and retain the strict component
-/// checks for traversal and repeated separators.
-fn cgroup_path_from_legacy_relative(path: &str) -> crate::core::error::CoreResult<CgroupPath> {
-    if path.is_empty() {
-        CgroupPath::root().map_err(Into::into)
-    } else if path.starts_with('/') {
-        CgroupPath::from_proc_cgroup_path(path).map_err(Into::into)
-    } else {
-        CgroupPath::new(path).map_err(Into::into)
-    }
-}
-
-/// Convert a general path-like input into a validated [`CgroupPath`].
-///
-/// Empty input represents the hierarchy root (`CgroupPath::root()`), while
-/// non-empty input is validated as a relative cgroup path.
-pub(crate) fn parse_cgroup_path<P: AsRef<Path>>(
-    path: P,
-) -> crate::core::error::CoreResult<CgroupPath> {
-    if path.as_ref().as_os_str().is_empty() {
-        CgroupPath::root().map_err(Into::into)
-    } else {
-        CgroupPath::new(path).map_err(Into::into)
-    }
-}
-
 pub const UNIFIED_MOUNTPOINT: &str = "/sys/fs/cgroup";
 
-fn enable_controllers(controllers: &[String], path: &Path) {
-    let f = path.join("cgroup.subtree_control");
-    for c in controllers {
-        let body = format!("+{}", c);
-        let _rest = fs::write(f.as_path(), body.as_bytes());
+fn enable_controllers(
+    selection: &ControllerSelection,
+    controllers: &[String],
+    available: &[String],
+    path: &Path,
+) -> Result<()> {
+    enable_controllers_with(selection, controllers, available, path, |file, body| {
+        fs::write(file, body)
+    })
+}
+
+// Keep the write boundary injectable so tests can exercise kernel errno
+// propagation without depending on privileges or the host's cgroup layout.
+fn enable_controllers_with(
+    selection: &ControllerSelection,
+    controllers: &[String],
+    available: &[String],
+    path: &Path,
+    mut write: impl FnMut(&Path, &str) -> std::io::Result<()>,
+) -> Result<()> {
+    let controllers: Vec<_> = controllers
+        .iter()
+        .filter(|controller| available.contains(controller))
+        .collect();
+    if controllers.is_empty() {
+        return Ok(());
     }
+    let f = path.join("cgroup.subtree_control");
+    let content = fs::read_to_string(&f)
+        .map_err(|cause| Error::with_cause(ReadFailed(f.display().to_string()), cause))?;
+    let mut enabled: Vec<_> = content.split_whitespace().collect();
+    for c in controllers {
+        // A redundant write still requires permission and can hit kernel
+        // hierarchy constraints outside the caller's delegated subtree.
+        if enabled.contains(&c.as_str()) {
+            continue;
+        }
+        let body = format!("+{}", c);
+        match write(&f, &body) {
+            Ok(()) => enabled.push(c),
+            // All is best-effort: an ancestor may offer controllers that the
+            // caller cannot distribute. Descendants report what is available.
+            Err(_) if matches!(selection, ControllerSelection::All) => continue,
+            Err(cause) => {
+                return Err(Error::with_cause(
+                    WriteFailed(f.display().to_string(), body),
+                    cause,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_controllers(controllers: &[String], available: &[String], path: &Path) -> Result<()> {
+    for controller in controllers {
+        if !available.contains(controller) {
+            return Err(Error::new(UnsupportedController {
+                controller: controller.clone(),
+                path: Some(path.join("cgroup.controllers")),
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn supported_controllers_at(root: &Path) -> Result<Vec<String>> {
@@ -743,35 +783,36 @@ fn supported_controllers_at(root: &Path) -> Result<Vec<String>> {
 fn create_v2_cgroup(
     root: PathBuf,
     path: &CgroupPath,
-    specified_controllers: &Option<Vec<String>>,
+    selection: &ControllerSelection,
     topology: Option<&CgroupTopology>,
 ) -> Result<()> {
-    let available_controllers = if let Some(topo) = topology {
-        topo.controllers()
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-    } else {
-        supported_controllers_at(&root)?
-    };
+    // Availability may change after discovery. Read it for this operation
+    // without rediscovering the handle's mount topology.
+    let available_controllers = supported_controllers_at(&root)?;
 
-    let controllers = match specified_controllers {
-        Some(s_controllers) => {
-            if !s_controllers
-                .iter()
-                .all(|c| available_controllers.contains(c))
-            {
-                return Err(Error::new(ErrorKind::SpecifiedControllers));
-            }
-            s_controllers.clone()
-        }
-        None => available_controllers,
+    let controllers = match selection {
+        // Freezing is a v2 core interface, not an enableable controller.
+        ControllerSelection::Only(selected) => selected
+            .iter()
+            .filter(|controller| controller.as_str() != "freezer")
+            .cloned()
+            .collect(),
+        ControllerSelection::All => match topology {
+            Some(topology) => topology.controllers().iter().map(str::to_string).collect(),
+            // Built-in hierarchies always carry a snapshot. Only a custom
+            // hierarchy can require reading its root's controller set here.
+            None => available_controllers.clone(),
+        },
     };
+    let explicit = matches!(selection, ControllerSelection::Only(_));
+    if explicit {
+        require_controllers(&controllers, &available_controllers, &root)?;
+    }
 
     let mut fp = root;
 
     // enable for root
-    enable_controllers(&controllers, &fp);
+    enable_controllers(selection, &controllers, &available_controllers, &fp)?;
 
     let components: Vec<_> = path.as_path().components().collect();
     let last_index = components.len().saturating_sub(1);
@@ -781,9 +822,16 @@ fn create_v2_cgroup(
             return Err(Error::with_cause(ErrorKind::FsError, e));
         }
 
-        if i < last_index {
-            // enable controllers for subtree
-            enable_controllers(&controllers, &fp);
+        if !controllers.is_empty() && (i < last_index || explicit) {
+            // Availability is inherited from the immediate parent, not from
+            // the real hierarchy root. Read it after enabling that parent.
+            let available = supported_controllers_at(&fp)?;
+            if explicit {
+                require_controllers(&controllers, &available, &fp)?;
+            }
+            if i < last_index {
+                enable_controllers(selection, &controllers, &available, &fp)?;
+            }
         }
     }
 
@@ -800,86 +848,30 @@ pub fn verify_supported_controllers_at(root: &Path, controllers: &[String]) -> b
         .unwrap_or(false)
 }
 
-pub fn get_cgroups_relative_paths() -> Result<HashMap<String, String>> {
-    get_cgroups_relative_paths_with_host_paths(&crate::core::discovery::HostPaths::default())
+/// Read current membership using the default host paths.
+///
+/// Returns raw procfs membership paths, including their leading `/` and any
+/// namespace-relative `..`; these are not validated [`CgroupPath`] values.
+/// Use [`CgroupReader::memberships`] to configure a different source or process.
+pub fn get_cgroup_memberships() -> Result<HashMap<String, String>> {
+    CgroupReader::default().memberships(None)
 }
 
-pub fn get_cgroups_relative_paths_with_host_paths(
-    host_paths: &crate::core::discovery::HostPaths,
-) -> Result<HashMap<String, String>> {
-    let path = host_paths.procfs.join("self/cgroup");
-    get_cgroups_relative_paths_by_path(&path)
+/// Read a process's membership using the default host paths.
+///
+/// Returns raw procfs membership paths, including their leading `/` and any
+/// namespace-relative `..`; these are not validated [`CgroupPath`] values.
+/// Use [`CgroupReader::memberships`] to configure the source independently.
+pub fn get_cgroup_memberships_by_pid(pid: u32) -> Result<HashMap<String, String>> {
+    CgroupReader::default().memberships(Some(pid))
 }
 
-pub fn get_cgroups_relative_paths_by_pid(pid: u32) -> Result<HashMap<String, String>> {
-    get_cgroups_relative_paths_by_pid_with_host_paths(
-        pid,
-        &crate::core::discovery::HostPaths::default(),
-    )
-}
-
-pub fn get_cgroups_relative_paths_by_pid_with_host_paths(
-    pid: u32,
-    host_paths: &crate::core::discovery::HostPaths,
-) -> Result<HashMap<String, String>> {
-    let path = host_paths.procfs.join(format!("{}/cgroup", pid));
-    get_cgroups_relative_paths_by_path(&path)
-}
-
-fn get_cgroup_destination(mut mount_root: String, pidpath: String) -> String {
-    if mount_root == "/" {
-        mount_root = String::from("");
-    }
-    pidpath.trim_start_matches(&mount_root).to_string()
-}
-
+/// Apply the legacy v1 mapping using the default host paths.
+///
+/// Use [`CgroupReader::existing_path`] with an explicitly configured reader
+/// for other sources. Discovery errors propagate through this wrapper.
 pub fn existing_path(paths: HashMap<String, String>) -> Result<HashMap<String, String>> {
-    existing_path_with_host_paths(paths, &crate::core::discovery::HostPaths::default())
-}
-
-pub fn existing_path_with_host_paths(
-    paths: HashMap<String, String>,
-    host_paths: &crate::core::discovery::HostPaths,
-) -> Result<HashMap<String, String>> {
-    let mount_roots_v1 =
-        V1::with_host_paths(host_paths).map_err(|e| Error::with_cause(ErrorKind::FsError, e))?;
-    let mut mount_roots_subsystems_map = HashMap::new();
-
-    for s in mount_roots_v1.subsystems().iter() {
-        let controller_name = s.controller_name();
-        let path_from_cgroup = paths.get(&controller_name).ok_or_else(|| {
-            Error::new(Common(format!(
-                "controller {} found in mountinfo, but not found in cgroup.",
-                controller_name
-            )))
-        })?;
-        let path_from_mountinfo = s.to_controller().base().to_string_lossy().to_string();
-
-        let des_path = get_cgroup_destination(path_from_mountinfo, path_from_cgroup.to_owned());
-        mount_roots_subsystems_map.insert(controller_name, des_path);
-    }
-    Ok(mount_roots_subsystems_map)
-}
-
-fn get_cgroups_relative_paths_by_path<P: AsRef<Path>>(path: P) -> Result<HashMap<String, String>> {
-    let path = path.as_ref();
-    let content = fs::read_to_string(path)
-        .map_err(|e| Error::with_cause(ErrorKind::ReadFailed(path.display().to_string()), e))?;
-    let membership = crate::core::discovery::parse_membership(&content)
-        .map_err(|e| Error::with_cause(ErrorKind::InvalidPath, e))?;
-
-    let mut m = HashMap::new();
-    for record in membership.records() {
-        let path_str = record.path.to_string_lossy().into_owned();
-        if record.controllers.is_empty() {
-            m.insert(String::new(), path_str);
-        } else {
-            for controller in &record.controllers {
-                m.insert(controller.clone(), path_str.clone());
-            }
-        }
-    }
-    Ok(m)
+    CgroupReader::default().existing_path(paths)
 }
 
 #[cfg(test)]
@@ -888,17 +880,27 @@ mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
+    // Ordinary files model observed state only; they do not propagate a
+    // parent's controller changes into its children like cgroupfs does.
+    fn seed_v2_directory(root: &Path, path: &str, available: &str, enabled: &str) -> PathBuf {
+        let directory = root.join(path);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("cgroup.controllers"), available).unwrap();
+        fs::write(directory.join("cgroup.subtree_control"), enabled).unwrap();
+        directory
+    }
+
     #[test]
     #[cfg(feature = "fixtures")]
     fn test_cgroup_preserves_non_utf8_path() {
         let non_utf8_bytes = b"\xff\xfe/test_subgroup";
         let path = CgroupPath::new(Path::new(OsStr::from_bytes(non_utf8_bytes))).unwrap();
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "");
-        let hier = crate::fs::hierarchies::auto_with_topology(fixture.topology.clone());
+        let hier = crate::fs::hierarchies::from_topology(fixture.topology.clone());
 
-        let cg = Cgroup::load_validated(hier, path);
-        assert_eq!(cg.as_path().as_os_str().as_bytes(), non_utf8_bytes);
-        assert!(cg.path_str().is_none());
+        let cg = Cgroup::load(hier, path);
+        assert_eq!(cg.path().as_path().as_os_str().as_bytes(), non_utf8_bytes);
+        assert!(cg.path().as_path().to_str().is_none());
     }
 
     #[test]
@@ -913,7 +915,7 @@ mod tests {
                 b"1:cpuset:/\n",
                 "",
             );
-            let hierarchy = crate::fs::hierarchies::auto_with_topology(fixture.topology.clone());
+            let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
             let prefix = CgroupPath::new(OsStr::from_bytes(prefix)).unwrap();
             let path = CgroupPath::new(OsStr::from_bytes(path)).unwrap();
             let mount = fixture.topology.cgroupfs_root().join("cpuset");
@@ -942,14 +944,13 @@ mod tests {
                 }
             }
 
-            let handle = Cgroup::load_with_relative_paths_validated(
-                hierarchy,
-                path.clone(),
-                HashMap::from([("cpuset".to_string(), prefix)]),
-            );
-            handle.create().unwrap();
+            let handle = Cgroup::builder(hierarchy, path.clone())
+                .controllers(ControllerSelection::Only(vec!["cpuset".to_string()]))
+                .v1_prefixes(HashMap::from([("cpuset".to_string(), prefix)]))
+                .create()
+                .unwrap();
             let cpuset: &crate::fs::cpuset::CpuSetController = handle.controller_of().unwrap();
-            assert_eq!(handle.cgroup_path(), &path);
+            assert_eq!(handle.path(), &path);
             assert_eq!(cpuset.path(), base.join(&path));
             for directory in directories {
                 for (file, expected) in [("cpuset.cpus", "2-3"), ("cpuset.mems", "1")] {
@@ -970,9 +971,10 @@ mod tests {
         let topology = fixture.topology.clone();
 
         let path = CgroupPath::new("a/b/c").unwrap();
-        let cg = Cgroup::load_validated_with_topology(topology.clone(), path);
+        let hierarchy = crate::fs::hierarchies::from_topology(topology.clone());
+        let cg = Cgroup::load(hierarchy.clone(), path);
 
-        // 1. Cgroup directly holds topology
+        // 1. Cgroup exposes its hierarchy's topology
         assert!(cg.topology().is_some());
         assert_eq!(
             cg.topology().unwrap().cgroupfs_root(),
@@ -988,7 +990,8 @@ mod tests {
 
         // 3. Parent control group threads the same topology
         let parent = cg.parent().unwrap();
-        assert_eq!(parent.as_path(), Path::new("a/b"));
+        assert_eq!(parent.path().as_path(), Path::new("a/b"));
+        assert!(Arc::ptr_eq(&hierarchy, &parent.hier));
         assert!(parent.topology().is_some());
         assert!(std::sync::Arc::ptr_eq(
             &cg.topology().unwrap(),
@@ -997,38 +1000,13 @@ mod tests {
 
         // 4. Root control group threads the same topology
         let root = parent.parent().unwrap().parent().unwrap();
-        assert_eq!(root.as_path(), Path::new(""));
+        assert!(root.path().is_root());
+        assert!(Arc::ptr_eq(&hierarchy, &root.hier));
         assert!(root.topology().is_some());
         assert!(std::sync::Arc::ptr_eq(
             &cg.topology().unwrap(),
             &root.topology().unwrap()
         ));
-    }
-
-    #[test]
-    #[cfg(feature = "fixtures")]
-    fn test_cgroup_new_and_mutation_rejects_escaping_path() {
-        let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "");
-        let topology = fixture.topology.clone();
-        let hierarchy = || crate::fs::hierarchies::auto_with_topology(topology.clone());
-
-        // 1. Cgroup::new rejects escaping paths
-        assert!(Cgroup::new(hierarchy(), "../escape").is_err());
-        assert!(Cgroup::new(hierarchy(), "/absolute").is_err());
-        assert!(Cgroup::new(hierarchy(), "a/../b").is_err());
-
-        // 2. Cgroup::load panics on escaping / absolute paths
-        let res1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            #[allow(deprecated)]
-            Cgroup::load(hierarchy(), "../escape");
-        }));
-        assert!(res1.is_err());
-
-        let res2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            #[allow(deprecated)]
-            Cgroup::load(hierarchy(), "/absolute");
-        }));
-        assert!(res2.is_err());
     }
 
     #[test]
@@ -1039,9 +1017,9 @@ mod tests {
         let topology = fixture.topology.clone();
 
         // Explicitly create V1 with this topology
-        let v1 = crate::fs::hierarchies::V1::with_topology(topology.clone());
-        let cg_v1 = Cgroup::load_validated(
-            Box::new(v1),
+        let v1 = crate::fs::hierarchies::V1::from(topology.clone());
+        let cg_v1 = Cgroup::load(
+            Arc::new(v1),
             crate::core::CgroupPath::new("test_v1").unwrap(),
         );
         assert!(!cg_v1.v2(), "Original cgroup should be v1");
@@ -1059,25 +1037,27 @@ mod tests {
     }
 
     #[test]
-    fn test_cgroup_clone_preserves_custom_hierarchy_object() {
+    fn test_handles_share_non_clone_custom_hierarchy_until_last_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         #[derive(Debug)]
-        struct CustomHierarchy(PathBuf);
+        struct CustomHierarchy {
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl Drop for CustomHierarchy {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
 
         impl Hierarchy for CustomHierarchy {
             fn subsystems(&self) -> Vec<Subsystem> {
                 Vec::new()
             }
 
-            fn root(&self) -> PathBuf {
-                self.0.clone()
-            }
-
-            fn root_control_group(&self) -> Cgroup {
-                panic!("not used by this test")
-            }
-
-            fn parent_control_group(&self, _path: &str) -> Cgroup {
-                panic!("not used by this test")
+            fn root(&self) -> Result<PathBuf> {
+                Err(Error::new(CgroupVersion))
             }
 
             fn v2(&self) -> bool {
@@ -1085,89 +1065,1330 @@ mod tests {
             }
         }
 
-        let cg = Cgroup::load_validated(
-            Box::new(CustomHierarchy(PathBuf::from("/custom/hierarchy"))),
-            CgroupPath::new("child").unwrap(),
-        );
-        let cloned = cg.clone();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let hierarchy: Arc<dyn Hierarchy> = Arc::new(CustomHierarchy {
+            drops: drops.clone(),
+        });
+        let a = Cgroup::load(hierarchy.clone(), CgroupPath::new("a/child").unwrap());
+        let b = Cgroup::builder(hierarchy.clone(), CgroupPath::new("b").unwrap()).load();
+        let cloned = a.clone();
+        let parent = a.parent().unwrap();
+        let root = Cgroup::load(hierarchy.clone(), CgroupPath::root());
+        for handle in [&a, &b, &cloned, &parent, &root] {
+            assert!(Arc::ptr_eq(&hierarchy, &handle.hier));
+        }
+        assert_eq!(a.path().as_path(), Path::new("a/child"));
+        assert_eq!(b.path().as_path(), Path::new("b"));
+        assert_eq!(parent.path().as_path(), Path::new("a"));
+        assert!(root.path().is_root());
 
-        assert!(Arc::ptr_eq(&cg.hier, &cloned.hier));
-        assert_eq!(cloned.hier.root(), Path::new("/custom/hierarchy"));
-    }
-
-    #[test]
-    fn test_legacy_relative_path_conversion() {
-        assert_eq!(
-            cgroup_path_from_legacy_relative("/parent/child")
-                .unwrap()
-                .as_path(),
-            Path::new("parent/child")
-        );
-        assert_eq!(
-            cgroup_path_from_legacy_relative("parent/child")
-                .unwrap()
-                .as_path(),
-            Path::new("parent/child")
-        );
-        assert!(cgroup_path_from_legacy_relative("/").unwrap().is_root());
-        assert!(cgroup_path_from_legacy_relative("").unwrap().is_root());
-        assert!(cgroup_path_from_legacy_relative("/../escape").is_err());
-        assert!(cgroup_path_from_legacy_relative("//escape").is_err());
+        drop((hierarchy, a, cloned, parent, root));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(b.hier.root().unwrap_err().kind(), &CgroupVersion);
+        drop(b);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     #[cfg(feature = "fixtures")]
-    fn test_specified_controllers_preserve_legacy_root_semantics() {
+    fn test_controller_selection_applies_to_root_and_child() {
+        let legacy = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+              44 33 0:39 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n",
+            b"1:memory:/\n2:cpu:/\n",
+            "",
+        );
+        let unified = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu memory");
+        for fixture in [&legacy, &unified] {
+            let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+            for selection in [
+                ControllerSelection::default(),
+                ControllerSelection::Only(vec!["memory".to_string()]),
+                ControllerSelection::Only(Vec::new()),
+            ] {
+                let builder =
+                    |path| Cgroup::builder(hierarchy.clone(), path).controllers(selection.clone());
+                let child = builder(CgroupPath::new("child").unwrap()).load();
+                let mut expected = match &selection {
+                    ControllerSelection::Only(controllers) => controllers.clone(),
+                    ControllerSelection::All if hierarchy.v2() => vec![
+                        "cpu".to_string(),
+                        "memory".to_string(),
+                        "freezer".to_string(),
+                    ],
+                    ControllerSelection::All => vec!["cpu".to_string(), "memory".to_string()],
+                };
+                expected.sort();
+                let subtree_control = fixture
+                    .topology
+                    .cgroupfs_root()
+                    .join("cgroup.subtree_control");
+                if hierarchy.v2() {
+                    fs::write(&subtree_control, b"unchanged").unwrap();
+                }
+                let loaded_root = builder(CgroupPath::root()).load();
+                if hierarchy.v2() {
+                    assert_eq!(fs::read(&subtree_control).unwrap(), b"unchanged");
+                }
+                let mut handles = vec![loaded_root, child.parent().unwrap(), child];
+                if matches!(&selection, ControllerSelection::Only(controllers) if controllers.is_empty())
+                {
+                    let error = builder(CgroupPath::root()).create().unwrap_err();
+                    assert_eq!(
+                        error.kind(),
+                        &EmptyControllerSelection {
+                            path: PathBuf::new()
+                        }
+                    );
+                    if hierarchy.v2() {
+                        assert_eq!(fs::read(&subtree_control).unwrap(), b"unchanged");
+                    }
+                } else {
+                    handles.push(builder(CgroupPath::root()).create().unwrap());
+                    if hierarchy.v2() {
+                        assert_eq!(fs::read(&subtree_control).unwrap(), b"+memory");
+                    }
+                }
+                for handle in handles {
+                    let mut actual: Vec<_> = handle
+                        .subsystems()
+                        .iter()
+                        .map(Subsystem::controller_name)
+                        .collect();
+                    actual.sort();
+                    assert_eq!(actual, expected);
+                    assert!(Arc::ptr_eq(&hierarchy, &handle.hier));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_creation_rejects_invalid_selections_without_mutation() {
+        use crate::core::CgroupVersion;
+
+        for version in [CgroupVersion::V1, CgroupVersion::V2] {
+            let fixture = crate::tests::topology_fixture(version, "memory");
+            let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+            let root = fixture.topology.cgroupfs_root();
+            let subtree_control = root.join("cgroup.subtree_control");
+            fs::write(&subtree_control, b"unchanged").unwrap();
+            for names in [
+                Vec::new(),
+                vec!["memory".to_string(), "missing".to_string()],
+            ] {
+                let path = CgroupPath::new("parent/child").unwrap();
+                let handle = Cgroup::builder(hierarchy.clone(), path.clone())
+                    .controllers(ControllerSelection::Only(names.clone()))
+                    .load();
+                // Exercise both public creation entrypoints; load remains non-mutating.
+                for error in [
+                    handle.create().unwrap_err(),
+                    Cgroup::builder(hierarchy.clone(), path.clone())
+                        .controllers(ControllerSelection::Only(names.clone()))
+                        .create()
+                        .unwrap_err(),
+                ] {
+                    let expected = if names.is_empty() {
+                        EmptyControllerSelection {
+                            path: path.as_path().to_path_buf(),
+                        }
+                    } else {
+                        UnsupportedController {
+                            controller: "missing".to_string(),
+                            path: if version == CgroupVersion::V2 {
+                                Some(root.join("cgroup.controllers"))
+                            } else {
+                                None
+                            },
+                        }
+                    };
+                    assert_eq!(error.kind(), &expected);
+                }
+                assert_eq!(fs::read(&subtree_control).unwrap(), b"unchanged");
+                assert!(!root.join("parent").exists());
+                assert!(!root.join("memory/parent").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn test_try_load_rejects_unreported_controller_names_without_cgroupfs() {
+        let legacy = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n\
+              44 33 0:39 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+            b"1:cpu:/\n2:memory:/\n",
+            "",
+        );
+        let unified = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu memory");
+        for fixture in [&legacy, &unified] {
+            let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+            let root = fixture.topology.cgroupfs_root();
+            // Loading uses the hierarchy's reported set even after its
+            // control files disappear. It must not read or recreate them.
+            fs::remove_dir_all(root).unwrap();
+            for path in [CgroupPath::root(), CgroupPath::new("child").unwrap()] {
+                let builder = || {
+                    Cgroup::builder(hierarchy.clone(), path.clone()).controllers(
+                        ControllerSelection::Only(vec!["cpu".to_string(), "mmeory".to_string()]),
+                    )
+                };
+                let unchecked = builder().load();
+                assert_eq!(unchecked.subsystems().len(), 1);
+                assert!(unchecked
+                    .controller_of::<crate::fs::cpu::CpuController>()
+                    .is_some());
+                assert!(unchecked
+                    .controller_of::<crate::fs::memory::MemController>()
+                    .is_none());
+
+                let error = builder().try_load().unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    &UnsupportedController {
+                        controller: "mmeory".to_string(),
+                        path: if hierarchy.v2() {
+                            Some(root.join("cgroup.controllers"))
+                        } else {
+                            None
+                        },
+                    }
+                );
+                assert_eq!(unchecked.create().unwrap_err().kind(), error.kind());
+                assert!(!root.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn test_try_load_preserves_valid_selections_and_v1_prefixes() {
+        let legacy = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/blkio rw - cgroup cgroup rw,blkio\n",
+            b"1:blkio:/\n",
+            "",
+        );
+        let unified = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "io");
+        for (fixture, name, wrong_name) in [(&legacy, "blkio", "io"), (&unified, "io", "blkio")] {
+            let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+            let root = fixture.topology.cgroupfs_root();
+            fs::remove_dir_all(root).unwrap();
+            for path in [CgroupPath::root(), CgroupPath::new("child").unwrap()] {
+                for selection in [
+                    ControllerSelection::All,
+                    ControllerSelection::Only(vec![name.to_string()]),
+                    ControllerSelection::Only(Vec::new()),
+                ] {
+                    let handle = Cgroup::builder(hierarchy.clone(), path.clone())
+                        .controllers(selection.clone())
+                        .v1_prefixes(HashMap::from([(
+                            "blkio".to_string(),
+                            CgroupPath::new("delegated").unwrap(),
+                        )]))
+                        .try_load()
+                        .unwrap();
+                    if matches!(selection, ControllerSelection::Only(names) if names.is_empty()) {
+                        assert!(handle.subsystems().is_empty());
+                        assert_eq!(
+                            handle.create().unwrap_err().kind(),
+                            &EmptyControllerSelection {
+                                path: path.as_path().to_path_buf(),
+                            }
+                        );
+                    } else {
+                        let block_io: &crate::fs::blkio::BlkIoController =
+                            handle.controller_of().unwrap();
+                        let base = if hierarchy.v2() {
+                            root.to_path_buf()
+                        } else {
+                            root.join("blkio/delegated")
+                        };
+                        assert_eq!(block_io.path(), base.join(path.as_path()));
+                    }
+                }
+                let error = Cgroup::builder(hierarchy.clone(), path.clone())
+                    .controllers(ControllerSelection::Only(vec![wrong_name.to_string()]))
+                    .try_load()
+                    .unwrap_err();
+                assert!(
+                    matches!(error.kind(), UnsupportedController { controller, .. } if controller == wrong_name)
+                );
+                if hierarchy.v2() {
+                    let freezer = Cgroup::builder(hierarchy.clone(), path)
+                        .controllers(ControllerSelection::Only(vec!["freezer".to_string()]))
+                        .try_load()
+                        .unwrap();
+                    assert_eq!(freezer.subsystems().len(), 1);
+                    assert!(freezer
+                        .controller_of::<crate::fs::freezer::FreezerController>()
+                        .is_some());
+                }
+            }
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn test_v1_kill_reports_no_unified_root() {
+        let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V1, "memory");
+        let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+        let handle = Cgroup::load(hierarchy, CgroupPath::new("child").unwrap());
+        assert_eq!(handle.kill().unwrap_err().kind(), &CgroupVersion);
+        assert!(!fixture.topology.cgroupfs_root().join("child").exists());
+    }
+
+    #[test]
+    fn test_v2_operations_propagate_unified_root_errors() {
+        use std::error::Error as _;
+
+        #[derive(Debug)]
+        struct UnavailableHierarchy;
+
+        impl Hierarchy for UnavailableHierarchy {
+            fn subsystems(&self) -> Vec<Subsystem> {
+                Vec::new()
+            }
+
+            fn root(&self) -> Result<PathBuf> {
+                Err(Error::with_cause(
+                    ReadFailed("/custom/unified".to_string()),
+                    std::io::Error::from_raw_os_error(libc::EACCES),
+                ))
+            }
+
+            fn v2(&self) -> bool {
+                true
+            }
+        }
+
+        let handle = Cgroup::load(
+            Arc::new(UnavailableHierarchy),
+            CgroupPath::new("child").unwrap(),
+        );
+        for error in [
+            handle.create().unwrap_err(),
+            handle.delete().unwrap_err(),
+            handle.kill().unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), &ReadFailed("/custom/unified".to_string()));
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EACCES)
+            );
+        }
+    }
+
+    #[test]
+    fn test_v2_creation_with_no_resource_controllers() {
+        let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "");
+        let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+        let root = fixture.topology.cgroupfs_root();
+        let subtree_control = root.join("cgroup.subtree_control");
+        fs::write(&subtree_control, b"unchanged").unwrap();
+
+        let all = Cgroup::builder(hierarchy.clone(), CgroupPath::new("all").unwrap())
+            .create()
+            .unwrap();
+        assert_eq!(all.controllers, ControllerSelection::All);
+        assert!(root.join("all").is_dir());
+        assert!(all
+            .controller_of::<crate::fs::freezer::FreezerController>()
+            .is_some());
+
+        let freezer = Cgroup::builder(hierarchy, CgroupPath::new("freezer/child").unwrap())
+            .controllers(ControllerSelection::Only(vec!["freezer".to_string()]))
+            .create()
+            .unwrap();
+        assert_eq!(freezer.subsystems().len(), 1);
+        assert!(root.join("freezer/child").is_dir());
+        assert_eq!(fs::read(&subtree_control).unwrap(), b"unchanged");
+        assert!(!root.join("freezer/cgroup.subtree_control").exists());
+    }
+
+    #[test]
+    fn test_custom_v2_hierarchy_can_create_without_a_snapshot() {
+        #[derive(Debug)]
+        struct CustomHierarchy(PathBuf);
+
+        impl Hierarchy for CustomHierarchy {
+            fn subsystems(&self) -> Vec<Subsystem> {
+                vec![Subsystem::Cpu(crate::fs::cpu::CpuController::new(
+                    self.0.clone(),
+                    PathBuf::new(),
+                    true,
+                ))]
+            }
+
+            fn root(&self) -> Result<PathBuf> {
+                Ok(self.0.clone())
+            }
+
+            fn v2(&self) -> bool {
+                true
+            }
+        }
+
+        let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu");
+        let root = fixture.topology.cgroupfs_root();
+        let hierarchy: Arc<dyn Hierarchy> = Arc::new(CustomHierarchy(root.to_path_buf()));
+        seed_v2_directory(root, "child", "cpu", "");
+        let handle = Cgroup::new(hierarchy.clone(), CgroupPath::new("child").unwrap()).unwrap();
+        assert!(handle.topology().is_none());
+        assert!(Arc::ptr_eq(&hierarchy, &handle.hier));
+        assert!(root.join("child").is_dir());
+        assert_eq!(
+            fs::read(root.join("cgroup.subtree_control")).unwrap(),
+            b"+cpu"
+        );
+    }
+
+    #[test]
+    fn test_block_io_selection_uses_kernel_names_for_each_hierarchy() {
+        let legacy = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/blkio rw - cgroup cgroup rw,blkio\n",
+            b"1:blkio:/\n",
+            "",
+        );
+        let unified = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "io memory");
+        for (fixture, name, wrong_name, relative_directory) in [
+            (&legacy, "blkio", "io", "blkio/child"),
+            (&unified, "io", "blkio", "child"),
+        ] {
+            let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+            let root = fixture.topology.cgroupfs_root();
+            if hierarchy.v2() {
+                seed_v2_directory(root, "child", "io", "");
+            }
+            let handle = Cgroup::builder(hierarchy.clone(), CgroupPath::new("child").unwrap())
+                .controllers(ControllerSelection::Only(vec![name.to_string()]))
+                .create()
+                .unwrap();
+            assert_eq!(handle.subsystems().len(), 1);
+            let blkio: &crate::fs::blkio::BlkIoController = handle.controller_of().unwrap();
+            assert_eq!(blkio.path(), root.join(relative_directory));
+            if hierarchy.v2() {
+                assert_eq!(
+                    fs::read(root.join("cgroup.subtree_control")).unwrap(),
+                    b"+io"
+                );
+            }
+            let cloned = handle.clone();
+            let parent = handle.parent().unwrap();
+            for related in [&cloned, &parent] {
+                assert_eq!(related.controllers, handle.controllers);
+                assert!(related
+                    .controller_of::<crate::fs::blkio::BlkIoController>()
+                    .is_some());
+            }
+            let error = Cgroup::builder(hierarchy, CgroupPath::new("other").unwrap())
+                .controllers(ControllerSelection::Only(vec![wrong_name.to_string()]))
+                .create()
+                .unwrap_err();
+            assert!(
+                matches!(error.kind(), UnsupportedController { controller, .. } if controller == wrong_name)
+            );
+            assert!(!root.join("other").exists());
+            assert!(!root.join("blkio/other").exists());
+        }
+    }
+
+    #[test]
+    fn test_v2_creation_rechecks_current_controller_availability() {
+        use std::error::Error as _;
+
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu memory");
-        let topology = fixture.topology.clone();
-        let selected = vec!["memory".to_string()];
-
-        let root = Cgroup::load_with_specified_controllers_validated(
-            crate::fs::hierarchies::auto_with_topology(topology.clone()),
-            CgroupPath::root().unwrap(),
-            selected.clone(),
+        let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+        let root = fixture.topology.cgroupfs_root();
+        let controller_list = root.join("cgroup.controllers");
+        let subtree_control = root.join("cgroup.subtree_control");
+        let handle = Cgroup::builder(hierarchy.clone(), CgroupPath::new("child").unwrap())
+            .controllers(ControllerSelection::Only(vec!["memory".to_string()]))
+            .load();
+        fs::write(&subtree_control, b"unchanged").unwrap();
+        fs::write(&controller_list, b"cpu").unwrap();
+        assert_eq!(
+            handle.create().unwrap_err().kind(),
+            &UnsupportedController {
+                controller: "memory".to_string(),
+                path: Some(controller_list.clone()),
+            }
         );
-        let root_names: Vec<_> = root
-            .subsystems()
-            .iter()
-            .map(Subsystem::controller_name)
-            .collect();
-        assert!(root_names.contains(&"cpu".to_string()));
-        assert!(root_names.contains(&"memory".to_string()));
-        assert!(root_names.contains(&"freezer".to_string()));
+        assert_eq!(fs::read(&subtree_control).unwrap(), b"unchanged");
+        assert!(!root.join("child").exists());
 
-        let child = Cgroup::load_with_specified_controllers_validated(
-            crate::fs::hierarchies::auto_with_topology(topology),
+        fs::remove_file(&controller_list).unwrap();
+        let error = handle.create().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ReadFailed(controller_list.display().to_string())
+        );
+        let cause = error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(cause.raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(fs::read(&subtree_control).unwrap(), b"unchanged");
+        assert!(!root.join("child").exists());
+
+        // All tolerates a smaller current set even at the hierarchy root.
+        fs::write(&controller_list, b"cpu").unwrap();
+        Cgroup::builder(hierarchy.clone(), CgroupPath::new("reduced").unwrap())
+            .create()
+            .unwrap();
+        assert_eq!(fs::read(&subtree_control).unwrap(), b"+cpu");
+
+        // All retains the snapshot's controller set rather than adopting a
+        // controller that became available after discovery.
+        fs::write(&controller_list, b"cpu memory io").unwrap();
+        let all = Cgroup::builder(hierarchy, CgroupPath::new("all").unwrap())
+            .create()
+            .unwrap();
+        assert!(all
+            .controller_of::<crate::fs::blkio::BlkIoController>()
+            .is_none());
+        assert_eq!(fs::read(&subtree_control).unwrap(), b"+memory");
+    }
+
+    #[test]
+    fn test_v2_controller_read_errors_preserve_context_and_stop_creation() {
+        use std::error::Error as _;
+
+        for selection in [
+            ControllerSelection::All,
+            ControllerSelection::Only(vec!["cpu".to_string()]),
+        ] {
+            for failed_directory in ["", "parent"] {
+                let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu");
+                let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+                let root = fixture.topology.cgroupfs_root();
+                let root_control = root.join("cgroup.subtree_control");
+                fs::write(&root_control, b"unchanged").unwrap();
+                let failed_file = root.join(failed_directory).join("cgroup.subtree_control");
+                if failed_directory.is_empty() {
+                    fs::remove_file(&failed_file).unwrap();
+                }
+                // A directory at the read target reliably produces EISDIR without root.
+                fs::create_dir_all(&failed_file).unwrap();
+                if !failed_directory.is_empty() {
+                    fs::write(root.join("parent/cgroup.controllers"), b"cpu").unwrap();
+                }
+                let error = Cgroup::builder(hierarchy, CgroupPath::new("parent/child").unwrap())
+                    .controllers(selection.clone())
+                    .create()
+                    .unwrap_err();
+                assert_eq!(error.kind(), &ReadFailed(failed_file.display().to_string()));
+                let cause = error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap();
+                assert_eq!(cause.raw_os_error(), Some(libc::EISDIR));
+                assert!(!root.join("parent/child").exists());
+                if failed_directory.is_empty() {
+                    assert!(!root.join("parent").exists());
+                } else {
+                    // The successful ancestor write remains; creation has no rollback.
+                    assert_eq!(fs::read(&root_control).unwrap(), b"+cpu");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_v2_creation_through_pre_enabled_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for selection in [
+            ControllerSelection::Only(vec!["pids".to_string()]),
+            ControllerSelection::All,
+        ] {
+            let fixture = crate::tests::topology_fixture(
+                crate::core::CgroupVersion::V2,
+                "cpuset memory pids rdma",
+            );
+            let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+            let root = fixture.topology.cgroupfs_root();
+            let mut ancestors = vec![(root.to_path_buf(), "cpuset memory pids rdma")];
+            for path in [
+                "user.slice",
+                "user.slice/user-1000.slice",
+                "user.slice/user-1000.slice/user@1000.service",
+            ] {
+                // Only pids was distributed into this branch. All must not
+                // attempt to enable cpuset/memory/rdma from the root snapshot.
+                ancestors.push((seed_v2_directory(root, path, "pids", "pids"), "pids"));
+            }
+            fs::write(root.join("cgroup.subtree_control"), ancestors[0].1).unwrap();
+            for (ancestor, _) in &ancestors {
+                fs::set_permissions(
+                    ancestor.join("cgroup.subtree_control"),
+                    fs::Permissions::from_mode(0o444),
+                )
+                .unwrap();
+            }
+            let parent_path = "user.slice/user-1000.slice/user@1000.service/app.slice";
+            let parent = seed_v2_directory(root, parent_path, "pids", "");
+            let target_path = format!("{}/x", parent_path);
+            if matches!(selection, ControllerSelection::Only(_)) {
+                // Seed the final observation for Only's postcondition. Plain
+                // directories do not synthesize cgroup.controllers on mkdir.
+                seed_v2_directory(root, &target_path, "pids", "");
+            }
+            let handle = Cgroup::builder(hierarchy, CgroupPath::new(&target_path).unwrap())
+                .controllers(selection)
+                .create()
+                .unwrap();
+            assert!(handle.exists());
+            assert_eq!(
+                fs::read(parent.join("cgroup.subtree_control")).unwrap(),
+                b"+pids"
+            );
+            for (ancestor, enabled) in ancestors {
+                // Also catches redundant writes when this test runs as root,
+                // where mode bits alone cannot forbid them.
+                assert_eq!(
+                    fs::read_to_string(ancestor.join("cgroup.subtree_control")).unwrap(),
+                    enabled
+                );
+            }
+            if root
+                .join(&target_path)
+                .join("cgroup.subtree_control")
+                .exists()
+            {
+                assert_eq!(
+                    fs::read(root.join(&target_path).join("cgroup.subtree_control")).unwrap(),
+                    b""
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_v2_only_requires_controllers_in_ancestors_and_target() {
+        for missing_at in ["parent", "parent/child"] {
+            let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "pids");
+            let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+            let root = fixture.topology.cgroupfs_root();
+            fs::write(root.join("cgroup.subtree_control"), b"pids").unwrap();
+            let parent = seed_v2_directory(root, "parent", "pids", "pids");
+            let target = seed_v2_directory(root, "parent/child", "pids", "unchanged");
+            fs::write(root.join(missing_at).join("cgroup.controllers"), b"").unwrap();
+            let error = Cgroup::builder(hierarchy, CgroupPath::new("parent/child").unwrap())
+                .controllers(ControllerSelection::Only(vec!["pids".to_string()]))
+                .create()
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &UnsupportedController {
+                    controller: "pids".to_string(),
+                    path: Some(root.join(missing_at).join("cgroup.controllers")),
+                }
+            );
+            assert_eq!(
+                fs::read(parent.join("cgroup.subtree_control")).unwrap(),
+                b"pids"
+            );
+            assert_eq!(
+                fs::read(target.join("cgroup.subtree_control")).unwrap(),
+                b"unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v2_enable_writes_only_missing_controllers_and_preserves_errors() {
+        use std::error::Error as _;
+
+        let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu pids");
+        let root = fixture.topology.cgroupfs_root();
+        let file = root.join("cgroup.subtree_control");
+        fs::write(&file, b"pids\n").unwrap();
+        let selected = vec!["pids".to_string(), "cpu".to_string(), "cpu".to_string()];
+        let selection = ControllerSelection::Only(selected.clone());
+        let available = vec!["cpu".to_string(), "pids".to_string()];
+        let mut writes = Vec::new();
+        enable_controllers_with(&selection, &selected, &available, root, |path, body| {
+            writes.push((path.to_path_buf(), body.to_string()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(writes, [(file.clone(), "+cpu".to_string())]);
+
+        // Required writes must still fail, with their original errno. Inject
+        // the write result so this test also works in a root library harness.
+        for errno in [libc::EACCES, libc::EBUSY] {
+            writes.clear();
+            let error =
+                enable_controllers_with(&selection, &selected, &available, root, |path, body| {
+                    writes.push((path.to_path_buf(), body.to_string()));
+                    Err(std::io::Error::from_raw_os_error(errno))
+                })
+                .unwrap_err();
+            assert_eq!(writes, [(file.clone(), "+cpu".to_string())]);
+            assert_eq!(
+                error.kind(),
+                &WriteFailed(file.display().to_string(), "+cpu".to_string())
+            );
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(errno)
+            );
+        }
+    }
+
+    #[test]
+    fn test_v2_all_skips_individual_ancestor_enable_failures() {
+        let fixture =
+            crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpuset cpu pids");
+        let root = fixture.topology.cgroupfs_root();
+        // user.slice offers cpuset without distributing it to the delegated
+        // branch. Inject the error so this also works in a root test harness.
+        let ancestor = seed_v2_directory(root, "user.slice", "cpuset cpu pids", "pids");
+        let file = ancestor.join("cgroup.subtree_control");
+        let controllers = vec!["cpuset".to_string(), "cpu".to_string(), "pids".to_string()];
+        let available = supported_controllers_at(&ancestor).unwrap();
+        let selection = ControllerSelection::default();
+
+        for errno in [libc::EACCES, libc::EBUSY] {
+            let mut writes = Vec::new();
+            enable_controllers_with(
+                &selection,
+                &controllers,
+                &available,
+                &ancestor,
+                |path, body| {
+                    writes.push((path.to_path_buf(), body.to_string()));
+                    if body == "+cpuset" {
+                        Err(std::io::Error::from_raw_os_error(errno))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                writes,
+                [
+                    (file.clone(), "+cpuset".to_string()),
+                    (file.clone(), "+cpu".to_string()),
+                ]
+            );
+        }
+
+        // The next level uses its own offered set; cpuset is unavailable.
+        let delegated = seed_v2_directory(root, "user.slice/user-1000.slice", "cpu pids", "");
+        let available = supported_controllers_at(&delegated).unwrap();
+        let mut writes = Vec::new();
+        enable_controllers_with(
+            &selection,
+            &controllers,
+            &available,
+            &delegated,
+            |path, body| {
+                writes.push((path.to_path_buf(), body.to_string()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        let file = delegated.join("cgroup.subtree_control");
+        assert_eq!(
+            writes,
+            [
+                (file.clone(), "+cpu".to_string()),
+                (file, "+pids".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_root_operations_use_v1_prefixes_only_for_membership() {
+        let fixture = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+              44 33 0:39 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n\
+              45 33 0:40 / /sys/fs/cgroup/pids rw - cgroup cgroup rw,pids\n\
+              46 33 0:41 / /sys/fs/cgroup/blkio rw - cgroup cgroup rw,blkio\n",
+            b"1:memory:/\n2:cpu:/\n3:pids:/\n4:blkio:/\n",
+            "",
+        );
+        let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+        let root = fixture.topology.cgroupfs_root();
+        let names = ["cpu", "memory", "pids", "blkio"];
+        let files = [
+            ("tasks", "100"),
+            ("cgroup.procs", "101"),
+            ("release_agent", "/sbin/release"),
+        ];
+        let prefixes: HashMap<_, _> = names
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    CgroupPath::new(format!("delegated/{}", name)).unwrap(),
+                )
+            })
+            .collect();
+
+        for (selection, prefixes) in [
+            (
+                ControllerSelection::Only(vec!["cpu".to_string()]),
+                prefixes.clone(),
+            ),
+            (ControllerSelection::Only(Vec::new()), prefixes.clone()),
+            (ControllerSelection::All, prefixes.clone()),
+            (ControllerSelection::All, HashMap::new()),
+            (
+                ControllerSelection::All,
+                HashMap::from([("cpu".to_string(), prefixes["cpu"].clone())]),
+            ),
+        ] {
+            // Seed both the true roots and prefixed paths with distinct state.
+            // These ordinary files verify destinations, not kernel migration.
+            for name in names {
+                let prefix = prefixes
+                    .get(name)
+                    .map_or(Path::new(""), CgroupPath::as_path);
+                for relative in [
+                    PathBuf::new(),
+                    prefix.to_path_buf(),
+                    prefix.join("parent/child"),
+                ] {
+                    let directory = root.join(name).join(relative);
+                    fs::create_dir_all(&directory).unwrap();
+                    for (file, _) in files {
+                        fs::write(directory.join(file), b"unchanged").unwrap();
+                    }
+                }
+            }
+            let child =
+                Cgroup::builder(hierarchy.clone(), CgroupPath::new("parent/child").unwrap())
+                    .controllers(selection.clone())
+                    .v1_prefixes(prefixes.clone())
+                    .load();
+            child.remove_task(CgroupPid::from(100)).unwrap();
+            child
+                .clone()
+                .remove_task_by_tgid(CgroupPid::from(101))
+                .unwrap();
+            child.set_release_agent("/sbin/release").unwrap();
+
+            for name in names {
+                let selected = match &selection {
+                    ControllerSelection::All => true,
+                    ControllerSelection::Only(names) => {
+                        names.iter().any(|selected| selected == name)
+                    }
+                };
+                let prefix = prefixes
+                    .get(name)
+                    .map_or(Path::new(""), CgroupPath::as_path);
+                for (file, value) in files {
+                    let target = if file == "release_agent" {
+                        Path::new("")
+                    } else {
+                        prefix
+                    };
+                    for relative in [
+                        PathBuf::new(),
+                        prefix.to_path_buf(),
+                        prefix.join("parent/child"),
+                    ] {
+                        assert_eq!(
+                            fs::read_to_string(root.join(name).join(&relative).join(file)).unwrap(),
+                            if selected && relative == target {
+                                value
+                            } else {
+                                "unchanged"
+                            },
+                            "{name}/{relative:?}/{file} must respect {selection:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_root_operations_preserve_write_error_paths_and_sources() {
+        use std::error::Error as _;
+
+        let fixture = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+              44 33 0:39 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n",
+            b"1:memory:/\n2:cpu:/\n",
+            "",
+        );
+        let root = fixture.topology.cgroupfs_root();
+        for file in ["delegated/tasks", "delegated/cgroup.procs", "release_agent"] {
+            // A directory at the write target fails even in a root harness.
+            fs::create_dir_all(root.join("cpu").join(file)).unwrap();
+        }
+        let child = Cgroup::builder(
+            crate::fs::hierarchies::from_topology(fixture.topology.clone()),
             CgroupPath::new("child").unwrap(),
-            selected,
-        );
-        let child_names: Vec<_> = child
-            .subsystems()
-            .iter()
-            .map(Subsystem::controller_name)
-            .collect();
-        assert_eq!(child_names, vec!["memory".to_string()]);
+        )
+        .controllers(ControllerSelection::Only(vec!["cpu".to_string()]))
+        .v1_prefixes(HashMap::from([(
+            "cpu".to_string(),
+            CgroupPath::new("delegated").unwrap(),
+        )]))
+        .load();
+        for (file, error) in [
+            (
+                "delegated/tasks",
+                child.remove_task(CgroupPid::from(100)).unwrap_err(),
+            ),
+            (
+                "delegated/cgroup.procs",
+                child.remove_task_by_tgid(CgroupPid::from(101)).unwrap_err(),
+            ),
+            (
+                "release_agent",
+                child.set_release_agent("/sbin/release").unwrap_err(),
+            ),
+        ] {
+            assert!(
+                matches!(error.kind(), WriteFailed(path, _) if path == &root.join("cpu").join(file).display().to_string())
+            );
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EISDIR)
+            );
+        }
+        assert!(!root.join("memory").exists());
+        assert!(!root.join("cpu/delegated/child").exists());
+
+        // A missing prefix must fail rather than fall back to a writable root.
+        fs::remove_dir_all(root.join("cpu/delegated")).unwrap();
+        for file in ["tasks", "cgroup.procs"] {
+            fs::write(root.join("cpu").join(file), b"unchanged").unwrap();
+        }
+        for (file, error) in [
+            (
+                "tasks",
+                child.remove_task(CgroupPid::from(100)).unwrap_err(),
+            ),
+            (
+                "cgroup.procs",
+                child.remove_task_by_tgid(CgroupPid::from(101)).unwrap_err(),
+            ),
+        ] {
+            assert!(
+                matches!(error.kind(), WriteFailed(path, _) if path == &root.join("cpu/delegated").join(file).display().to_string())
+            );
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::ENOENT),
+            );
+            assert_eq!(fs::read(root.join("cpu").join(file)).unwrap(), b"unchanged");
+        }
+    }
+
+    #[test]
+    fn test_remove_task_ignores_v1_prefixes_on_v2() {
+        let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu");
+        let root = fixture.topology.cgroupfs_root();
+        // A regular file models thread mode for destination checks only.
+        fs::write(root.join("cgroup.type"), CGROUP_MODE_DOMAIN_THREADED).unwrap();
+        for relative in ["", "delegated", "child", "delegated/child"] {
+            let directory = root.join(relative);
+            fs::create_dir_all(&directory).unwrap();
+            for file in ["cgroup.threads", "cgroup.procs"] {
+                fs::write(directory.join(file), b"unchanged").unwrap();
+            }
+        }
+        let child = Cgroup::builder(
+            crate::fs::hierarchies::from_topology(fixture.topology.clone()),
+            CgroupPath::new("child").unwrap(),
+        )
+        .controllers(ControllerSelection::Only(vec!["cpu".to_string()]))
+        .v1_prefixes(HashMap::from([(
+            "cpu".to_string(),
+            CgroupPath::new("delegated").unwrap(),
+        )]))
+        .load();
+        child.remove_task(CgroupPid::from(100)).unwrap();
+        child.remove_task_by_tgid(CgroupPid::from(101)).unwrap();
+        for (file, value) in [("cgroup.threads", "100"), ("cgroup.procs", "101")] {
+            assert_eq!(fs::read_to_string(root.join(file)).unwrap(), value);
+            for relative in ["delegated", "child", "delegated/child"] {
+                assert_eq!(
+                    fs::read(root.join(relative).join(file)).unwrap(),
+                    b"unchanged"
+                );
+            }
+        }
     }
 
     #[test]
     #[cfg(feature = "fixtures")]
-    fn test_cgroup_legacy_and_typed_path_api() {
+    fn test_root_selection_limits_v1_creation_and_membership_writes() {
+        let fixture = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+              44 33 0:39 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n",
+            b"1:memory:/\n2:cpu:/\n",
+            "",
+        );
+        let root = fixture.topology.cgroupfs_root();
+        let memory = root.join("memory/delegated");
+        let cpu = root.join("cpu/delegated");
+        let handle = Cgroup::builder(
+            crate::fs::hierarchies::from_topology(fixture.topology.clone()),
+            CgroupPath::root(),
+        )
+        .controllers(ControllerSelection::Only(vec!["memory".to_string()]))
+        .v1_prefixes(HashMap::from([
+            ("memory".to_string(), CgroupPath::new("delegated").unwrap()),
+            ("cpu".to_string(), CgroupPath::new("delegated").unwrap()),
+        ]))
+        .create()
+        .unwrap();
+        assert!(memory.is_dir());
+        assert!(!cpu.exists());
+
+        // Ordinary files verify write destinations, not kernel migration.
+        fs::create_dir_all(&cpu).unwrap();
+        for directory in [&memory, &cpu] {
+            fs::write(directory.join("tasks"), b"999").unwrap();
+            fs::write(directory.join("cgroup.procs"), b"999").unwrap();
+        }
+        handle.add_task(CgroupPid::from(100)).unwrap();
+        handle.add_task_by_tgid(CgroupPid::from(101)).unwrap();
+        assert_eq!(fs::read(memory.join("tasks")).unwrap(), b"100");
+        assert_eq!(fs::read(memory.join("cgroup.procs")).unwrap(), b"101");
+        assert_eq!(fs::read(cpu.join("tasks")).unwrap(), b"999");
+        assert_eq!(fs::read(cpu.join("cgroup.procs")).unwrap(), b"999");
+    }
+
+    #[test]
+    #[cfg(feature = "fixtures")]
+    fn test_handle_builder_maps_v1_paths_and_preserves_v2_paths() {
+        let fixture = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+              44 33 0:39 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n",
+            b"1:memory:/\n2:cpu:/\n",
+            "",
+        );
+        let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+        let v1_prefixes =
+            HashMap::from([("memory".to_string(), CgroupPath::new("delegated").unwrap())]);
+        let child = Cgroup::builder(hierarchy.clone(), CgroupPath::new("child").unwrap())
+            .v1_prefixes(v1_prefixes.clone())
+            .load();
+        assert_eq!(child.path().as_path(), Path::new("child"));
+        let memory: &crate::fs::memory::MemController = child.controller_of().unwrap();
+        let cpu: &crate::fs::cpu::CpuController = child.controller_of().unwrap();
+        let root = fixture.topology.cgroupfs_root();
+        assert_eq!(memory.path(), root.join("memory/delegated/child"));
+        assert_eq!(cpu.path(), root.join("cpu/child"));
+        assert!(Arc::ptr_eq(&hierarchy, &child.hier));
+
+        let selected = Cgroup::builder(hierarchy.clone(), CgroupPath::new("child").unwrap())
+            .controllers(ControllerSelection::Only(vec!["memory".to_string()]))
+            .v1_prefixes(v1_prefixes.clone())
+            .load();
+        assert_eq!(selected.subsystems().len(), 1);
+        let memory: &crate::fs::memory::MemController = selected.controller_of().unwrap();
+        assert_eq!(memory.path(), root.join("memory/delegated/child"));
+
+        let root_handle = Cgroup::builder(hierarchy, CgroupPath::root())
+            .controllers(ControllerSelection::Only(vec!["memory".to_string()]))
+            .v1_prefixes(v1_prefixes.clone())
+            .load();
+        assert!(root_handle.path().is_root());
+        assert_eq!(root_handle.subsystems().len(), 1);
+        let memory: &crate::fs::memory::MemController = root_handle.controller_of().unwrap();
+        assert_eq!(memory.path(), root.join("memory/delegated"));
+
+        let unified = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "memory");
+        let hierarchy = crate::fs::hierarchies::from_topology(unified.topology.clone());
+        let child = Cgroup::builder(hierarchy, CgroupPath::new("child").unwrap())
+            .v1_prefixes(v1_prefixes)
+            .load();
+        assert_eq!(child.path().as_path(), Path::new("child"));
+        let memory: &crate::fs::memory::MemController = child.controller_of().unwrap();
+        assert_eq!(
+            memory.path(),
+            unified.topology.cgroupfs_root().join("child")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "fixtures")]
+    fn test_parent_retains_controller_selection_and_v1_prefixes() {
+        let fixture = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+              44 33 0:39 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n",
+            b"1:memory:/\n2:cpu:/\n",
+            "",
+        );
+        let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+        let selected = vec!["memory".to_string()];
+        let child = Cgroup::builder(hierarchy.clone(), CgroupPath::new("a/b").unwrap())
+            .controllers(ControllerSelection::Only(selected.clone()))
+            .v1_prefixes(HashMap::from([(
+                "memory".to_string(),
+                CgroupPath::new("delegated").unwrap(),
+            )]))
+            .load();
+
+        for parent in [child.parent().unwrap(), child.clone().parent().unwrap()] {
+            assert_eq!(parent.path().as_path(), Path::new("a"));
+            assert!(Arc::ptr_eq(&hierarchy, &parent.hier));
+            assert_eq!(
+                parent.controllers,
+                ControllerSelection::Only(selected.clone())
+            );
+            assert_eq!(parent.subsystems().len(), 1);
+            let memory: &crate::fs::memory::MemController = parent.controller_of().unwrap();
+            assert_eq!(
+                memory.path(),
+                fixture.topology.cgroupfs_root().join("memory/delegated/a")
+            );
+
+            // The empty relative path stays at the configured v1 prefix and
+            // retains the child's controller selection.
+            let boundary = parent.parent().unwrap().clone();
+            assert!(boundary.path().is_root());
+            assert!(Arc::ptr_eq(&hierarchy, &boundary.hier));
+            assert_eq!(
+                boundary.controllers,
+                ControllerSelection::Only(selected.clone())
+            );
+            assert_eq!(boundary.subsystems().len(), 1);
+            let memory: &crate::fs::memory::MemController = boundary.controller_of().unwrap();
+            assert_eq!(
+                memory.path(),
+                fixture.topology.cgroupfs_root().join("memory/delegated")
+            );
+            assert!(boundary.parent().is_err());
+        }
+    }
+
+    #[test]
+    fn test_v1_prefix_split_controls_parent_boundary_for_the_same_directory() {
+        let fixture = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+            b"1:memory:/\n",
+            "",
+        );
+        let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+        let handle = |prefix: &str, path: &str| {
+            Cgroup::builder(hierarchy.clone(), CgroupPath::new(path).unwrap())
+                .v1_prefixes(HashMap::from([(
+                    "memory".to_string(),
+                    CgroupPath::new(prefix).unwrap(),
+                )]))
+                .load()
+        };
+        let directory = |handle: &Cgroup| {
+            let memory: &crate::fs::memory::MemController = handle.controller_of().unwrap();
+            memory.path().to_path_buf()
+        };
+
+        let narrow = handle("kubepods/pod1", "ctr1");
+        let broad = handle("kubepods", "pod1/ctr1");
+        let mount = fixture.topology.cgroupfs_root().join("memory");
+        assert_eq!(directory(&narrow), mount.join("kubepods/pod1/ctr1"));
+        assert_eq!(directory(&narrow), directory(&broad));
+
+        let narrow_parent = narrow.parent().unwrap();
+        let broad_parent = broad.parent().unwrap();
+        assert_eq!(directory(&narrow_parent), mount.join("kubepods/pod1"));
+        assert_eq!(directory(&narrow_parent), directory(&broad_parent));
+        assert!(narrow_parent.path().is_root());
+        assert!(narrow_parent.parent().is_err());
+        assert_eq!(broad_parent.path().as_path(), Path::new("pod1"));
+
+        let broad_boundary = broad_parent.parent().unwrap();
+        assert_eq!(directory(&broad_boundary), mount.join("kubepods"));
+        assert!(broad_boundary.path().is_root());
+        assert!(broad_boundary.parent().is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "fixtures")]
+    fn test_parent_at_empty_path_preserves_distinct_v1_prefixes() {
+        use std::error::Error as _;
+
+        let fixture = crate::tests::TopologyFixture::new(
+            b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+              44 33 0:39 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n\
+              45 33 0:40 / /sys/fs/cgroup/pids rw - cgroup cgroup rw,pids\n",
+            b"1:memory:/\n2:cpu:/\n3:pids:/\n",
+            "",
+        );
+        let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+        let prefixes = HashMap::from([
+            (
+                "memory".to_string(),
+                CgroupPath::new(OsStr::from_bytes(b"delegated/\xff")).unwrap(),
+            ),
+            ("cpu".to_string(), CgroupPath::new("workloads/cpu").unwrap()),
+        ]);
+        let root = fixture.topology.cgroupfs_root();
+        let memory_parent = root
+            .join("memory")
+            .join(OsStr::from_bytes(b"delegated/\xff"));
+        let cpu_parent = root.join("cpu/workloads/cpu");
+        let pids_parent = root.join("pids");
+
+        for selection in [
+            ControllerSelection::All,
+            ControllerSelection::Only(vec!["memory".to_string(), "cpu".to_string()]),
+            ControllerSelection::Only(Vec::new()),
+        ] {
+            let builder = Cgroup::builder(hierarchy.clone(), CgroupPath::new("child").unwrap())
+                .v1_prefixes(prefixes.clone())
+                .controllers(selection.clone());
+            let root_builder = Cgroup::builder(hierarchy.clone(), CgroupPath::root())
+                .v1_prefixes(prefixes.clone())
+                .controllers(selection);
+            let child = builder.load();
+            for parent in [
+                child.parent().unwrap(),
+                child.clone().parent().unwrap(),
+                root_builder.load(),
+            ] {
+                assert!(parent.path().is_root());
+                assert!(Arc::ptr_eq(&hierarchy, &parent.hier));
+                let expected: Vec<_> = child
+                    .subsystems()
+                    .iter()
+                    .map(Subsystem::controller_name)
+                    .collect();
+                let actual: Vec<_> = parent
+                    .subsystems()
+                    .iter()
+                    .map(Subsystem::controller_name)
+                    .collect();
+                assert_eq!(actual, expected);
+                for subsystem in parent.subsystems() {
+                    let expected_path = match subsystem.controller_name().as_str() {
+                        "memory" => &memory_parent,
+                        "cpu" => &cpu_parent,
+                        "pids" => &pids_parent,
+                        name => panic!("unexpected controller: {}", name),
+                    };
+                    assert_eq!(subsystem.to_controller().path(), expected_path);
+                }
+            }
+        }
+
+        // Ordinary files verify the migration methods' write destinations;
+        // they do not exercise kernel process migration.
+        for directory in [
+            &memory_parent,
+            &cpu_parent,
+            &pids_parent,
+            &root.join("memory"),
+            &root.join("cpu"),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join("tasks"), b"999").unwrap();
+            fs::write(directory.join("cgroup.procs"), b"999").unwrap();
+        }
+        let child = Cgroup::builder(hierarchy, CgroupPath::new("child").unwrap())
+            .controllers(ControllerSelection::Only(vec![
+                "memory".to_string(),
+                "cpu".to_string(),
+            ]))
+            .v1_prefixes(prefixes)
+            .load();
+        child.move_task_to_parent(CgroupPid::from(100)).unwrap();
+        child
+            .clone()
+            .move_task_to_parent_by_tgid(CgroupPid::from(101))
+            .unwrap();
+        for directory in [&memory_parent, &cpu_parent] {
+            assert_eq!(fs::read(directory.join("tasks")).unwrap(), b"100");
+            assert_eq!(fs::read(directory.join("cgroup.procs")).unwrap(), b"101");
+        }
+        for directory in [&pids_parent, &root.join("memory"), &root.join("cpu")] {
+            assert_eq!(fs::read(directory.join("tasks")).unwrap(), b"999");
+            assert_eq!(fs::read(directory.join("cgroup.procs")).unwrap(), b"999");
+        }
+
+        // A missing configured parent propagates the filesystem error rather
+        // than falling back to the controller's hierarchy root.
+        fs::remove_dir_all(&cpu_parent).unwrap();
+        let error = child.move_task_to_parent(CgroupPid::from(102)).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            WriteFailed(path, _) if path == &cpu_parent.join("tasks").display().to_string()
+        ));
+        let cause = error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(cause.kind(), std::io::ErrorKind::NotFound);
+        assert!(!cpu_parent.exists());
+        assert_eq!(fs::read(root.join("cpu/tasks")).unwrap(), b"999");
+    }
+
+    #[test]
+    #[cfg(feature = "fixtures")]
+    fn test_load_does_not_create_and_new_preserves_creation_errors() {
+        use std::error::Error as _;
+
+        let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "memory");
+        let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
+        let root = fixture.topology.cgroupfs_root();
+        let handle = Cgroup::load(hierarchy.clone(), CgroupPath::new("missing").unwrap());
+        assert!(!root.join("missing").exists());
+        assert!(!handle.exists());
+
+        fs::write(root.join("blocked"), b"not a directory").unwrap();
+        let error = Cgroup::new(hierarchy, CgroupPath::new("blocked/child").unwrap()).unwrap_err();
+        let cause = error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        // Creation visits "blocked" first; its existing regular file causes
+        // EEXIST before attempting to create the child directory.
+        assert_eq!(cause.raw_os_error(), Some(libc::EEXIST));
+    }
+
+    #[test]
+    #[cfg(feature = "fixtures")]
+    fn test_cgroup_path_accessor() {
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V1, "");
         let topology = fixture.topology.clone();
-        let hier = Box::new(crate::fs::hierarchies::V1::with_topology(topology));
-        #[allow(deprecated)]
-        let cg = Cgroup::load(hier, "subgroup/child");
+        let hier = Arc::new(crate::fs::hierarchies::V1::from(topology));
+        let cg = Cgroup::load(hier, CgroupPath::new("subgroup/child").unwrap());
 
-        // Legacy path() returns &str
-        let path_str: &str = cg.path();
-        assert_eq!(path_str, "subgroup/child");
-
-        // Typed as_path() returns &Path
-        let path_ref: &Path = cg.as_path();
+        let path: &CgroupPath = cg.path();
+        let path_ref: &Path = path.as_path();
         assert_eq!(path_ref, Path::new("subgroup/child"));
+        assert_eq!(path_ref.to_str(), Some("subgroup/child"));
 
-        // Validated cgroup_path() returns &CgroupPath
-        assert_eq!(cg.cgroup_path().as_path(), Path::new("subgroup/child"));
+        // The typed borrow can also be passed directly to AsRef<Path> APIs.
+        assert_eq!(
+            Path::new("/mount").join(cg.path()),
+            Path::new("/mount/subgroup/child")
+        );
     }
 
     #[test]
@@ -1183,21 +2404,26 @@ mod tests {
     #[test]
     #[cfg(feature = "fixtures")]
     fn test_parent_and_move_task_fails_closed_on_root() {
+        use crate::core::error::PathError;
+        use std::error::Error as _;
+
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "");
         let topology = fixture.topology.clone();
-        let hier = crate::fs::hierarchies::auto_with_topology(topology);
-        let root = Cgroup::load_validated(hier, CgroupPath::root().unwrap());
+        let hier = crate::fs::hierarchies::from_topology(topology);
+        let root = Cgroup::load(hier, CgroupPath::root());
 
         // Root cgroup has no parent and must fail closed rather than mutating root
-        assert!(root.parent().is_err());
+        let error = root.parent().unwrap_err();
+        let cause = error.source().unwrap().downcast_ref::<PathError>().unwrap();
+        assert!(matches!(
+            cause,
+            PathError::RootPath { input, operation }
+                if input.as_os_str().is_empty() && *operation == "Cgroup::parent"
+        ));
         assert!(root.move_task_to_parent(CgroupPid::from(100)).is_err());
         assert!(root
             .move_task_to_parent_by_tgid(CgroupPid::from(100))
             .is_err());
-
-        let legacy_parent =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.parent_control_group()));
-        assert!(legacy_parent.is_err());
     }
 
     #[test]
@@ -1207,103 +2433,72 @@ mod tests {
         let path = CgroupPath::new(Path::new(OsStr::from_bytes(non_utf8_bytes))).unwrap();
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "");
         let topology = fixture.topology.clone();
-        let hier = crate::fs::hierarchies::auto_with_topology(topology);
-        let child = Cgroup::load_validated(hier, path);
+        let hier = crate::fs::hierarchies::from_topology(topology);
+        let child = Cgroup::load(hier, path);
 
         let parent = child.parent().expect("parent resolution must succeed");
-        assert_eq!(parent.as_path().as_os_str().as_bytes(), b"\xff\xfe");
+        assert_eq!(parent.path().as_path().as_os_str().as_bytes(), b"\xff\xfe");
     }
 
     #[test]
-    fn test_existing_path_propagates_discovery_error() {
-        let host_paths = crate::core::HostPaths::new(
-            PathBuf::from("/nonexistent/proc"),
-            PathBuf::from("/nonexistent/hugepages"),
-        );
-        let mut paths = HashMap::new();
-        paths.insert("memory".to_string(), "/test".to_string());
-
-        let result = existing_path_with_host_paths(paths, &host_paths);
-        assert!(
-            result.is_err(),
-            "existing_path must return Err and not panic on discovery failure"
-        );
-    }
-
-    #[test]
-    fn test_get_cgroups_relative_paths_uses_membership_parser() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("cgroups-rs-rel-path-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).unwrap();
-
-        let valid_file = temp_dir.join("cgroup_valid");
-        fs::write(
-            &valid_file,
-            "1:memory:/user.slice\n2:cpu,cpuacct:/test.slice:colon_path:scope\n0::/../sibling.slice\n",
-        )
-        .unwrap();
-        let map = get_cgroups_relative_paths_by_path(&valid_file).unwrap();
-        assert_eq!(map.get("memory").unwrap(), "/user.slice");
-        assert_eq!(map.get("cpu").unwrap(), "/test.slice:colon_path:scope");
-        assert_eq!(map.get("cpuacct").unwrap(), "/test.slice:colon_path:scope");
-        assert_eq!(map.get("").unwrap(), "/../sibling.slice");
-
-        let malformed_file = temp_dir.join("cgroup_malformed");
-        fs::write(&malformed_file, "bad_line_without_colons\n").unwrap();
-        let err = get_cgroups_relative_paths_by_path(&malformed_file);
-        assert!(
-            err.is_err(),
-            "Must propagate parse error for malformed membership content"
-        );
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_custom_hierarchy_legacy_parent_control_group_does_not_skip_generation() {
+    fn test_custom_parent_preserves_hierarchy_controllers_and_path_bytes() {
         #[derive(Debug)]
-        struct LegacyCustomHierarchy(PathBuf);
+        struct CustomHierarchy(PathBuf);
 
-        impl Hierarchy for LegacyCustomHierarchy {
+        impl Hierarchy for CustomHierarchy {
             fn subsystems(&self) -> Vec<Subsystem> {
-                vec![]
+                vec![
+                    Subsystem::Mem(crate::fs::memory::MemController::new(
+                        self.0.clone(),
+                        self.0.clone(),
+                        true,
+                    )),
+                    Subsystem::Cpu(crate::fs::cpu::CpuController::new(
+                        self.0.clone(),
+                        self.0.clone(),
+                        true,
+                    )),
+                ]
             }
 
-            fn root(&self) -> PathBuf {
-                self.0.clone()
-            }
-
-            fn root_control_group(&self) -> Cgroup {
-                Cgroup::load_validated(
-                    Box::new(LegacyCustomHierarchy(self.0.clone())),
-                    CgroupPath::root().unwrap(),
-                )
-            }
-
-            // Custom hierarchy only implements the legacy &str method
-            fn parent_control_group(&self, path: &str) -> Cgroup {
-                let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
-                let cpath = if parent.as_os_str().is_empty() {
-                    CgroupPath::root().unwrap()
-                } else {
-                    CgroupPath::new(parent).unwrap()
-                };
-                Cgroup::load_validated(Box::new(LegacyCustomHierarchy(self.0.clone())), cpath)
+            fn root(&self) -> Result<PathBuf> {
+                Ok(self.0.clone())
             }
 
             fn v2(&self) -> bool {
-                false
+                true
             }
         }
 
-        let hier = Box::new(LegacyCustomHierarchy(PathBuf::from("/test")));
-        let child = Cgroup::load_validated(hier, CgroupPath::new("a/b/c").unwrap());
-        let parent = child.parent().expect("parent resolution must succeed");
-        assert_eq!(
-            parent.as_path(),
-            Path::new("a/b"),
-            "parent must be direct parent a/b, not grandparent a"
-        );
+        let hierarchy: Arc<dyn Hierarchy> = Arc::new(CustomHierarchy(PathBuf::from("/test")));
+        let selected = vec!["memory".to_string()];
+        let cases: &[(&[u8], &[u8])] = &[(b"a/b/c", b"a/b"), (b"\xff/b/c", b"\xff/b"), (b"a", b"")];
+        for (path, expected_parent) in cases {
+            let child = Cgroup::builder(
+                hierarchy.clone(),
+                CgroupPath::new(OsStr::from_bytes(path)).unwrap(),
+            )
+            .controllers(ControllerSelection::Only(selected.clone()))
+            .load();
+            let parent = child.parent().unwrap();
+            assert_eq!(
+                parent.path().as_path().as_os_str().as_bytes(),
+                *expected_parent
+            );
+            assert!(Arc::ptr_eq(&hierarchy, &parent.hier));
+            assert_eq!(
+                parent.controllers,
+                ControllerSelection::Only(selected.clone())
+            );
+            assert_eq!(parent.subsystems().len(), 1);
+            let memory: &crate::fs::memory::MemController = parent.controller_of().unwrap();
+            assert_eq!(
+                memory.path(),
+                hierarchy
+                    .root()
+                    .unwrap()
+                    .join(OsStr::from_bytes(expected_parent))
+            );
+        }
     }
 }

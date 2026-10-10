@@ -5,6 +5,7 @@
 //
 
 //! Integration test about setting resources using `apply()`
+use cgroups_rs::core::CgroupPath;
 use cgroups_rs::fs::pid::PidController;
 use cgroups_rs::fs::{Cgroup, MaxValue, PidResources, Resources};
 
@@ -12,8 +13,8 @@ use cgroups_rs::fs::{Cgroup, MaxValue, PidResources, Resources};
 fn pid_resources() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("pid_resources")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("pid_resources").unwrap()).unwrap();
     {
         let res = Resources {
             pid: PidResources {

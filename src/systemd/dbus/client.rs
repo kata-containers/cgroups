@@ -317,7 +317,9 @@ pub mod tests {
     }
 
     fn start_default_cgroup(pid: CgroupPid, unit: &'_ str) -> SystemdClient<'_> {
-        let mut props = PropertiesBuilder::default_cgroup(TEST_SLICE, unit).build();
+        let mut props = PropertiesBuilder::default_cgroup(TEST_SLICE, unit)
+            .build()
+            .unwrap();
         props.push((PIDS, Value::Array(vec![pid.pid as u32].into())));
         let cgroup = SystemdClient::new(unit, props).unwrap();
         // Stop the unit if it exists.
@@ -337,7 +339,7 @@ pub mod tests {
         skip_if_not_root!();
         skip_if_no_systemd!();
 
-        let v2 = hierarchies::is_cgroup2_unified_mode();
+        let v2 = hierarchies::is_cgroup2_unified_mode().unwrap();
         let unit = test_unit();
         let mut child = spawn_sleep_inf();
         let cgroup = start_default_cgroup(CgroupPid::from(child.id() as u64), &unit);
@@ -538,7 +540,7 @@ pub mod tests {
         skip_if_not_root!();
         skip_if_no_systemd!();
 
-        let v2 = hierarchies::is_cgroup2_unified_mode();
+        let v2 = hierarchies::is_cgroup2_unified_mode().unwrap();
         let unit = test_unit();
         let mut child = spawn_yes();
         let cgroup = start_default_cgroup(CgroupPid::from(child.id() as u64), &unit);
@@ -606,7 +608,7 @@ pub mod tests {
         skip_if_not_root!();
         skip_if_no_systemd!();
 
-        let v2 = hierarchies::is_cgroup2_unified_mode();
+        let v2 = hierarchies::is_cgroup2_unified_mode().unwrap();
         let unit = test_unit();
         let mut child = spawn_sleep_inf();
         let cgroup = start_default_cgroup(CgroupPid::from(child.id() as u64), &unit);
