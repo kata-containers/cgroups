@@ -12,8 +12,9 @@ use std::process::Command;
 use cgroups_rs::core::CgroupPath;
 use cgroups_rs::fs::hierarchies;
 use cgroups_rs::fs::pid::PidController;
-use cgroups_rs::fs::{Cgroup, Hierarchy, MaxValue, Subsystem};
+use cgroups_rs::fs::{Cgroup, ControllerSelection, Hierarchy, MaxValue, Subsystem};
 use cgroups_rs::CgroupPid;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct DelegatedV2Hierarchy {
@@ -35,22 +36,8 @@ impl Hierarchy for DelegatedV2Hierarchy {
         ))]
     }
 
-    fn root(&self) -> PathBuf {
-        self.root.clone()
-    }
-
-    fn root_control_group(&self) -> Cgroup {
-        Cgroup::load_validated(Box::new(self.clone()), CgroupPath::root().unwrap())
-    }
-
-    fn parent_control_group(&self, path: &str) -> Cgroup {
-        let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
-        let cpath = if parent.as_os_str().is_empty() {
-            CgroupPath::root().unwrap()
-        } else {
-            CgroupPath::new(parent).unwrap_or_else(|_| CgroupPath::root().unwrap())
-        };
-        Cgroup::load_validated(Box::new(self.clone()), cpath)
+    fn root(&self) -> cgroups_rs::fs::error::Result<PathBuf> {
+        Ok(self.root.clone())
     }
 
     fn v2(&self) -> bool {
@@ -124,9 +111,16 @@ fn prepare_parent_for_pids(root: &Path) -> Vec<String> {
     root_pids
 }
 
-fn exercise_v2_hierarchy(hierarchy: Box<dyn Hierarchy>, root: &Path) {
+fn exercise_v2_hierarchy(hierarchy: Arc<dyn Hierarchy>, root: &Path) {
     let name = format!("cgroups-rs-environment-{}", std::process::id());
-    let cgroup = Cgroup::new(hierarchy, &name).expect("create a child cgroup");
+    let path = root
+        .strip_prefix(hierarchy.root().expect("get the unified mount point"))
+        .expect("delegated directory must be within the hierarchy mount")
+        .join(&name);
+    let cgroup = Cgroup::builder(hierarchy, CgroupPath::new(path).unwrap())
+        .controllers(ControllerSelection::Only(vec!["pids".to_string()]))
+        .create()
+        .expect("create a child cgroup");
     assert!(cgroup.exists(), "new child cgroup must exist");
     let cgroup_type =
         fs::read_to_string(root.join(&name).join("cgroup.type")).expect("read child cgroup.type");
@@ -213,9 +207,14 @@ fn delegated_rootless_v2() {
 
     prepare_parent_for_pids(&delegated_root);
     exercise_v2_hierarchy(
-        Box::new(DelegatedV2Hierarchy::new(delegated_root.clone())),
+        Arc::new(DelegatedV2Hierarchy::new(delegated_root.clone())),
         &delegated_root,
     );
+    // The built-in hierarchy starts at the actual mount point. A rootless
+    // caller must traverse pre-enabled ancestors without writing to them.
+    let hierarchy = hierarchies::auto().expect("discover the built-in hierarchy");
+    assert_ne!(hierarchy.root().unwrap(), delegated_root);
+    exercise_v2_hierarchy(hierarchy, &delegated_root);
 }
 
 #[test]
@@ -229,7 +228,7 @@ fn cgroup_namespace_nested_v2() {
         "the service cgroup must become the cgroup namespace root"
     );
     assert!(
-        hierarchies::is_cgroup2_unified_mode(),
+        hierarchies::is_cgroup2_unified_mode().unwrap(),
         "the private /sys/fs/cgroup mount must be cgroup2"
     );
 
@@ -243,5 +242,5 @@ fn cgroup_namespace_nested_v2() {
         root_pids.iter().any(|pid| pid != &test_pid),
         "the unshare --fork waiting parent must be moved out of the namespace root"
     );
-    exercise_v2_hierarchy(hierarchies::auto(), Path::new("/sys/fs/cgroup"));
+    exercise_v2_hierarchy(hierarchies::auto().unwrap(), Path::new("/sys/fs/cgroup"));
 }

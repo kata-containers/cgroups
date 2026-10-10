@@ -34,7 +34,6 @@ macro_rules! update {
 
 pub mod blkio;
 pub mod cgroup;
-pub mod cgroup_builder;
 pub mod cpu;
 pub mod cpuacct;
 pub mod cpuset;
@@ -50,6 +49,7 @@ pub mod net_prio;
 pub mod perf_event;
 pub mod pid;
 pub mod rdma;
+mod reader;
 pub mod systemd;
 
 use crate::fs::blkio::BlkIoController;
@@ -70,7 +70,9 @@ use crate::fs::rdma::RdmaController;
 use crate::fs::systemd::SystemdController;
 
 #[doc(inline)]
-pub use crate::fs::cgroup::Cgroup;
+pub use crate::fs::cgroup::{Cgroup, CgroupBuilder, ControllerSelection};
+#[doc(inline)]
+pub use crate::fs::reader::CgroupReader;
 
 /// Contains all the subsystems that are available in this crate.
 #[derive(Debug, Clone)]
@@ -518,62 +520,46 @@ pub trait ControllIdentifier {
     fn controller_type() -> Controllers;
 }
 
-/// Control group hierarchy (right now, only V1 is supported, but in the future Unified will be
-/// implemented as well).
+/// A cgroup v1 or v2 hierarchy view shared by control group handles.
+///
+/// Implementations describe the hierarchy. Load root handles with
+/// `Cgroup::load(hierarchy, CgroupPath::root())` and derive parent handles
+/// with [`Cgroup::parent`].
 pub trait Hierarchy: std::fmt::Debug + Send + Sync {
     /// Returns what subsystems are supported by the hierarchy.
     fn subsystems(&self) -> Vec<Subsystem>;
 
-    /// Returns the root directory of the hierarchy.
-    fn root(&self) -> PathBuf;
-
-    /// Return a handle to the root control group in the hierarchy.
-    fn root_control_group(&self) -> Cgroup;
-
-    /// Return a handle to the parent control group in the hierarchy.
+    /// Return the unified mount point on v2.
     ///
-    /// Implementations should panic rather than return the root control group
-    /// when `path` has no parent. New code should prefer the fallible
-    /// [`Hierarchy::parent_control_group_path`] method.
+    /// Returns [`ErrorKind::CgroupVersion`] on v1, where controllers have
+    /// separate mounts and no single root exists.
     ///
-    /// # Panics
+    /// Custom v1 implementations can construct the version error directly:
     ///
-    /// May panic if `path` is the hierarchy root or cannot be resolved.
-    fn parent_control_group(&self, path: &str) -> Cgroup;
-
-    /// Return a handle to the parent control group in the hierarchy from a `&Path`.
+    /// ```
+    /// use cgroups_rs::fs::error::{ErrorKind, Result};
+    /// use cgroups_rs::fs::{Hierarchy, Subsystem};
+    /// use std::path::PathBuf;
     ///
-    /// Fails closed if the path represents the root control group, if the parent
-    /// contains invalid components, or if a legacy custom hierarchy receives
-    /// an invalid UTF-8 path.
-    fn parent_control_group_path(&self, path: &Path) -> Result<Cgroup> {
-        if path.as_os_str().is_empty() {
-            return Err(Error::with_cause(
-                ErrorKind::InvalidPath,
-                crate::core::error::PathError::RootPath {
-                    input: path.to_path_buf(),
-                    operation: "parent_control_group_path",
-                },
-            ));
-        }
-        let str_slice = path.to_str().ok_or_else(|| {
-            Error::with_cause(
-                ErrorKind::InvalidPath,
-                crate::core::error::PathError::NonUtf8 {
-                    input: path.to_path_buf(),
-                    operation: "parent_control_group_path (non-utf8)",
-                },
-            )
-        })?;
-        Ok(self.parent_control_group(str_slice))
-    }
+    /// #[derive(Debug)]
+    /// struct LegacyHierarchy;
+    /// impl Hierarchy for LegacyHierarchy {
+    /// #   fn subsystems(&self) -> Vec<Subsystem> { Vec::new() }
+    /// #   fn v2(&self) -> bool { false }
+    ///     fn root(&self) -> Result<PathBuf> {
+    ///         Err(ErrorKind::CgroupVersion.into())
+    ///     }
+    /// }
+    /// # assert_eq!(LegacyHierarchy.root().unwrap_err().kind(), &ErrorKind::CgroupVersion);
+    /// ```
+    fn root(&self) -> Result<PathBuf>;
 
     fn v2(&self) -> bool;
 
     /// The immutable topology snapshot this hierarchy was constructed
     /// from, when the hierarchy is one of the discovery-built ones.
     ///
-    /// Built-in hierarchies expose the snapshot to cgroup operations.
+    /// Built-in hierarchies always expose their validated snapshot.
     /// Custom implementations may keep the default (`None`); a
     /// [`Cgroup`](crate::fs::Cgroup) still preserves the exact custom
     /// hierarchy when cloned because the trait object itself is shared.

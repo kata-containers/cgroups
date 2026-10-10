@@ -96,7 +96,10 @@ controlled environments:
   the cgroupfs test as a non-root user. The test first moves itself into a
   manager leaf, enables the delegated `pids` controller, then creates a
   workload cgroup, sets and reads back `pids.max`, attaches a child process,
-  and removes the workload cgroup.
+  and removes the workload cgroup. It exercises both a custom hierarchy rooted
+  at the delegated directory and the built-in discovered hierarchy rooted at
+  the real mount point, using `Only(["pids"])`. The latter must traverse
+  pre-enabled ancestors without requiring write access to them.
 - A delegated root service unshares its cgroup and mount namespaces, replaces
   `/sys/fs/cgroup` with a namespace-rooted cgroup2 mount, and executes the
   nested-layout test. The test moves both itself and the waiting

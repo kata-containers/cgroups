@@ -4,6 +4,7 @@
 //
 
 //! Integration tests about the hugetlb subsystem
+use cgroups_rs::core::CgroupPath;
 use cgroups_rs::fs::memory::{MemController, SetMemory};
 use cgroups_rs::fs::{Cgroup, Controller, MaxValue};
 
@@ -11,8 +12,8 @@ use cgroups_rs::fs::{Cgroup, Controller, MaxValue};
 fn test_disable_oom_killer() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("test_disable_oom_killer")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("test_disable_oom_killer").unwrap()).unwrap();
     {
         let mem_controller: &MemController = cg.controller_of().unwrap();
 
@@ -39,8 +40,8 @@ fn set_kmem_limit_v1() {
     cgroups_rs::skip_if_not_root!();
     cgroups_rs::skip_if_cgroups_v2!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("set_kmem_limit_v1")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("set_kmem_limit_v1").unwrap()).unwrap();
     {
         let mem_controller: &MemController = cg.controller_of().unwrap();
         mem_controller.set_kmem_limit(1).unwrap();
@@ -53,8 +54,8 @@ fn set_mem_v2() {
     cgroups_rs::skip_if_not_root!();
     cgroups_rs::skip_if_cgroups_v1!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("set_mem_v2")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("set_mem_v2").unwrap()).unwrap();
     {
         let mem_controller: &MemController = cg.controller_of().unwrap();
 

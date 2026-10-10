@@ -3,9 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
-// The manager migrates to checked cgroup entry points in the next PR.
-#![allow(deprecated)]
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -76,7 +73,10 @@ impl FsManager {
     pub fn new(base: &str) -> Result<Self> {
         let paths = parse_cgroup_subsystems()?;
         let mounts = parse_cgroup_mountinfo(&paths)?;
-        let cgroup = Cgroup::load(hierarchies::auto(), base);
+        let cgroup = Cgroup::load(
+            hierarchies::auto()?,
+            CgroupPath::new(base).map_err(CoreError::from)?,
+        );
         let base = base.to_string();
 
         Ok(Self {
@@ -102,22 +102,26 @@ impl FsManager {
     /// with cgroup v2, see [1].
     ///
     /// 1: https://github.com/kata-containers/kata-containers/issues/10733
-    pub fn subcgroup(&self) -> &str {
+    /// Returns an error if the v2 hierarchy cannot provide its unified mount.
+    pub fn subcgroup(&self) -> Result<&str> {
+        if !self.v2() {
+            return Ok("/");
+        }
         // Check if we're in a Docker-in-Docker setup by verifying:
         // 1. We're using cgroups v2 (which restricts direct process control)
         // 2. An "init" subdirectory exists (used by DinD for process
         //    delegation)
-        let init_exists = hierarchies::auto()
-            .root()
+        let init_exists = self
+            .cgroup
+            .hierarchy()
+            .root()?
             .join(&self.base)
             .join("init")
             .exists();
-        let is_dind = self.v2() && init_exists;
-
-        if is_dind {
-            "/init/"
+        if init_exists {
+            Ok("/init/")
         } else {
-            "/"
+            Ok("/")
         }
     }
 
@@ -464,7 +468,7 @@ impl FsManager {
         T: Controller + ControllIdentifier,
         for<'a> F: Fn(&'a T) -> Result<()>,
     {
-        let root = hierarchies::auto().root_control_group();
+        let root = Cgroup::load(self.cgroup.hierarchy().clone(), CgroupPath::root());
         let controller: &T = root
             .controller_of()
             .ok_or(FsError::new(FsErrorKind::SubsystemsEmpty))?;
@@ -492,7 +496,10 @@ impl FsManager {
                 .trim_start_matches(&root_path_str)
                 // Makes sure the starting slash is removed
                 .trim_start_matches("/");
-            let cgroup = Cgroup::new(hierarchies::auto(), relative_path)?;
+            let cgroup = Cgroup::new(
+                self.cgroup.hierarchy().clone(),
+                CgroupPath::new(relative_path).map_err(CoreError::from)?,
+            )?;
             let controller: &T = cgroup
                 .controller_of()
                 .ok_or(FsError::new(FsErrorKind::SubsystemsEmpty))?;
@@ -1153,6 +1160,38 @@ mod tests {
 
     const TEST_BASE: &str = "cgroupsrs/pod";
 
+    #[test]
+    fn test_subcgroup_uses_only_the_unified_mount() {
+        use crate::core::{CgroupPath, CgroupVersion};
+
+        for version in [CgroupVersion::V1, CgroupVersion::V2] {
+            let fixture = crate::tests::topology_fixture(version, "memory");
+            let root = fixture.topology.cgroupfs_root();
+            let cgroup = Cgroup::load(
+                hierarchies::from_topology(fixture.topology.clone()),
+                CgroupPath::new("workloads").unwrap(),
+            );
+            let manager = FsManager {
+                paths: HashMap::new(),
+                mounts: HashMap::new(),
+                base: "workloads".to_string(),
+                cgroup,
+            };
+            assert_eq!(manager.subcgroup().unwrap(), "/");
+            // This ordinary directory only verifies the legacy path policy;
+            // it does not model kernel delegation or process migration.
+            fs::create_dir_all(root.join("workloads/init")).unwrap();
+            assert_eq!(
+                manager.subcgroup().unwrap(),
+                if version == CgroupVersion::V2 {
+                    "/init/"
+                } else {
+                    "/"
+                }
+            );
+        }
+    }
+
     impl FsManager {
         pub fn cgroup(&self) -> &Cgroup {
             &self.cgroup
@@ -1173,7 +1212,7 @@ mod tests {
             let paths = parse_cgroup_subsystems().unwrap();
             let mounts = parse_cgroup_mountinfo(&paths).unwrap();
 
-            if hierarchies::is_cgroup2_unified_mode() {
+            if hierarchies::is_cgroup2_unified_mode().unwrap() {
                 let full = join_path(UNIFIED_MOUNTPOINT, dir);
                 let path = Path::new(&full);
                 if path.exists() {
@@ -1494,6 +1533,7 @@ mod parse_tests {
         parse_cgroup_subsystems_str,
     };
     use crate::core::discovery::membership::parse_membership_bytes;
+    use crate::core::discovery::mountinfo::parse_mountinfo_bytes;
     use crate::core::error::{CoreError, ParseMountError, PathError};
     use crate::fs::hierarchies;
     use crate::oci::error::Error;
@@ -1728,41 +1768,40 @@ bad mountinfo line\n";
     /// Fixtures lock our changes to the parser; this locks the parser against
     /// the live host. The realistic risk is not format breakage (`/proc` is
     /// userspace ABI) but additions: new controllers, new fields. If a kernel
-    /// change makes `parse_mountinfo_for_line` reject every cgroup line, this
+    /// change makes the strict stream parser reject the mount table, this
     /// fails at the source instead of surfacing indirectly as "couldn't find
     /// the memory controller" in a downstream integration test.
     ///
-    /// `mountinfo_self()` keeps only v1 `cgroup` mounts (it drops `cgroup2`),
-    /// so it is legitimately empty on a unified v2 host; on v1/hybrid it must
-    /// be non-empty. The line-parser canary covers both versions.
+    /// Parse the complete byte stream, then verify that strict discovery
+    /// retains mounts for the primary hierarchy. Named v1 mounts may remain
+    /// visible on a v2-primary host.
     #[test]
     #[ignore = "requires a controlled cgroup hierarchy; run explicitly in QEMU"]
     fn test_live_mountinfo_canary() {
-        let data = fs::read_to_string("/proc/self/mountinfo")
+        let data = fs::read("/proc/self/mountinfo")
             .expect("canary: /proc/self/mountinfo must be readable");
 
-        let cgroup_mounts: Vec<_> = data
-            .lines()
-            .filter_map(hierarchies::parse_mountinfo_for_line)
-            .filter(|mi| mi.fs_type.0 == "cgroup" || mi.fs_type.0 == "cgroup2")
-            .collect();
+        let mounts = parse_mountinfo_bytes(&data)
+            .expect("canary: the complete live mountinfo stream must parse");
         assert!(
-            !cgroup_mounts.is_empty(),
+            !mounts.cgroup_mounts().is_empty() || !mounts.unified_mounts().is_empty(),
             "canary: no cgroup/cgroup2 mounts parsed from live /proc/self/mountinfo; \
              parser may have regressed on a kernel format change"
         );
 
-        let mounts = hierarchies::mountinfo_self();
-        if hierarchies::is_cgroup2_unified_mode() {
+        let hierarchy = hierarchies::auto().expect("canary: strict host discovery must succeed");
+        let topology = hierarchy
+            .topology()
+            .expect("built-in hierarchies have a snapshot");
+        if hierarchy.v2() {
             assert!(
-                mounts.is_empty(),
-                "canary: mountinfo_self() drops cgroup2 on a unified v2 host, got {:?}",
-                mounts
+                !topology.mounts().unified_mounts().is_empty(),
+                "canary: no unified mount retained on a v2-primary host"
             );
         } else {
             assert!(
-                !mounts.is_empty(),
-                "canary: mountinfo_self() found no v1 cgroup mounts on a v1/hybrid host; \
+                !topology.mounts().cgroup_mounts().is_empty(),
+                "canary: no v1 cgroup mounts retained on a v1/hybrid host; \
                  parser may have regressed"
             );
         }

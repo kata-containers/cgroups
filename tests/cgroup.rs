@@ -5,6 +5,7 @@
 //
 
 //! Simple unit tests about the control groups system.
+use cgroups_rs::core::CgroupPath;
 use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
@@ -15,16 +16,16 @@ use cgroups_rs::fs::cgroup::{
 };
 use cgroups_rs::fs::memory::MemController;
 use cgroups_rs::fs::Controller;
-use cgroups_rs::fs::{Cgroup, Subsystem};
+use cgroups_rs::fs::{Cgroup, ControllerSelection, Subsystem};
 use cgroups_rs::CgroupPid;
 
 #[test]
 fn test_procs_iterator_cgroup() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
     let pid = libc::pid_t::from(nix::unistd::getpid()) as u64;
-    let cg = Cgroup::new(h, String::from("test_procs_iterator_cgroup")).unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("test_procs_iterator_cgroup").unwrap()).unwrap();
     {
         // Add a task to the control group.
         cg.add_task_by_tgid(CgroupPid::from(pid)).unwrap();
@@ -49,9 +50,9 @@ fn test_tasks_iterator_cgroup_v1() {
     cgroups_rs::skip_if_not_root!();
     cgroups_rs::skip_if_cgroups_v2!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
     let pid = libc::pid_t::from(nix::unistd::getpid()) as u64;
-    let cg = Cgroup::new(h, String::from("test_tasks_iterator_cgroup_v1")).unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("test_tasks_iterator_cgroup_v1").unwrap()).unwrap();
     {
         // Add a task to the control group.
         cg.add_task(CgroupPid::from(pid)).unwrap();
@@ -78,21 +79,29 @@ fn test_tasks_iterator_cgroup_threaded_mode() {
 
     let pid = libc::pid_t::from(nix::unistd::getpid()) as u64;
     let cg = Cgroup::new(
-        cgroups_rs::fs::hierarchies::auto(),
-        String::from("test_tasks_iterator_cgroup_threaded_mode"),
+        cgroups_rs::fs::hierarchies::auto().unwrap(),
+        CgroupPath::new("test_tasks_iterator_cgroup_threaded_mode").unwrap(),
     )
     .unwrap();
-    let cg_threaded_sub1 = Cgroup::new_with_specified_controllers(
-        cgroups_rs::fs::hierarchies::auto(),
-        String::from("test_tasks_iterator_cgroup_threaded_mode/threaded_sub1"),
-        Some(vec![String::from("cpuset"), String::from("cpu")]),
+    let cg_threaded_sub1 = Cgroup::builder(
+        cgroups_rs::fs::hierarchies::auto().unwrap(),
+        CgroupPath::new("test_tasks_iterator_cgroup_threaded_mode/threaded_sub1").unwrap(),
     )
+    .controllers(ControllerSelection::Only(vec![
+        String::from("cpuset"),
+        String::from("cpu"),
+    ]))
+    .create()
     .unwrap();
-    let cg_threaded_sub2 = Cgroup::new_with_specified_controllers(
-        cgroups_rs::fs::hierarchies::auto(),
-        String::from("test_tasks_iterator_cgroup_threaded_mode/threaded_sub2"),
-        Some(vec![String::from("cpuset"), String::from("cpu")]),
+    let cg_threaded_sub2 = Cgroup::builder(
+        cgroups_rs::fs::hierarchies::auto().unwrap(),
+        CgroupPath::new("test_tasks_iterator_cgroup_threaded_mode/threaded_sub2").unwrap(),
     )
+    .controllers(ControllerSelection::Only(vec![
+        String::from("cpuset"),
+        String::from("cpu"),
+    ]))
+    .create()
     .unwrap();
     {
         // Verify that cgroup type of the control group is domain mode.
@@ -170,8 +179,8 @@ fn test_kill_cgroup() {
     cgroups_rs::skip_if_not_root!();
     cgroups_rs::skip_if_cgroups_v1!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("test_kill_cgroup")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("test_kill_cgroup").unwrap()).unwrap();
     {
         // Spawn a proc, don't want to getpid(2) here.
         let mut child = Command::new("sleep").arg("infinity").spawn().unwrap();
@@ -209,40 +218,29 @@ fn test_kill_cgroup() {
 }
 
 #[test]
-#[allow(deprecated)]
 fn test_cgroup_with_relative_paths() {
     cgroups_rs::skip_if_not_root!();
     cgroups_rs::skip_if_cgroups_v2!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cgroup_root = h.root();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let v1 = cgroups_rs::fs::hierarchies::V1::from(h.topology().unwrap());
     let cgroup_name = "test_cgroup_with_relative_paths";
 
-    let cg = Cgroup::load(h, String::from(cgroup_name));
+    let cg = Cgroup::load(h, CgroupPath::new(cgroup_name).unwrap());
     {
         let subsystems = cg.subsystems();
         subsystems.iter().for_each(|sub| match sub {
             Subsystem::Pid(c) => {
-                let cgroup_path = c.path().to_str().unwrap();
-                let relative_path = "/pids/";
-                // cgroup_path = cgroup_root + relative_path + cgroup_name
-                assert_eq!(
-                    cgroup_path,
-                    format!(
-                        "{}{}{}",
-                        cgroup_root.to_str().unwrap(),
-                        relative_path,
-                        cgroup_name
-                    )
-                );
+                let (mount, _) = v1
+                    .get_mount_point(cgroups_rs::fs::Controllers::Pids)
+                    .unwrap();
+                assert_eq!(c.path(), mount.join(cgroup_name));
             }
             Subsystem::Mem(c) => {
-                let cgroup_path = c.path().to_str().unwrap();
-                // cgroup_path = cgroup_root + relative_path + cgroup_name
-                assert_eq!(
-                    cgroup_path,
-                    format!("{}/memory/{}", cgroup_root.to_str().unwrap(), cgroup_name)
-                );
+                let (mount, _) = v1
+                    .get_mount_point(cgroups_rs::fs::Controllers::Mem)
+                    .unwrap();
+                assert_eq!(c.path(), mount.join(cgroup_name));
             }
             _ => {}
         });
@@ -255,8 +253,8 @@ fn test_cgroup_v2() {
     cgroups_rs::skip_if_not_root!();
     cgroups_rs::skip_if_cgroups_v1!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("test_v2")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("test_v2").unwrap()).unwrap();
 
     let mem_controller: &MemController = cg.controller_of().unwrap();
     let (mem, swp, rev) = (4 * 1024 * 1000, 2 * 1024 * 1000, 1024 * 1000);

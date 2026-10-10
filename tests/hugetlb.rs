@@ -4,6 +4,7 @@
 //
 
 //! Integration tests about the hugetlb subsystem
+use cgroups_rs::core::CgroupPath;
 use cgroups_rs::fs::error::*;
 use cgroups_rs::fs::hugetlb::{self, HugeTlbController};
 use cgroups_rs::fs::Cgroup;
@@ -14,8 +15,8 @@ fn test_hugetlb_sizes() {
     cgroups_rs::skip_if_not_root!();
     cgroups_rs::skip_if_cgroups_v2!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("test_hugetlb_sizes")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("test_hugetlb_sizes").unwrap()).unwrap();
     {
         let hugetlb_controller: &HugeTlbController = cg.controller_of().unwrap();
         let _ = hugetlb_controller.get_sizes();

@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 /// A validated relative path identifying a cgroup within its hierarchy.
 ///
 /// `CgroupPath` is the single source of truth for "which cgroup" across all
-/// backends. Construction is the only fallible step: once a `CgroupPath`
-/// exists, every backend operation that accepts it is infallible with respect
-/// to path safety.
+/// backends. Construction from external input validates path safety: once a
+/// `CgroupPath` exists, every backend operation that accepts it is infallible
+/// with respect to path safety.
 ///
 /// # Validity rules
 ///
@@ -41,11 +41,12 @@ impl CgroupPath {
     /// The root is the identity element of [`CgroupPath::join`] and renders
     /// as an empty relative path. [`CgroupPath::new`] also accepts empty
     /// input as the hierarchy root; this constructor expresses that intent
-    /// directly at call sites.
-    pub fn root() -> Result<Self, PathError> {
-        Ok(Self {
+    /// directly at call sites. Construction is infallible because the empty
+    /// relative path satisfies every validity rule.
+    pub fn root() -> Self {
+        Self {
             path: PathBuf::new(),
-        })
+        }
     }
 
     /// Validate and construct a `CgroupPath` from any path-like input.
@@ -146,6 +147,9 @@ impl CgroupPath {
     /// an empty `Path`). This lets a `CgroupPath` feed any API taking
     /// [`AsRef<Path>`] and enables zero-copy component iteration via
     /// [`Path::components`].
+    ///
+    /// Non-UTF-8 bytes are preserved. Use [`Path::to_str`] for a checked UTF-8
+    /// conversion or [`Path::display`] for diagnostics.
     pub fn as_path(&self) -> &Path {
         &self.path
     }
@@ -239,9 +243,6 @@ mod tests {
         expected_operation: &'static str,
     ) -> ExpectedPathError {
         let (kind, input, operation) = match error {
-            PathError::NonUtf8 { .. } => {
-                panic!("typed path validation must preserve non-UTF-8 paths")
-            }
             PathError::AbsolutePath { input, operation } => {
                 (ExpectedPathError::AbsolutePath, input, operation)
             }
@@ -456,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_root_canonical_form() {
-        let root = CgroupPath::root().unwrap();
+        let root = CgroupPath::root();
         assert!(root.is_root());
         assert!(!path("a").is_root());
         assert_ne!(root, path("a"));
@@ -492,7 +493,7 @@ mod tests {
             assert_eq!(got, path(case.expect), "case `{}`", case.name);
         }
 
-        let root = CgroupPath::root().unwrap();
+        let root = CgroupPath::root();
         assert_eq!(path("docker").join(&root), path("docker"));
         assert_eq!(root.join(&path("kata/a1")), path("kata/a1"));
         assert_eq!(root.join(&root), root);
@@ -529,8 +530,8 @@ mod tests {
 
     #[test]
     fn test_parent_table() {
-        assert_eq!(CgroupPath::root().unwrap().parent(), None);
-        assert_eq!(path("a").parent(), Some(CgroupPath::root().unwrap()));
+        assert_eq!(CgroupPath::root().parent(), None);
+        assert_eq!(path("a").parent(), Some(CgroupPath::root()));
 
         struct Case {
             name: &'static str,
@@ -576,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_as_path_table() {
-        assert_eq!(CgroupPath::root().unwrap().as_path(), Path::new(""));
+        assert_eq!(CgroupPath::root().as_path(), Path::new(""));
 
         struct Case {
             name: &'static str,
@@ -670,7 +671,7 @@ mod tests {
     fn test_from_proc_cgroup_path() {
         assert_eq!(
             CgroupPath::from_proc_cgroup_path("/").unwrap(),
-            CgroupPath::root().unwrap()
+            CgroupPath::root()
         );
         assert_eq!(CgroupPath::from_proc_cgroup_path("/a").unwrap(), path("a"));
         assert_eq!(

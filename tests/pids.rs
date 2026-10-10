@@ -5,6 +5,7 @@
 //
 
 //! Integration tests about the pids subsystem
+use cgroups_rs::core::CgroupPath;
 use cgroups_rs::fs::pid::PidController;
 use cgroups_rs::fs::{Cgroup, Controller, MaxValue};
 use libc::pid_t;
@@ -15,8 +16,8 @@ use nix::unistd::{fork, ForkResult};
 fn create_and_delete_cgroup() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("create_and_delete_cgroup")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("create_and_delete_cgroup").unwrap()).unwrap();
     {
         let pidcontroller: &PidController = cg.controller_of().unwrap();
         pidcontroller.set_pid_max(MaxValue::Value(1337)).unwrap();
@@ -31,8 +32,8 @@ fn create_and_delete_cgroup() {
 fn test_pids_current_is_zero() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("test_pids_current_is_zero")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("test_pids_current_is_zero").unwrap()).unwrap();
     {
         let pidcontroller: &PidController = cg.controller_of().unwrap();
         let current = pidcontroller.get_pid_current();
@@ -45,8 +46,8 @@ fn test_pids_current_is_zero() {
 fn test_pids_events_is_zero() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("test_pids_events_is_zero")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("test_pids_events_is_zero").unwrap()).unwrap();
     {
         let pidcontroller: &PidController = cg.controller_of().unwrap();
         let events = pidcontroller.get_pid_events();
@@ -60,8 +61,8 @@ fn test_pids_events_is_zero() {
 fn test_pid_events_is_not_zero() {
     cgroups_rs::skip_if_not_root!();
 
-    let h = cgroups_rs::fs::hierarchies::auto();
-    let cg = Cgroup::new(h, String::from("test_pid_events_is_not_zero")).unwrap();
+    let h = cgroups_rs::fs::hierarchies::auto().unwrap();
+    let cg = Cgroup::new(h, CgroupPath::new("test_pid_events_is_not_zero").unwrap()).unwrap();
     {
         let pids: &PidController = cg.controller_of().unwrap();
         let before = pids.get_pid_events();

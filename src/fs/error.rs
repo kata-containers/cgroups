@@ -6,6 +6,7 @@
 
 use std::error::Error as StdError;
 use std::fmt;
+use std::path::PathBuf;
 
 /// The different types of errors that can occur while manipulating control groups.
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
@@ -51,9 +52,23 @@ pub enum ErrorKind {
     #[error("invalid bytes size")]
     InvalidBytesSize,
 
-    /// The specified controller is not in the list of supported controllers.
-    #[error("specified controller is not in the list of supported controllers")]
-    SpecifiedControllers,
+    /// A requested controller is unavailable to the handle or hierarchy.
+    #[error("controller {controller:?} is unavailable{}", .path.as_ref().map(|path| format!(" at {}", path.display())).unwrap_or_default())]
+    UnsupportedController {
+        /// The requested name, using the hierarchy's kernel spelling.
+        controller: String,
+        /// The controller-list file associated with availability on v2.
+        /// V1 name validation has no single source path and reports `None`.
+        /// Snapshot-based validation does not read this path.
+        path: Option<PathBuf>,
+    },
+
+    /// Creation was requested with an explicitly empty controller selection.
+    #[error("cannot create cgroup {path:?} with an empty controller selection")]
+    EmptyControllerSelection {
+        /// The requested path relative to the hierarchy.
+        path: PathBuf,
+    },
 
     /// Using method in wrong cgroup version.
     #[error("using method in wrong cgroup version")]
@@ -76,6 +91,12 @@ pub enum ErrorKind {
 pub struct Error {
     kind: ErrorKind,
     cause: Option<Box<dyn StdError + Send + Sync>>,
+}
+
+impl From<ErrorKind> for Error {
+    fn from(kind: ErrorKind) -> Self {
+        Self::new(kind)
+    }
 }
 
 impl fmt::Display for Error {

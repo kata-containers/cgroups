@@ -421,6 +421,8 @@ pub fn discover(host_paths: &HostPaths) -> CoreResult<Arc<CgroupTopology>> {
 /// uses its parent; other mounts use their own mount point. All inferred
 /// roots must agree so one root can describe the layout and map its mounts
 /// into one fixture tree.
+/// This coordinate is used for discovery validation and fixture mapping;
+/// v1 controllers use their individual mount points for operations.
 ///
 /// Only parsed mounts are inspected; the caller attaches the procfs source
 /// path to any layout error.
@@ -430,7 +432,26 @@ pub fn discover(host_paths: &HostPaths) -> CoreResult<Arc<CgroupTopology>> {
 fn determine_v1_natural_root(v1_mounts: &[&MountRecord]) -> Result<PathBuf, LayoutError> {
     let roots = v1_mounts
         .iter()
-        .map(|mount| v1_mount_natural_root(mount).to_path_buf())
+        .map(|mount| {
+            let mount_name = mount
+                .mount_point
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let is_subsystem_dir = !mount_name.is_empty()
+                && mount_name.split(',').all(|name| {
+                    mount.super_opts.iter().any(|opt| {
+                        opt.as_slice() == name.as_bytes()
+                            || opt.strip_prefix(b"name=") == Some(name.as_bytes())
+                    })
+                });
+            if is_subsystem_dir {
+                mount.mount_point.parent().unwrap_or(&mount.mount_point)
+            } else {
+                &mount.mount_point
+            }
+            .to_path_buf()
+        })
         .collect::<BTreeSet<_>>();
 
     if roots.len() > 1 {
@@ -440,31 +461,6 @@ fn determine_v1_natural_root(v1_mounts: &[&MountRecord]) -> Result<PathBuf, Layo
             .into_iter()
             .next()
             .expect("v1 root inference requires at least one mount"))
-    }
-}
-
-/// Infer the filesystem root represented by one parsed v1 mount.
-///
-/// A controller-named mount directory uses its parent; other mount points
-/// represent their own root. This uses filesystem coordinates, independently
-/// of the mount's cgroup-relative `mount_root`, and performs no I/O.
-pub(crate) fn v1_mount_natural_root(mount: &MountRecord) -> &Path {
-    let mount_name = mount
-        .mount_point
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    let is_subsystem_dir = !mount_name.is_empty()
-        && mount_name.split(',').all(|name| {
-            mount.super_opts.iter().any(|opt| {
-                opt.as_slice() == name.as_bytes()
-                    || opt.strip_prefix(b"name=") == Some(name.as_bytes())
-            })
-        });
-    if is_subsystem_dir {
-        mount.mount_point.parent().unwrap_or(&mount.mount_point)
-    } else {
-        &mount.mount_point
     }
 }
 

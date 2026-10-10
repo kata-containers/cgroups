@@ -63,7 +63,7 @@ impl SystemdManager<'_> {
     ///   "parent:scope_prefix:name".
     pub fn new(path: &str) -> Result<Self> {
         let (slice, unit) = Self::parse_slice_and_unit(path)?;
-        let props = PropertiesBuilder::default_cgroup(&slice, &unit).build();
+        let props = PropertiesBuilder::default_cgroup(&slice, &unit).build()?;
         let slice_base = expand_slice(&slice)?;
 
         let fs_base = join_path(&slice_base, &unit);
@@ -212,7 +212,7 @@ impl Manager for SystemdManager<'_> {
             return Ok(());
         }
 
-        let subcgroup = self.fs_manager.subcgroup();
+        let subcgroup = self.fs_manager.subcgroup()?;
         self.systemd_client.add_process(pid, subcgroup)?;
 
         Ok(())

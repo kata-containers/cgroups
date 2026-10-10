@@ -5,6 +5,7 @@
 
 use zbus::zvariant::Value as ZbusValue;
 
+use crate::core::error::CoreResult;
 use crate::fs::hierarchies;
 use crate::systemd::utils::is_slice_unit;
 use crate::systemd::{
@@ -112,7 +113,18 @@ impl PropertiesBuilder {
         self
     }
 
-    pub fn build(self) -> Vec<Property<'static>> {
+    /// Build the unit properties, detecting the hierarchy for I/O accounting.
+    ///
+    /// Discovery errors propagate rather than selecting the v1 accounting
+    /// property by default. Without I/O accounting, building performs no I/O.
+    pub fn build(self) -> CoreResult<Vec<Property<'static>>> {
+        self.build_with_detector(hierarchies::is_cgroup2_unified_mode)
+    }
+
+    fn build_with_detector(
+        self,
+        unified_mode: impl FnOnce() -> CoreResult<bool>,
+    ) -> CoreResult<Vec<Property<'static>>> {
         let mut props = vec![];
 
         if let Some(cpu_accounting) = self.cpu_accounting {
@@ -128,7 +140,7 @@ impl PropertiesBuilder {
         }
 
         if let Some(io_accounting) = self.io_accounting {
-            if hierarchies::is_cgroup2_unified_mode() {
+            if unified_mode()? {
                 props.push((IO_ACCOUNTING, ZbusValue::Bool(io_accounting)));
             } else {
                 props.push((BLOCK_IO_ACCOUNTING, ZbusValue::Bool(io_accounting)));
@@ -165,6 +177,63 @@ impl PropertiesBuilder {
             props.push((TIMEOUT_STOP_USEC, ZbusValue::U64(timeout)));
         }
 
-        props
+        Ok(props)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::error::CoreError;
+    use std::error::Error as _;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_io_accounting_selects_the_property_for_the_detected_hierarchy() {
+        for unified in [false, true] {
+            let props = PropertiesBuilder::default()
+                .io_accounting(true)
+                .build_with_detector(|| Ok(unified))
+                .unwrap();
+            let (selected, other) = if unified {
+                (IO_ACCOUNTING, BLOCK_IO_ACCOUNTING)
+            } else {
+                (BLOCK_IO_ACCOUNTING, IO_ACCOUNTING)
+            };
+            assert!(props.contains(&(selected, ZbusValue::Bool(true))));
+            assert!(!props.iter().any(|(name, _)| *name == other));
+        }
+    }
+
+    #[test]
+    fn test_io_accounting_preserves_discovery_error_context() {
+        let path = PathBuf::from("/fixture/cgroup.controllers");
+        let error = PropertiesBuilder::default()
+            .io_accounting(true)
+            .build_with_detector(|| {
+                Err(CoreError::ReadControllers {
+                    path: path.clone(),
+                    cause: std::io::Error::from_raw_os_error(libc::EACCES),
+                })
+            })
+            .unwrap_err();
+        assert!(
+            matches!(&error, CoreError::ReadControllers { path: failed, .. } if failed == &path)
+        );
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(source.raw_os_error(), Some(libc::EACCES));
+    }
+
+    #[test]
+    fn test_build_without_io_accounting_does_not_detect_the_host() {
+        let props = PropertiesBuilder::default()
+            .cpu_accounting(true)
+            .build_with_detector(|| panic!("no I/O accounting was requested"))
+            .unwrap();
+        assert!(props.contains(&(CPU_ACCOUNTING, ZbusValue::Bool(true))));
     }
 }
