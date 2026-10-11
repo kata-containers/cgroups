@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
+use std::convert::TryFrom;
 use std::future::Future;
 use std::time::Duration;
 
@@ -12,9 +13,12 @@ use futures_lite::{future, StreamExt};
 use zbus::zvariant::Value;
 use zbus::{Error as ZbusError, Result as ZbusResult};
 
+use crate::model::ProcessId;
 use crate::systemd::dbus::error::{Error, Result};
 use crate::systemd::dbus::proxy::systemd_manager_proxy;
 use crate::systemd::dbus::systemd_manager_proxy::ManagerProxy as AsyncSystemManager;
+#[cfg(any(feature = "oci", test))]
+use crate::systemd::dbus::systemd_manager_proxy::ManagerProxyBlocking;
 use crate::systemd::{Property, NO_SUCH_UNIT, PIDS, UNIT_MODE_REPLACE};
 use crate::CgroupPid;
 
@@ -41,7 +45,8 @@ impl SystemdClient<'_> {
     /// Append a process ID to the PIDs property of the unit. If not
     /// exists, one property will be created.
     pub fn set_pid_prop(&mut self, pid: CgroupPid) -> Result<()> {
-        if self.exists() {
+        let pid = ProcessId::try_from(pid)?;
+        if self.try_exists()? {
             return Ok(());
         }
 
@@ -49,7 +54,7 @@ impl SystemdClient<'_> {
             if prop.0 == PIDS {
                 // If PIDS is already set, we append the new pid to the existing list.
                 if let Value::Array(arr) = &mut prop.1 {
-                    arr.append(pid.pid.into())
+                    arr.append(pid.get().into())
                         .map_err(|_| Error::InvalidProperties)?;
                     return Ok(());
                 }
@@ -59,7 +64,7 @@ impl SystemdClient<'_> {
         }
         // If PIDS is not set, we create a new property.
         self.props
-            .push((PIDS, Value::Array(vec![pid.pid as u32].into())));
+            .push((PIDS, Value::Array(vec![pid.get()].into())));
         Ok(())
     }
 
@@ -186,25 +191,90 @@ impl SystemdClient<'_> {
         Ok(())
     }
 
-    /// Check if the unit exists.
-    pub fn exists(&self) -> bool {
-        let sys_proxy = match systemd_manager_proxy() {
-            Ok(proxy) => proxy,
-            _ => return false,
-        };
+    /// Check if the unit exists through dbus `GetUnit`.
+    ///
+    /// Returns `Ok(true)` if the unit exists, `Ok(false)` if systemd returns
+    /// `org.freedesktop.systemd1.NoSuchUnit`, or an `Err` if D-Bus communication
+    /// or authorization fails.
+    pub fn try_exists(&self) -> Result<bool> {
+        let sys_proxy = systemd_manager_proxy()?;
+        match sys_proxy.get_unit(&self.unit) {
+            Ok(_) => Ok(true),
+            Err(ZbusError::MethodError(err_name, _, _)) if err_name.as_str() == NO_SUCH_UNIT => {
+                Ok(false)
+            }
+            Err(e) => Err(Error::Dbus(e)),
+        }
+    }
 
-        sys_proxy
-            .get_unit(&self.unit)
-            .map(|_| true)
-            .unwrap_or_default()
+    /// Read the existing scope's actual delegation setting. Unit names and
+    /// requested transient properties do not establish ownership of its tree.
+    #[cfg(feature = "oci")]
+    pub(crate) fn try_delegated(&self) -> Result<bool> {
+        let manager = systemd_manager_proxy()?;
+        self.delegated_with_proxy(&manager)
+    }
+
+    /// Controllers requested for delegation. This list still needs to be
+    /// intersected with the visible, realized hierarchies of the active dialect.
+    #[cfg(feature = "oci")]
+    pub(crate) fn try_delegated_controllers(&self) -> Result<Vec<String>> {
+        let manager = systemd_manager_proxy()?;
+        self.delegated_controllers_with_proxy(&manager)
+    }
+
+    #[cfg(any(feature = "oci", test))]
+    fn scope_with_proxy<'a>(
+        &self,
+        manager: &ManagerProxyBlocking<'a>,
+    ) -> Result<zbus::blocking::Proxy<'a>> {
+        let path = manager.get_unit(&self.unit)?;
+        Ok(zbus::blocking::Proxy::new(
+            manager.inner().connection(),
+            "org.freedesktop.systemd1",
+            path,
+            "org.freedesktop.systemd1.Scope",
+        )?)
+    }
+
+    #[cfg(any(feature = "oci", test))]
+    fn delegated_with_proxy(&self, manager: &ManagerProxyBlocking<'_>) -> Result<bool> {
+        Ok(self
+            .scope_with_proxy(manager)?
+            .get_property::<bool>("Delegate")?)
+    }
+
+    #[cfg(any(feature = "oci", test))]
+    fn delegated_controllers_with_proxy(
+        &self,
+        manager: &ManagerProxyBlocking<'_>,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .scope_with_proxy(manager)?
+            .get_property("DelegateControllers")?)
+    }
+
+    /// Check if the unit exists.
+    ///
+    /// For backwards compatibility, errors are swallowed and return `false`.
+    /// Callers on fallible attachment paths should prefer [`SystemdClient::try_exists`].
+    pub fn exists(&self) -> bool {
+        self.try_exists().unwrap_or(false)
     }
 
     /// Add a process (tgid) to the unit through dbus
     /// `AttachProcessesToUnit`.
     pub fn add_process(&self, pid: CgroupPid, subcgroup: &str) -> Result<()> {
+        let pid = ProcessId::try_from(pid)?;
+        self.add_process_id(pid, subcgroup)
+    }
+
+    /// Add a validated [`ProcessId`] (tgid) to the unit through dbus
+    /// `AttachProcessesToUnit`.
+    pub fn add_process_id(&self, pid: ProcessId, subcgroup: &str) -> Result<()> {
         let sys_proxy = systemd_manager_proxy()?;
 
-        sys_proxy.attach_processes_to_unit(&self.unit, subcgroup, &[pid.pid as u32])?;
+        sys_proxy.attach_processes_to_unit(&self.unit, subcgroup, &[pid.get()])?;
 
         Ok(())
     }
@@ -260,6 +330,104 @@ pub mod tests {
     use crate::tests::{spawn_sleep_inf, spawn_yes};
 
     const TEST_SLICE: &str = "cgroupsrs-test.slice";
+
+    #[test]
+    // Keep compatibility with zbus 5.8, before async_io_unix_stream was added.
+    #[allow(deprecated)]
+    fn test_actual_delegation_property_and_errors_on_private_bus() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::Arc;
+
+        struct MockManager;
+        #[zbus::interface(name = "org.freedesktop.systemd1.Manager")]
+        impl MockManager {
+            fn get_unit(&self, _unit: &str) -> zbus::zvariant::ObjectPath<'static> {
+                zbus::zvariant::ObjectPath::try_from("/org/freedesktop/systemd1/unit/test").unwrap()
+            }
+        }
+
+        struct MockScope(Arc<AtomicU8>);
+        #[zbus::interface(name = "org.freedesktop.systemd1.Scope")]
+        impl MockScope {
+            #[zbus(property)]
+            fn delegate(&self) -> zbus::fdo::Result<bool> {
+                match self.0.load(Ordering::SeqCst) {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(zbus::fdo::Error::AccessDenied(
+                        "fixture denies Delegate".to_string(),
+                    )),
+                }
+            }
+
+            #[zbus(property)]
+            fn delegate_controllers(&self) -> zbus::fdo::Result<Vec<String>> {
+                match self.0.load(Ordering::SeqCst) {
+                    0 => Ok(Vec::new()),
+                    1 => Ok(vec!["cpu".to_string(), "memory".to_string()]),
+                    _ => Err(zbus::fdo::Error::AccessDenied(
+                        "fixture denies DelegateControllers".to_string(),
+                    )),
+                }
+            }
+        }
+
+        // Both ends are synthetic peers over an in-process socket pair. No
+        // system bus connection, unit creation, or host cgroup access occurs.
+        let state = Arc::new(AtomicU8::new(0));
+        let (server_socket, client_socket) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = zbus::connection::Builder::unix_stream(server_socket)
+            .server(zbus::Guid::generate())
+            .unwrap()
+            .p2p()
+            .serve_at("/org/freedesktop/systemd1", MockManager)
+            .unwrap()
+            .serve_at(
+                "/org/freedesktop/systemd1/unit/test",
+                MockScope(state.clone()),
+            )
+            .unwrap();
+        let client = zbus::connection::Builder::unix_stream(client_socket).p2p();
+        let (server, connection) =
+            async_io::block_on(futures_lite::future::zip(server.build(), client.build()));
+        let _server = server.unwrap();
+        let connection = zbus::blocking::Connection::from(connection.unwrap());
+        let manager = ManagerProxyBlocking::new(&connection).unwrap();
+        let client = SystemdClient::new("test.scope", Vec::new()).unwrap();
+        assert!(!client.delegated_with_proxy(&manager).unwrap());
+        assert!(client
+            .delegated_controllers_with_proxy(&manager)
+            .unwrap()
+            .is_empty());
+        state.store(1, Ordering::SeqCst);
+        assert!(client.delegated_with_proxy(&manager).unwrap());
+        assert_eq!(
+            client.delegated_controllers_with_proxy(&manager).unwrap(),
+            ["cpu", "memory"]
+        );
+        state.store(2, Ordering::SeqCst);
+        assert!(matches!(
+            client.delegated_with_proxy(&manager),
+            Err(Error::Dbus(_))
+        ));
+        let error = client
+            .delegated_controllers_with_proxy(&manager)
+            .unwrap_err();
+        // Properties.Get maps standard remote errors to zbus's FDO variants.
+        match error {
+            Error::Dbus(zbus::Error::FDO(error)) => {
+                assert!(
+                    matches!(error.as_ref(), zbus::fdo::Error::AccessDenied(message)
+                    if message == "fixture denies DelegateControllers")
+                );
+                assert_eq!(
+                    zbus::DBusError::name(error.as_ref()).as_str(),
+                    "org.freedesktop.DBus.Error.AccessDenied"
+                );
+            }
+            other => panic!("unexpected property error: {:?}", other),
+        }
+    }
 
     #[test]
     fn test_wait_timeout() {

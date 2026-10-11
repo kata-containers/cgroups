@@ -10,10 +10,15 @@ use std::sync::Arc;
 use oci_spec::runtime::LinuxResources;
 use zbus::zvariant::Value as ZbusValue;
 
+use crate::discovery::attachment::{plan_attachment, CreationPolicy, Placement};
+use crate::discovery::membership::Membership;
 use crate::discovery::{discover, CgroupTopology, CgroupVersion, HostPaths};
+use crate::error::AttachmentError;
 use crate::manager::conv;
 use crate::manager::error::{Error, Result};
 use crate::manager::fs::{join_path, FsManager};
+use crate::model::path::CgroupPath;
+use crate::model::pid::ProcessId;
 use crate::model::{
     AttachDestination, CpuPatch, CpuSetPatch, MemoryPatch, PidsPatch, ResourcePatch, Update,
 };
@@ -32,6 +37,10 @@ use crate::{CgroupPid, CgroupStats, FreezerState, Manager};
 /// 2: https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
 const DEFAULT_CPU_QUOTA_PERIOD: u64 = 100_000; // 100ms
 
+// systemd's legacy resource dialect (CGROUP_MASK_V1). In particular, a v1
+// cpuset or freezer mount is not a hierarchy systemd realizes for each unit.
+const SYSTEMD_V1_CONTROLLERS: &[&str] = &["cpu", "cpuacct", "blkio", "memory", "devices", "pids"];
+
 pub struct SystemdManager<'a> {
     /// The name of slice
     slice: String,
@@ -41,11 +50,74 @@ pub struct SystemdManager<'a> {
     systemd_client: SystemdClient<'a>,
     /// Cgroupfs manager
     fs_manager: FsManager,
-    /// Default attachment destination for processes and threads.
-    default_destination: AttachDestination,
 }
 
 impl SystemdManager<'_> {
+    /// Select only delegated, realized v1 resource hierarchies, plus the named
+    /// unit hierarchy. DelegateControllers can also name v2-only controllers.
+    /// A missing unit root is normal for an unrealized resource controller;
+    /// missing descendant targets and other metadata errors remain failures.
+    fn attachment_subsystems(
+        &self,
+        pid: ProcessId,
+        delegated_controllers: &[String],
+    ) -> Result<Vec<String>> {
+        if self.topology().version == CgroupVersion::V2 {
+            return Ok(Vec::new());
+        }
+
+        let cpu_delegated = delegated_controllers
+            .iter()
+            .any(|controller| controller == "cpu" || controller == "cpuacct");
+        let mut subsystems = vec!["name=systemd".to_string()];
+        for controller in SYSTEMD_V1_CONTROLLERS {
+            let delegated = match *controller {
+                // systemd extends either CPU bit to both co-mounted controllers.
+                "cpu" | "cpuacct" => cpu_delegated,
+                _ => delegated_controllers.iter().any(|name| name == controller),
+            };
+            if !delegated {
+                continue;
+            }
+            let Some(mount) = self.topology().mounts.controller_mount(controller) else {
+                continue;
+            };
+            let target = self
+                .topology()
+                .resolve_mount_point(&mount.mount_point)
+                .join(self.fs_manager.base().as_path());
+            let source = match std::fs::metadata(&target) {
+                Ok(metadata) if metadata.is_dir() => {
+                    subsystems.push((*controller).to_string());
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => error,
+                Ok(_) => std::io::Error::from_raw_os_error(libc::ENOTDIR),
+            };
+            return Err(AttachmentError::TargetIo {
+                backend: "systemd",
+                pid,
+                operation: "inspect delegated unit hierarchy",
+                target,
+                controllers: vec![(*controller).to_string()],
+                source,
+            }
+            .into());
+        }
+        subsystems.sort();
+        Ok(subsystems)
+    }
+
+    fn delegated_subsystems(&self, pid: ProcessId, is_delegated: bool) -> Result<Vec<String>> {
+        let controllers = if is_delegated && self.topology().version == CgroupVersion::V1 {
+            self.systemd_client.try_delegated_controllers()?
+        } else {
+            Vec::new()
+        };
+        self.attachment_subsystems(pid, &controllers)
+    }
+
     fn parse_slice_and_unit(path: &str) -> Result<(String, String)> {
         let parts: Vec<&str> = path.split(':').collect();
         if parts.len() != 3 {
@@ -106,7 +178,6 @@ impl SystemdManager<'_> {
             unit,
             fs_manager,
             systemd_client: cgroup,
-            default_destination: AttachDestination::default(),
         })
     }
 
@@ -116,22 +187,231 @@ impl SystemdManager<'_> {
     }
 }
 
+/// Classification of a process's current cgroup location relative to this unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProcessLocation {
+    /// Process is inside the managed unit cgroup tree at the specified subpath.
+    Inside(CgroupPath),
+    /// The process is inside the unit on all managed v1 hierarchies, but at
+    /// different subpaths. A single path cannot establish an attachment no-op.
+    InsideDifferentHierarchies,
+    /// Process is completely outside the managed unit cgroup tree.
+    Outside,
+}
+
+/// Action to execute for attaching a process to a systemd unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SystemdAttachAction {
+    /// Unit does not exist yet; start transient unit with initial PID, then
+    /// move to subgroup if not unit root.
+    StartUnitWithSubgroup { subgroup: CgroupPath },
+    /// Process is outside unit; attach via D-Bus AttachProcessesToUnit.
+    AttachOutsideViaDbus { dbus_subgroup: String },
+    /// Process is already at the target destination inside the unit.
+    AlreadyAtDestination,
+    /// Process is inside the unit but in a different subgroup; migrate
+    /// directly within delegated subtree.
+    MigrateInsideDelegatedSubgroup { subgroup: CgroupPath },
+}
+
+/// Encode a [`CgroupPath`] into a systemd D-Bus subgroup argument.
+///
+/// Returns an empty string for the unit root, or a leading-slash absolute path
+/// for descendant subgroups. Fails if the subgroup path contains invalid UTF-8.
+pub(crate) fn encode_dbus_subgroup(path: &CgroupPath) -> Result<String> {
+    if path.is_root() {
+        return Ok(String::new());
+    }
+    let s = path.as_path().to_str().ok_or_else(|| {
+        Error::Attachment(AttachmentError::NonUtf8SystemdSubgroup { path: path.clone() })
+    })?;
+    Ok(format!("/{}", s.trim_start_matches('/')))
+}
+
+/// Plan the attach action to take given the unit existence state,
+/// process location, target subgroup, and delegation capability.
+pub(crate) fn plan_attach_action(
+    pid: ProcessId,
+    unit_exists: bool,
+    location: Option<&ProcessLocation>,
+    target_subgroup: &CgroupPath,
+    is_delegated: bool,
+) -> Result<SystemdAttachAction> {
+    // Subgroup placement requires delegation.  Non-delegated units (e.g.
+    // slices) must not have their cgroup tree mutated directly — systemd is
+    // the single writer.  Reject early, regardless of unit existence or
+    // process location.
+    if !is_delegated && !target_subgroup.is_root() {
+        return Err(Error::Unsupported(
+            "cannot place processes in a subgroup of a non-delegated systemd unit".to_string(),
+        ));
+    }
+
+    if !unit_exists {
+        return Ok(SystemdAttachAction::StartUnitWithSubgroup {
+            subgroup: target_subgroup.clone(),
+        });
+    }
+
+    let location = location.ok_or_else(|| {
+        Error::Attachment(AttachmentError::AmbiguousMembership {
+            pid,
+            detail: "process location must be provided when unit exists".to_string(),
+        })
+    })?;
+
+    match location {
+        ProcessLocation::Outside => {
+            if !is_delegated {
+                return Err(Error::Unsupported(
+                    "systemd process attachment requires a delegated unit".to_string(),
+                ));
+            }
+            let dbus_subgroup = encode_dbus_subgroup(target_subgroup)?;
+            Ok(SystemdAttachAction::AttachOutsideViaDbus { dbus_subgroup })
+        }
+        ProcessLocation::Inside(current) => {
+            if current == target_subgroup {
+                Ok(SystemdAttachAction::AlreadyAtDestination)
+            } else {
+                if !is_delegated {
+                    return Err(Error::Unsupported(
+                        "cannot migrate processes within a non-delegated systemd unit".to_string(),
+                    ));
+                }
+                Ok(SystemdAttachAction::MigrateInsideDelegatedSubgroup {
+                    subgroup: target_subgroup.clone(),
+                })
+            }
+        }
+        ProcessLocation::InsideDifferentHierarchies => {
+            if !is_delegated {
+                return Err(Error::Unsupported(
+                    "cannot migrate processes within a non-delegated systemd unit".to_string(),
+                ));
+            }
+            Ok(SystemdAttachAction::MigrateInsideDelegatedSubgroup {
+                subgroup: target_subgroup.clone(),
+            })
+        }
+    }
+}
+
+/// Classify every managed hierarchy. On v1, systemd decides whether a process
+/// belongs to a unit using name=systemd, independently of resource controllers.
+fn classify_process_location(
+    topology: &CgroupTopology,
+    base: &CgroupPath,
+    subsystems: &[String],
+    pid: ProcessId,
+    membership: &Membership,
+) -> Result<ProcessLocation> {
+    let destination = AttachDestination::same_cgroup_as(pid);
+    if topology.version == CgroupVersion::V1 {
+        match plan_attachment(
+            topology,
+            base,
+            &["name=systemd".to_string()],
+            &destination,
+            Some(membership),
+        ) {
+            Err(AttachmentError::OutsideManagedCgroup { .. }) => {
+                return Ok(ProcessLocation::Outside)
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+    }
+    let plan = match plan_attachment(topology, base, subsystems, &destination, Some(membership)) {
+        Ok(plan) => plan,
+        Err(AttachmentError::OutsideManagedCgroup { .. })
+            if topology.version == CgroupVersion::V2 =>
+        {
+            return Ok(ProcessLocation::Outside);
+        }
+        Err(AttachmentError::OutsideManagedCgroup { .. }) => {
+            return Err(AttachmentError::Unsupported {
+                backend: "systemd",
+                operation: "process belongs to the unit but a resource hierarchy is outside its delegated tree",
+            }.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let target = match &plan.placement {
+        Placement::Unified(target) => target,
+        Placement::Legacy(targets) => {
+            let target = targets
+                .values()
+                .next()
+                .ok_or(AttachmentError::Unsupported {
+                    backend: "systemd",
+                    operation: "attachment requires a visible managed hierarchy",
+                })?;
+            // Include name=systemd even when the manager's own membership did
+            // not list it: D-Bus unit membership must agree with all targets.
+            let systemd_plan = plan_attachment(
+                topology,
+                base,
+                &["name=systemd".to_string()],
+                &destination,
+                Some(membership),
+            )?;
+            let Placement::Legacy(systemd_targets) = systemd_plan.placement else {
+                unreachable!()
+            };
+            if targets
+                .values()
+                .chain(systemd_targets.values())
+                .any(|path| path != target)
+            {
+                return Ok(ProcessLocation::InsideDifferentHierarchies);
+            }
+            target
+        }
+    };
+    let subgroup = target.as_path().strip_prefix(base.as_path()).map_err(|_| {
+        Error::Core(crate::error::CoreError::InvalidPath {
+            input: target.as_path().to_path_buf(),
+            reason: crate::error::PathReason::ContainmentViolation,
+            operation: "classify_process_location",
+        })
+    })?;
+    Ok(ProcessLocation::Inside(
+        if subgroup.as_os_str().is_empty() {
+            CgroupPath::root()?
+        } else {
+            CgroupPath::new(subgroup)?
+        },
+    ))
+}
+
 impl SystemdManager<'_> {
-    /// Set the default attachment destination used by [`Manager::add_proc`]
-    /// and [`Manager::add_thread`].
-    pub fn set_default_destination(&mut self, destination: AttachDestination) {
-        self.default_destination = destination;
+    /// Existing scopes use the actual D-Bus property. For a new scope the
+    /// transient-unit builder explicitly requests Delegate=true.
+    fn is_delegated(&self, unit_exists: bool) -> Result<bool> {
+        if !self.unit.ends_with(SCOPE_SUFFIX) {
+            return Ok(false);
+        }
+        if unit_exists {
+            Ok(self.systemd_client.try_delegated()?)
+        } else {
+            Ok(true)
+        }
     }
 
-    /// Builder method to set the default attachment destination.
-    pub fn with_default_destination(mut self, destination: AttachDestination) -> Self {
-        self.default_destination = destination;
-        self
-    }
-
-    /// Return the current default attachment destination.
-    pub fn default_destination(&self) -> &AttachDestination {
-        &self.default_destination
+    /// Locate a process relative to this managed unit.
+    pub(crate) fn locate_process(
+        &self,
+        pid: ProcessId,
+        subsystems: &[String],
+    ) -> Result<ProcessLocation> {
+        classify_process_location(
+            self.topology(),
+            self.fs_manager.base(),
+            subsystems,
+            pid,
+            &self.fs_manager.read_membership(pid)?,
+        )
     }
 
     /// Get the slice name.
@@ -317,62 +597,94 @@ impl SystemdManager<'_> {
 
 impl Manager for SystemdManager<'_> {
     fn add_proc(&mut self, pid: CgroupPid) -> Result<()> {
-        let dest = self.default_destination.clone();
-        self.add_proc_to(pid, &dest)
+        self.add_proc_to(pid, &AttachDestination::ManagedCgroup)
     }
 
-    fn add_proc_to(&mut self, pid: CgroupPid, destination: &AttachDestination) -> Result<()> {
-        let sub = self.fs_manager.resolve_destination(destination)?;
-        let subcgroup = if sub.is_root() {
-            "/".to_string()
+    fn add_proc_to(&mut self, raw_pid: CgroupPid, destination: &AttachDestination) -> Result<()> {
+        let pid = ProcessId::try_from(raw_pid).map_err(|_| {
+            Error::Attachment(AttachmentError::InvalidProcessId { value: raw_pid.pid })
+        })?;
+
+        let unit_exists = self.systemd_client.try_exists()?;
+        let is_delegated = self.is_delegated(unit_exists)?;
+        let subsystems = if unit_exists {
+            self.delegated_subsystems(pid, is_delegated)?
         } else {
-            format!("/{}", sub.as_path().display())
+            // Before startup only the unit hierarchy is known. Non-reference
+            // destinations are syntactic; re-plan a subgroup after completion.
+            self.attachment_subsystems(pid, &[])?
+        };
+        let resolved = self
+            .fs_manager
+            .resolve_delegated_destination(destination, &subsystems)?;
+
+        let location = if unit_exists {
+            Some(self.locate_process(pid, &subsystems)?)
+        } else {
+            None
         };
 
-        if !self.systemd_client.exists() {
-            self.systemd_client.set_pid_prop(pid)?;
-            self.systemd_client.start()?;
-            if !sub.is_root() {
-                // StartTransientUnit has already placed this PID in the unit
-                // root. AttachProcessesToUnit deliberately treats any PID
-                // already belonging to the unit as a no-op, so move it through
-                // the delegated cgroupfs subtree instead.
-                self.fs_manager
-                    .add_proc_to_delegated_destination(pid, &sub)?;
+        let action = plan_attach_action(
+            pid,
+            unit_exists,
+            location.as_ref(),
+            &resolved.subgroup,
+            is_delegated,
+        )?;
+
+        match action {
+            SystemdAttachAction::StartUnitWithSubgroup { subgroup } => {
+                if resolved.plan.creation == CreationPolicy::MustExist {
+                    self.fs_manager
+                        .ensure_delegated_destination_exists(pid, &resolved)?;
+                    return Err(AttachmentError::Unsupported {
+                        backend: "systemd",
+                        operation: "SameCgroupAs requires an existing managed systemd unit",
+                    }
+                    .into());
+                }
+                self.systemd_client.set_pid_prop(raw_pid)?;
+                self.systemd_client.start()?;
+                if !subgroup.is_root() {
+                    if !self.systemd_client.try_delegated()? {
+                        return Err(Error::Unsupported(
+                            "started scope did not enable delegation".to_string(),
+                        ));
+                    }
+                    // Startup realizes and delegates the unit hierarchies. Use
+                    // the actual properties and roots, never create missing roots.
+                    let subsystems = self.delegated_subsystems(pid, true)?;
+                    let target = self
+                        .fs_manager
+                        .resolve_delegated_destination(destination, &subsystems)?;
+                    self.fs_manager
+                        .add_proc_to_delegated_destination(pid, &target)?;
+                }
             }
-            return Ok(());
+            SystemdAttachAction::AttachOutsideViaDbus { dbus_subgroup } => {
+                self.fs_manager
+                    .prepare_delegated_destination(pid, &resolved)?;
+                self.systemd_client.add_process_id(pid, &dbus_subgroup)?;
+            }
+            SystemdAttachAction::AlreadyAtDestination => {
+                self.fs_manager
+                    .ensure_delegated_destination_exists(pid, &resolved)?;
+            }
+            SystemdAttachAction::MigrateInsideDelegatedSubgroup { .. } => {
+                self.fs_manager
+                    .add_proc_to_delegated_destination(pid, &resolved)?;
+            }
         }
-
-        self.fs_manager.prepare_delegated_destination(&sub)?;
-
-        // systemd ignores the requested subgroup when the process is already
-        // anywhere inside this unit. Detect that case and perform the
-        // intra-unit move through the delegated cgroupfs tree. Processes
-        // outside the unit still go through systemd so it can perform the
-        // privileged cross-cgroup migration.
-        let proc_id = crate::model::pid::ProcessId::try_from(pid).map_err(|_| {
-            Error::Attachment(crate::error::AttachmentError::InvalidProcessId { value: pid.pid })
-        })?;
-        let current = self
-            .fs_manager
-            .resolve_destination(&AttachDestination::same_cgroup_as(proc_id));
-        match current {
-            Ok(current) if current == sub => return Ok(()),
-            Ok(_) => self
-                .fs_manager
-                .add_proc_to_delegated_destination(pid, &sub)?,
-            Err(_) => self.systemd_client.add_process(pid, &subcgroup)?,
-        }
-
         Ok(())
     }
 
     /// `add_thread()` is unsupported on `SystemdManager` because systemd does not
     /// expose an API to attach individual threads. Thread-level attachment cannot
     /// be safely downgraded to process-level migration.
-    fn add_thread(&mut self, pid: CgroupPid) -> Result<()> {
-        let dest = self.default_destination.clone();
-        self.add_thread_to(pid, &dest)
+    fn add_thread(&mut self, _pid: CgroupPid) -> Result<()> {
+        Err(Error::Unsupported(
+            "systemd manager does not support thread-level attachment".to_string(),
+        ))
     }
 
     fn add_thread_to(&mut self, _pid: CgroupPid, _destination: &AttachDestination) -> Result<()> {
@@ -944,6 +1256,115 @@ mod topology_tests {
     }
 
     #[test]
+    fn test_systemd_same_cgroup_as_must_exist_does_not_recreate_vanished_leaf() {
+        use crate::discovery::attachment::CreationPolicy;
+        use crate::error::AttachmentError;
+        use crate::manager::Error;
+        use crate::model::CgroupPath;
+
+        struct TempGuard(PathBuf);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "systemd-must-exist-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _guard = TempGuard(temp_dir.clone());
+        let procfs = temp_dir.join("proc");
+        let cgroupfs = temp_dir.join("cgroupfs");
+        let unit_dir = cgroupfs.join("test.slice/scope-unit.scope");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(procfs.join("4242")).unwrap();
+        // The reference process was observed in `gone`, which no longer
+        // exists on the (synthetic) cgroupfs.
+        std::fs::write(
+            procfs.join("4242/cgroup"),
+            "0::/test.slice/scope-unit.scope/gone\n",
+        )
+        .unwrap();
+
+        let topology = Arc::new(CgroupTopology {
+            version: CgroupVersion::V2,
+            v2_available: true,
+            mounts: crate::discovery::parse_mountinfo(
+                "32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            )
+            .unwrap(),
+            membership: crate::discovery::Membership::default(),
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root: cgroupfs.clone(),
+            hugepages: PathBuf::from("/nonexistent"),
+        });
+        let host_paths = HostPaths {
+            procfs,
+            cgroupfs_override: Some(cgroupfs),
+            hugepages: PathBuf::from("/nonexistent"),
+        };
+        let manager = SystemdManager::with_topology_and_host_paths(
+            "test.slice:scope:unit",
+            topology,
+            host_paths,
+        )
+        .unwrap();
+
+        // SameCgroupAs keeps MustExist after being flattened to a subgroup.
+        let ref_pid = crate::model::pid::ProcessId::new(4242).unwrap();
+        let resolved = manager
+            .fs_manager
+            .resolve_delegated_destination(&AttachDestination::same_cgroup_as(ref_pid), &[])
+            .unwrap();
+        assert_eq!(resolved.subgroup.as_path(), std::path::Path::new("gone"));
+        assert_eq!(resolved.plan.creation, CreationPolicy::MustExist);
+
+        // The migrate-inside branch must report ENOENT, not recreate `gone`.
+        let mover = crate::model::pid::ProcessId::new(77).unwrap();
+        let err = manager
+            .fs_manager
+            .add_proc_to_delegated_destination(mover, &resolved)
+            .unwrap_err();
+        match err {
+            Error::Attachment(AttachmentError::MissingResolvedTarget {
+                pid,
+                target,
+                source,
+            }) => {
+                assert_eq!(pid, mover);
+                assert_eq!(target, unit_dir.join("gone"));
+                assert_eq!(source.raw_os_error(), Some(libc::ENOENT));
+            }
+            other => panic!("expected MissingResolvedTarget, got {:?}", other),
+        }
+        // The D-Bus branch prepares the destination the same way.
+        assert!(manager
+            .fs_manager
+            .prepare_delegated_destination(mover, &resolved)
+            .is_err());
+        assert!(!unit_dir.join("gone").exists());
+
+        // Contrast: an explicit Subgroup may still create its leaf.
+        let explicit = manager
+            .fs_manager
+            .resolve_delegated_destination(
+                &AttachDestination::Subgroup(CgroupPath::new("worker").unwrap()),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(explicit.plan.creation, CreationPolicy::MayCreateLeaf);
+        manager
+            .fs_manager
+            .prepare_delegated_destination(mover, &explicit)
+            .unwrap();
+        assert!(unit_dir.join("worker").is_dir());
+
+        // This fixture stays independent of the host system D-Bus.
+    }
+
+    #[test]
     fn test_systemd_native_zero_updates_become_properties() {
         let topology = Arc::new(CgroupTopology {
             version: CgroupVersion::V2,
@@ -1174,5 +1595,583 @@ mod topology_tests {
         assert_eq!(props.len(), 1);
         assert_eq!(props[0].0, "MemoryLimit");
         assert!(matches!(&props[0].1, zbus::zvariant::Value::U64(u64::MAX)));
+    }
+
+    #[test]
+    fn test_encode_dbus_subgroup() {
+        use super::encode_dbus_subgroup;
+        use crate::model::path::CgroupPath;
+
+        let root = CgroupPath::root().unwrap();
+        assert_eq!(encode_dbus_subgroup(&root).unwrap(), "");
+
+        let sub = CgroupPath::new("worker").unwrap();
+        assert_eq!(encode_dbus_subgroup(&sub).unwrap(), "/worker");
+
+        let nested = CgroupPath::new("payload/init").unwrap();
+        assert_eq!(encode_dbus_subgroup(&nested).unwrap(), "/payload/init");
+    }
+
+    #[test]
+    fn test_plan_attach_action() {
+        use super::{plan_attach_action, ProcessLocation, SystemdAttachAction};
+        use crate::model::path::CgroupPath;
+        use crate::model::pid::ProcessId;
+
+        let root = CgroupPath::root().unwrap();
+        let worker = CgroupPath::new("worker").unwrap();
+        let pid = ProcessId::new(42).unwrap();
+
+        // 1. Unit does not exist -> StartUnitWithSubgroup
+        let action = plan_attach_action(pid, false, None, &worker, true).unwrap();
+        assert_eq!(
+            action,
+            SystemdAttachAction::StartUnitWithSubgroup {
+                subgroup: worker.clone()
+            }
+        );
+
+        // 2. Unit exists, process is Outside -> AttachOutsideViaDbus
+        let action =
+            plan_attach_action(pid, true, Some(&ProcessLocation::Outside), &worker, true).unwrap();
+        assert_eq!(
+            action,
+            SystemdAttachAction::AttachOutsideViaDbus {
+                dbus_subgroup: "/worker".to_string()
+            }
+        );
+
+        // 3. Unit exists, process is Inside at same destination -> AlreadyAtDestination
+        let action = plan_attach_action(
+            pid,
+            true,
+            Some(&ProcessLocation::Inside(worker.clone())),
+            &worker,
+            true,
+        )
+        .unwrap();
+        assert_eq!(action, SystemdAttachAction::AlreadyAtDestination);
+
+        // 4. Unit exists, process is Inside at root, target is worker, delegated -> MigrateInsideDelegatedSubgroup
+        let action = plan_attach_action(
+            pid,
+            true,
+            Some(&ProcessLocation::Inside(root.clone())),
+            &worker,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            SystemdAttachAction::MigrateInsideDelegatedSubgroup {
+                subgroup: worker.clone()
+            }
+        );
+
+        // 5. Unit exists, process is Inside at root, target is worker, NOT delegated -> Unsupported error
+        let err = plan_attach_action(
+            pid,
+            true,
+            Some(&ProcessLocation::Inside(root.clone())),
+            &worker,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::manager::error::Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn test_locate_process() {
+        use super::ProcessLocation;
+        use crate::error::AttachmentError;
+        use crate::model::path::CgroupPath;
+        use crate::model::pid::ProcessId;
+
+        struct TempGuard(PathBuf);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "systemd-locate-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _guard = TempGuard(temp_dir.clone());
+        let procfs = temp_dir.join("proc");
+        let cgroupfs = temp_dir.join("cgroupfs");
+
+        // PID 1001 is inside worker
+        std::fs::create_dir_all(procfs.join("1001")).unwrap();
+        std::fs::write(
+            procfs.join("1001/cgroup"),
+            "0::/test.slice/scope-unit.scope/worker\n",
+        )
+        .unwrap();
+
+        // PID 1002 is outside (different slice)
+        std::fs::create_dir_all(procfs.join("1002")).unwrap();
+        std::fs::write(procfs.join("1002/cgroup"), "0::/other.slice/other.scope\n").unwrap();
+
+        let topology = Arc::new(CgroupTopology {
+            version: CgroupVersion::V2,
+            v2_available: true,
+            mounts: crate::discovery::parse_mountinfo(
+                "32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            )
+            .unwrap(),
+            membership: crate::discovery::Membership::default(),
+            controllers: crate::discovery::ControllerSet::default(),
+            cgroupfs_root: cgroupfs.clone(),
+            hugepages: PathBuf::from("/nonexistent"),
+        });
+        let host_paths = HostPaths {
+            procfs,
+            cgroupfs_override: Some(cgroupfs),
+            hugepages: PathBuf::from("/nonexistent"),
+        };
+
+        let manager = SystemdManager::with_topology_and_host_paths(
+            "test.slice:scope:unit",
+            topology,
+            host_paths,
+        )
+        .unwrap();
+
+        // Inside
+        let loc = manager
+            .locate_process(ProcessId::new(1001).unwrap(), &[])
+            .unwrap();
+        assert_eq!(
+            loc,
+            ProcessLocation::Inside(CgroupPath::new("worker").unwrap())
+        );
+
+        // Outside
+        let loc = manager
+            .locate_process(ProcessId::new(1002).unwrap(), &[])
+            .unwrap();
+        assert_eq!(loc, ProcessLocation::Outside);
+
+        // Missing PID -> ReadMembership error, not Outside!
+        let err = manager
+            .locate_process(ProcessId::new(9999).unwrap(), &[])
+            .unwrap_err();
+        match err {
+            crate::manager::error::Error::Attachment(AttachmentError::ReadMembership {
+                pid,
+                ..
+            }) => {
+                assert_eq!(pid, ProcessId::new(9999).unwrap());
+            }
+            other => panic!("expected ReadMembership error, got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod attachment_regression_tests {
+    use super::*;
+    use crate::discovery::{parse_membership, parse_mountinfo, ControllerSet};
+    use std::path::PathBuf;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "p2-systemd-probe-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn manager(&self, v: CgroupVersion, mounts: &str, own: &str) -> SystemdManager<'static> {
+            let cg = self.0.join("cg");
+            let mounts = parse_mountinfo(mounts).unwrap();
+            let topo = Arc::new(CgroupTopology {
+                version: v,
+                v2_available: !mounts.unified_mounts().is_empty(),
+                mounts,
+                membership: parse_membership(own).unwrap(),
+                controllers: ControllerSet::default(),
+                cgroupfs_root: cg.clone(),
+                hugepages: self.0.join("hugepages"),
+            });
+            SystemdManager::with_topology_and_host_paths(
+                "test.slice:scope:unit",
+                topo,
+                HostPaths {
+                    procfs: self.0.join("proc"),
+                    cgroupfs_override: Some(cg),
+                    hugepages: self.0.join("hugepages"),
+                },
+            )
+            .unwrap()
+        }
+        fn membership(&self, pid: u32, content: &str) {
+            let path = self.0.join("proc").join(pid.to_string());
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("cgroup"), content).unwrap();
+        }
+        fn unit_dir(&self, controller: &str) -> PathBuf {
+            self.0
+                .join("cg")
+                .join(controller)
+                .join("test.slice/scope-unit.scope")
+        }
+        fn realize(&self, controllers: &[&str]) {
+            for controller in controllers {
+                let dir = self.unit_dir(controller);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("cgroup.procs"), "root").unwrap();
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const V1: &str = "31 23 0:27 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n32 23 0:28 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n33 23 0:29 / /sys/fs/cgroup/systemd rw - cgroup cgroup rw,name=systemd\n";
+
+    const EXTRA_V1_MOUNTS: &str = "34 23 0:30 / /sys/fs/cgroup/freezer rw - cgroup cgroup rw,freezer\n35 23 0:31 / /sys/fs/cgroup/cpuset rw - cgroup cgroup rw,cpuset\n36 23 0:32 / /sys/fs/cgroup/net_cls rw - cgroup cgroup rw,net_cls\n";
+
+    #[test]
+    fn test_v1_extra_mounts_do_not_block_systemd_attachment() {
+        // Exercise both a legacy table and one with an optional unified mount.
+        // These files prove selection and writes, not kernel process migration.
+        for unified_mount in [
+            "",
+            "37 23 0:33 / /sys/fs/cgroup/unified rw - cgroup2 cgroup2 rw\n",
+        ] {
+            let fixture = Fixture::new();
+            let mounts = format!("{V1}{EXTRA_V1_MOUNTS}{unified_mount}");
+            let unified_membership = if unified_mount.is_empty() {
+                ""
+            } else {
+                "0::/\n"
+            };
+            let membership = format!(
+                "1:cpu:/\n2:memory:/\n3:name=systemd:/\n4:freezer:/\n5:cpuset:/\n6:net_cls:/\n{unified_membership}"
+            );
+            let manager = fixture.manager(CgroupVersion::V1, &mounts, &membership);
+            fixture.realize(&["cpu", "memory", "systemd"]);
+            // Even an independently created freezer tree grants no ownership.
+            fixture.realize(&["freezer"]);
+            let pid = ProcessId::new(42).unwrap();
+            let delegated = ["cpu", "memory", "cpuset", "freezer"].map(str::to_string);
+            let subsystems = manager.attachment_subsystems(pid, &delegated).unwrap();
+            assert_eq!(subsystems, ["cpu", "memory", "name=systemd"]);
+            assert_eq!(manager.fs_manager.managed_subsystems().len(), 6);
+
+            fixture.membership(42, &format!("1:cpu:/outside\n2:memory:/outside\n3:name=systemd:/outside\n4:freezer:/\n5:cpuset:/\n6:net_cls:/\n{unified_membership}"));
+            let root = manager
+                .fs_manager
+                .resolve_delegated_destination(&AttachDestination::ManagedCgroup, &subsystems)
+                .unwrap();
+            let outside = manager.locate_process(pid, &subsystems).unwrap();
+            assert_eq!(
+                plan_attach_action(pid, true, Some(&outside), &root.subgroup, true).unwrap(),
+                SystemdAttachAction::AttachOutsideViaDbus {
+                    dbus_subgroup: String::new()
+                },
+            );
+            manager
+                .fs_manager
+                .prepare_delegated_destination(pid, &root)
+                .unwrap();
+
+            fixture.membership(42, &format!("1:cpu:/test.slice/scope-unit.scope\n2:memory:/test.slice/scope-unit.scope\n3:name=systemd:/test.slice/scope-unit.scope\n4:freezer:/\n5:cpuset:/\n6:net_cls:/\n{unified_membership}"));
+            let inside = manager.locate_process(pid, &subsystems).unwrap();
+            assert_eq!(
+                plan_attach_action(pid, true, Some(&inside), &root.subgroup, true).unwrap(),
+                SystemdAttachAction::AlreadyAtDestination,
+            );
+            manager
+                .fs_manager
+                .ensure_delegated_destination_exists(pid, &root)
+                .unwrap();
+
+            let leaf = manager
+                .fs_manager
+                .resolve_delegated_destination(
+                    &AttachDestination::subgroup("worker").unwrap(),
+                    &subsystems,
+                )
+                .unwrap();
+            manager
+                .fs_manager
+                .prepare_delegated_destination(pid, &leaf)
+                .unwrap();
+            for controller in ["cpu", "memory", "systemd"] {
+                std::fs::write(fixture.unit_dir(controller).join("worker/cgroup.procs"), "")
+                    .unwrap();
+            }
+            manager
+                .fs_manager
+                .add_proc_to_delegated_destination(pid, &leaf)
+                .unwrap();
+            for controller in ["cpu", "memory", "systemd"] {
+                assert_eq!(
+                    std::fs::read_to_string(
+                        fixture.unit_dir(controller).join("worker/cgroup.procs")
+                    )
+                    .unwrap(),
+                    "42"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(fixture.unit_dir("freezer").join("cgroup.procs")).unwrap(),
+                "root"
+            );
+            assert!(!fixture.unit_dir("freezer").join("worker").exists());
+            assert!(!fixture.unit_dir("cpuset").exists());
+            assert!(!fixture.unit_dir("net_cls").exists());
+        }
+    }
+
+    #[test]
+    fn test_v1_attachment_honors_partial_delegation_and_unrealized_roots() {
+        let fixture = Fixture::new();
+        let mounts = "31 23 0:27 / /sys/fs/cgroup/cpu,cpuacct rw - cgroup cgroup rw,cpu,cpuacct\n32 23 0:28 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n33 23 0:29 / /sys/fs/cgroup/systemd rw - cgroup cgroup rw,name=systemd\n34 23 0:30 / /sys/fs/cgroup/pids rw - cgroup cgroup rw,pids\n";
+        let manager = fixture.manager(
+            CgroupVersion::V1,
+            mounts,
+            "1:cpu,cpuacct:/\n2:memory:/\n3:name=systemd:/\n4:pids:/\n",
+        );
+        fixture.realize(&["cpu,cpuacct", "memory", "systemd"]);
+        let pid = ProcessId::new(42).unwrap();
+        // Memory is realized but not delegated; pids is requested but unrealized.
+        let delegated = ["cpu", "pids"].map(str::to_string);
+        let subsystems = manager.attachment_subsystems(pid, &delegated).unwrap();
+        assert_eq!(subsystems, ["cpu", "cpuacct", "name=systemd"]);
+        let leaf = manager
+            .fs_manager
+            .resolve_delegated_destination(
+                &AttachDestination::subgroup("worker").unwrap(),
+                &subsystems,
+            )
+            .unwrap();
+        manager
+            .fs_manager
+            .prepare_delegated_destination(pid, &leaf)
+            .unwrap();
+        for controller in ["cpu,cpuacct", "systemd"] {
+            let file = fixture.unit_dir(controller).join("worker/cgroup.procs");
+            std::fs::write(file, "").unwrap();
+        }
+        manager
+            .fs_manager
+            .add_proc_to_delegated_destination(pid, &leaf)
+            .unwrap();
+        assert!(!fixture.unit_dir("memory").join("worker").exists());
+        assert_eq!(
+            std::fs::read_to_string(fixture.unit_dir("memory").join("cgroup.procs")).unwrap(),
+            "root"
+        );
+        assert!(!fixture.unit_dir("pids").exists());
+    }
+
+    #[test]
+    fn test_v1_selected_reference_leaf_must_exist_on_every_hierarchy() {
+        let fixture = Fixture::new();
+        let mounts = format!("{V1}{EXTRA_V1_MOUNTS}");
+        let manager = fixture.manager(
+            CgroupVersion::V1,
+            &mounts,
+            "1:cpu:/\n2:memory:/\n3:name=systemd:/\n4:freezer:/\n5:cpuset:/\n6:net_cls:/\n",
+        );
+        fixture.realize(&["cpu", "memory", "systemd"]);
+        let pid = ProcessId::new(42).unwrap();
+        let subsystems = manager
+            .attachment_subsystems(pid, &["cpu".to_string(), "memory".to_string()])
+            .unwrap();
+        fixture.membership(100, "1:cpu:/test.slice/scope-unit.scope/worker\n2:memory:/test.slice/scope-unit.scope/worker\n3:name=systemd:/test.slice/scope-unit.scope/worker\n4:freezer:/\n5:cpuset:/\n6:net_cls:/\n");
+        let reference = AttachDestination::same_cgroup_as(ProcessId::new(100).unwrap());
+        let target = manager
+            .fs_manager
+            .resolve_delegated_destination(&reference, &subsystems)
+            .unwrap();
+        assert_eq!(target.plan.creation, CreationPolicy::MustExist);
+        for controller in ["cpu", "systemd"] {
+            let dir = fixture.unit_dir(controller).join("worker");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("cgroup.procs"), "original").unwrap();
+        }
+        let missing = fixture.unit_dir("memory").join("worker");
+        let error = manager
+            .fs_manager
+            .add_proc_to_delegated_destination(pid, &target)
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Attachment(AttachmentError::MissingResolvedTarget { target, source, .. })
+            if target == missing && source.raw_os_error() == Some(libc::ENOENT))
+        );
+        assert!(!missing.exists());
+        assert_eq!(
+            std::fs::read_to_string(fixture.unit_dir("cpu").join("worker/cgroup.procs")).unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    fn test_v1_unit_hierarchy_inspection_propagates_permission_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        crate::skip_if_root!();
+        let fixture = Fixture::new();
+        let manager = fixture.manager(
+            CgroupVersion::V1,
+            V1,
+            "1:cpu:/\n2:memory:/\n3:name=systemd:/\n",
+        );
+        fixture.realize(&["cpu", "memory", "systemd"]);
+        let locked = fixture.unit_dir("memory").parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let result =
+            manager.attachment_subsystems(ProcessId::new(42).unwrap(), &["memory".to_string()]);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(result, Err(Error::Attachment(AttachmentError::TargetIo { target, source, .. }))
+            if target == fixture.unit_dir("memory") && source.raw_os_error() == Some(libc::EACCES))
+        );
+    }
+
+    #[test]
+    fn test_v1_unit_membership_uses_systemd_hierarchy() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager(
+            CgroupVersion::V1,
+            V1,
+            "1:cpu:/\n2:memory:/\n3:name=systemd:/\n",
+        );
+        let pid = ProcessId::new(42).unwrap();
+        // Matching CPU/memory does not mean the process belongs to the unit.
+        let subsystems = manager.fs_manager.managed_subsystems();
+        fixture.membership(42, "1:cpu:/test.slice/scope-unit.scope/leaf\n2:memory:/test.slice/scope-unit.scope/leaf\n3:name=systemd:/other.scope\n");
+        assert_eq!(
+            manager.locate_process(pid, &subsystems).unwrap(),
+            ProcessLocation::Outside
+        );
+        // If systemd already considers it inside, D-Bus attach would be a
+        // no-op. An outside resource hierarchy cannot be written directly.
+        fixture.membership(42, "1:cpu:/other.scope\n2:memory:/test.slice/scope-unit.scope/leaf\n3:name=systemd:/test.slice/scope-unit.scope/leaf\n");
+        assert!(matches!(
+            manager.locate_process(pid, &subsystems),
+            Err(Error::Attachment(AttachmentError::Unsupported { .. }))
+        ));
+        // Missing membership must not be classified as outside.
+        fixture.membership(
+            42,
+            "1:cpu:/test.slice/scope-unit.scope/leaf\n2:memory:/test.slice/scope-unit.scope/leaf\n",
+        );
+        assert!(matches!(
+            manager.locate_process(pid, &subsystems),
+            Err(Error::Attachment(
+                AttachmentError::MissingHierarchyMembership { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_non_delegated_existing_unit_actions() {
+        let pid = ProcessId::new(42).unwrap();
+        let root = CgroupPath::root().unwrap();
+        for location in [
+            ProcessLocation::Outside,
+            ProcessLocation::InsideDifferentHierarchies,
+        ] {
+            assert!(matches!(
+                plan_attach_action(pid, true, Some(&location), &root, false),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        assert_eq!(
+            plan_attach_action(
+                pid,
+                true,
+                Some(&ProcessLocation::Inside(root.clone())),
+                &root,
+                false
+            )
+            .unwrap(),
+            SystemdAttachAction::AlreadyAtDestination
+        );
+    }
+
+    #[test]
+    fn test_malformed_membership_propagates_from_location() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager(
+            CgroupVersion::V2,
+            "32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            "0::/\n",
+        );
+        fixture.membership(42, "0::/test.slice/scope-unit.scope/leaf\n0::/outside\n");
+        assert!(matches!(
+            manager.locate_process(ProcessId::new(42).unwrap(), &[]),
+            Err(Error::Attachment(AttachmentError::ParseMembership { .. }))
+        ));
+    }
+
+    #[test]
+    fn test_forbid_nondelegated_move_to_root() {
+        let root = CgroupPath::root().unwrap();
+        let location = ProcessLocation::Inside(CgroupPath::new("leaf").unwrap());
+        let result = plan_attach_action(
+            ProcessId::new(42).unwrap(),
+            true,
+            Some(&location),
+            &root,
+            false,
+        );
+        assert!(
+            matches!(result, Err(Error::Unsupported(_))),
+            "nondelegated root move was planned: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_systemd_v1_compare_all_hierarchies() {
+        let f = Fixture::new();
+        let mounts = "31 23 0:27 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n32 23 0:28 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n33 23 0:29 / /sys/fs/cgroup/systemd rw - cgroup cgroup rw,name=systemd\n";
+        let m = f.manager(
+            CgroupVersion::V1,
+            mounts,
+            "1:cpu:/\n2:memory:/\n3:name=systemd:/\n",
+        );
+        f.membership(100, "1:cpu:/test.slice/scope-unit.scope/cpu_leaf\n2:memory:/test.slice/scope-unit.scope/mem_leaf\n3:name=systemd:/test.slice/scope-unit.scope/sys_leaf\n");
+        f.membership(42, "1:cpu:/test.slice/scope-unit.scope/cpu_leaf\n2:memory:/test.slice/scope-unit.scope/old_mem\n3:name=systemd:/test.slice/scope-unit.scope/old_sys\n");
+        let reference = AttachDestination::same_cgroup_as(ProcessId::new(100).unwrap());
+        let subsystems = m.fs_manager.managed_subsystems();
+        assert!(matches!(
+            m.fs_manager
+                .resolve_delegated_destination(&reference, &subsystems),
+            Err(Error::Attachment(AttachmentError::Unsupported {
+                backend: "systemd",
+                ..
+            }))
+        ));
+        let current = m
+            .locate_process(ProcessId::new(42).unwrap(), &subsystems)
+            .unwrap();
+        assert_eq!(current, ProcessLocation::InsideDifferentHierarchies);
+        let desired = CgroupPath::new("cpu_leaf").unwrap();
+        let action = plan_attach_action(
+            ProcessId::new(42).unwrap(),
+            true,
+            Some(&current),
+            &desired,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            SystemdAttachAction::MigrateInsideDelegatedSubgroup { subgroup: desired }
+        );
     }
 }

@@ -217,6 +217,20 @@ impl FsManager {
     }
 }
 
+/// A destination below a delegated (systemd-owned) cgroup, flattened to a
+/// single subgroup path but still carrying the complete execution plan.
+///
+/// The plan preserves both `SameCgroupAs`'s creation policy and the selected
+/// hierarchies. Execution must not widen systemd's selection to every mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DelegatedDestination {
+    /// Subgroup relative to the managed cgroup; [`CgroupPath::root`] means
+    /// the managed cgroup itself.
+    pub subgroup: CgroupPath,
+    /// Validated placement, selected hierarchies, and creation policy.
+    pub plan: AttachmentPlan,
+}
+
 impl FsManager {
     /// Return the validated base path of this manager.
     pub fn base(&self) -> &CgroupPath {
@@ -245,6 +259,14 @@ impl FsManager {
         &self,
         destination: &AttachDestination,
     ) -> Result<AttachmentPlan> {
+        self.plan_attachment_in(destination, &self.managed_subsystems())
+    }
+
+    fn plan_attachment_in(
+        &self,
+        destination: &AttachDestination,
+        subsystems: &[String],
+    ) -> Result<AttachmentPlan> {
         let membership = match destination {
             AttachDestination::SameCgroupAs(pid) => Some(self.read_membership(*pid)?),
             _ => None,
@@ -252,7 +274,7 @@ impl FsManager {
         pure_plan_attachment(
             &self.topology,
             &self.base,
-            &self.managed_subsystems(),
+            subsystems,
             destination,
             membership.as_ref(),
         )
@@ -262,7 +284,18 @@ impl FsManager {
     /// Resolve a destination to one subgroup below the managed cgroup.
     /// Divergent v1 hierarchy placements cannot be represented by this API.
     pub fn resolve_destination(&self, destination: &AttachDestination) -> Result<CgroupPath> {
-        let plan = self.plan_attachment(destination)?;
+        self.resolve_delegated_destination(destination, &self.managed_subsystems())
+            .map(|resolved| resolved.subgroup)
+    }
+
+    /// Preserve creation policy while converting a plan to the single subgroup
+    /// accepted by systemd. Never select an arbitrary v1 hierarchy.
+    pub(crate) fn resolve_delegated_destination(
+        &self,
+        destination: &AttachDestination,
+        subsystems: &[String],
+    ) -> Result<DelegatedDestination> {
+        let plan = self.plan_attachment_in(destination, subsystems)?;
         let target = match &plan.placement {
             Placement::Unified(target) => target,
             Placement::Legacy(targets) => {
@@ -289,13 +322,16 @@ impl FsManager {
                 Error::Core(crate::error::CoreError::InvalidPath {
                     input: target.as_path().to_path_buf(),
                     reason: crate::error::PathReason::ContainmentViolation,
-                    operation: "resolve_destination",
+                    operation: "resolve_delegated_destination",
                 })
             })?;
-        Ok(if sub.as_os_str().is_empty() {
-            CgroupPath::root()?
-        } else {
-            CgroupPath::new(sub)?
+        Ok(DelegatedDestination {
+            subgroup: if sub.as_os_str().is_empty() {
+                CgroupPath::root()?
+            } else {
+                CgroupPath::new(sub)?
+            },
+            plan,
         })
     }
 
@@ -441,44 +477,46 @@ impl FsManager {
         Ok(())
     }
 
-    /// Ensure that a destination below a systemd-delegated cgroup exists
-    /// without enabling cgroup v2 controllers on the managed unit root.
-    pub(crate) fn prepare_delegated_destination(&self, destination: &CgroupPath) -> Result<()> {
-        if !self.exists() {
-            return Err(Error::Attachment(AttachmentError::Unsupported {
-                backend: "cgroupfs",
-                operation:
-                    "cannot prepare an attachment destination before the managed cgroup exists",
-            }));
-        }
-        if destination.is_root() {
-            return Ok(());
-        }
-
-        let target_path = self.base.join(destination);
-        let target_cg = Cgroup::load_validated_with_topology(self.topology.clone(), target_path);
-        target_cg.create_attachment_leaf()?;
-        Ok(())
+    fn delegated_root_plan(&self, destination: &DelegatedDestination) -> Result<AttachmentPlan> {
+        let subsystems = match &destination.plan.placement {
+            Placement::Unified(_) => Vec::new(),
+            Placement::Legacy(targets) => targets.keys().cloned().collect(),
+        };
+        let mut plan = self.plan_attachment_in(&AttachDestination::ManagedCgroup, &subsystems)?;
+        plan.creation = CreationPolicy::MustExist;
+        Ok(plan)
     }
 
-    /// Attach a process to an already-resolved destination in a delegated
-    /// cgroup subtree.  This is used when systemd cannot relocate a process
-    /// because it already belongs to the unit.
+    /// Prepare a delegated leaf without enabling controllers on the unit root.
+    /// The managed unit must already exist on every selected hierarchy.
+    pub(crate) fn prepare_delegated_destination(
+        &self,
+        pid: ProcessId,
+        destination: &DelegatedDestination,
+    ) -> Result<()> {
+        self.prepare_attachment_plan(&self.delegated_root_plan(destination)?, pid)?;
+        self.prepare_attachment_plan(&destination.plan, pid)
+    }
+
+    /// Check every selected hierarchy, preserving metadata failures and errno.
+    pub(crate) fn ensure_delegated_destination_exists(
+        &self,
+        pid: ProcessId,
+        destination: &DelegatedDestination,
+    ) -> Result<()> {
+        let mut plan = destination.plan.clone();
+        plan.creation = CreationPolicy::MustExist;
+        self.prepare_attachment_plan(&plan, pid)
+    }
+
+    /// Migrate within a delegated unit using the resolved creation policy.
     pub(crate) fn add_proc_to_delegated_destination(
         &self,
-        tgid: CgroupPid,
-        destination: &CgroupPath,
+        pid: ProcessId,
+        destination: &DelegatedDestination,
     ) -> Result<()> {
-        self.prepare_delegated_destination(destination)?;
-        if destination.is_root() {
-            self.cgroup.add_task_by_tgid(tgid)?;
-        } else {
-            let target_path = self.base.join(destination);
-            let target_cg =
-                Cgroup::load_validated_with_topology(self.topology.clone(), target_path);
-            target_cg.add_task_by_tgid(tgid)?;
-        }
-        Ok(())
+        self.prepare_delegated_destination(pid, destination)?;
+        self.execute_attachment_plan(&destination.plan, pid, true)
     }
 
     /// Create the cgroups if they are not created yet.
@@ -2918,10 +2956,12 @@ mod attachment_tests {
             host_paths,
         )
         .unwrap();
-        let destination = CgroupPath::new("worker").unwrap();
+        let destination = manager
+            .resolve_delegated_destination(&AttachDestination::subgroup("worker").unwrap(), &[])
+            .unwrap();
 
         manager
-            .add_proc_to_delegated_destination(CgroupPid::from(42u64), &destination)
+            .add_proc_to_delegated_destination(ProcessId::new(42).unwrap(), &destination)
             .unwrap();
 
         assert_eq!(
