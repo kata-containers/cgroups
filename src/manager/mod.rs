@@ -35,13 +35,35 @@ pub trait Manager: Send + Sync {
     fn add_proc(&mut self, tgid: CgroupPid) -> Result<()>;
 
     /// Add a process specified by its tgid to an explicit attachment destination.
-    fn add_proc_to(&mut self, tgid: CgroupPid, destination: &AttachDestination) -> Result<()>;
+    ///
+    /// The default implementation forwards [`AttachDestination::ManagedCgroup`]
+    /// to [`Manager::add_proc`] and returns [`Error::Unsupported`] for custom
+    /// destinations, preserving source compatibility for third-party implementors.
+    fn add_proc_to(&mut self, tgid: CgroupPid, destination: &AttachDestination) -> Result<()> {
+        match destination {
+            AttachDestination::ManagedCgroup => self.add_proc(tgid),
+            _ => Err(Error::Unsupported(
+                "custom attachment destination is not supported by this manager".to_string(),
+            )),
+        }
+    }
 
     /// Add a thread specified by its pid using the default destination.
     fn add_thread(&mut self, pid: CgroupPid) -> Result<()>;
 
     /// Add a thread specified by its pid to an explicit attachment destination.
-    fn add_thread_to(&mut self, pid: CgroupPid, destination: &AttachDestination) -> Result<()>;
+    ///
+    /// The default implementation forwards [`AttachDestination::ManagedCgroup`]
+    /// to [`Manager::add_thread`] and returns [`Error::Unsupported`] for custom
+    /// destinations, preserving source compatibility for third-party implementors.
+    fn add_thread_to(&mut self, pid: CgroupPid, destination: &AttachDestination) -> Result<()> {
+        match destination {
+            AttachDestination::ManagedCgroup => self.add_thread(pid),
+            _ => Err(Error::Unsupported(
+                "custom attachment destination is not supported by this manager".to_string(),
+            )),
+        }
+    }
 
     /// Get the list of pids joint to the cgroups.
     fn pids(&self) -> Result<Vec<CgroupPid>>;

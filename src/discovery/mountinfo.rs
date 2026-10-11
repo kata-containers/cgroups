@@ -35,6 +35,28 @@ pub struct MountTable {
 }
 
 impl MountTable {
+    /// Select the unified mount used by discovery and attachment. Prefer a
+    /// complete hierarchy over a bind-mounted subtree, then retain input order.
+    pub(crate) fn unified_mount(&self) -> Option<&MountRecord> {
+        let mut mounts = self.records.iter().filter(|m| m.fs_type.0 == "cgroup2");
+        let first = mounts.next()?;
+        if first.mount_root == std::path::Path::new("/") {
+            Some(first)
+        } else {
+            mounts
+                .find(|m| m.mount_root == std::path::Path::new("/"))
+                .or(Some(first))
+        }
+    }
+
+    /// Select one visible v1 mount for a controller, including `name=...`
+    /// hierarchies. All consumers must use this same mount and its mount root.
+    pub(crate) fn controller_mount(&self, controller: &str) -> Option<&MountRecord> {
+        self.records.iter().find(|mount| {
+            mount.fs_type.0 == "cgroup" && mount.super_opts.iter().any(|opt| opt == controller)
+        })
+    }
+
     /// All parsed mount records, in input order.
     pub fn records(&self) -> &[MountRecord] {
         &self.records

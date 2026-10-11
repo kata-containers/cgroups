@@ -1,4 +1,5 @@
 // Copyright (c) 2026 Ant Group
+// Copyright (c) 2026 Kata Contributors
 //
 // SPDX-License-Identifier: Apache-2.0 or MIT
 
@@ -215,27 +216,6 @@ impl CgroupPath {
     pub fn as_path(&self) -> &Path {
         &self.path
     }
-
-    /// Convert this path into a systemd-compatible subgroup representation.
-    ///
-    /// Systemd encodes cgroup hierarchy positions using its own naming
-    /// conventions (`.slice` / `.scope` suffixes, dash-escaped path
-    /// components). This method will translate a validated `CgroupPath`
-    /// into that representation for use with the systemd D-Bus manager
-    /// interface.
-    ///
-    /// # Phase 2
-    ///
-    /// This is a placeholder for the systemd D-Bus integration rework.
-    /// The translation rules depend on design decisions in Phase 2
-    /// (slice nesting, scope naming, unit-name escaping) that have not
-    /// been finalized yet.
-    pub fn to_systemd_subgroup(&self) -> CoreResult<String> {
-        unimplemented!(
-            "CgroupPath::to_systemd_subgroup is a Phase 2 placeholder; \
-             systemd unit-name translation is not yet implemented"
-        )
-    }
 }
 
 impl AsRef<Path> for CgroupPath {
@@ -437,8 +417,8 @@ mod tests {
             },
             Case {
                 name: "nested components",
-                input: "docker/kata/a1",
-                expect: &["docker", "kata", "a1"],
+                input: "tenant/workload/a1",
+                expect: &["tenant", "workload", "a1"],
             },
             Case {
                 name: "colon in component",
@@ -512,9 +492,9 @@ mod tests {
         const CASES: &[Case] = &[
             Case {
                 name: "append nested sub-path",
-                base: "docker",
-                sub: "kata/a1",
-                expect: "docker/kata/a1",
+                base: "tenant",
+                sub: "workload/a1",
+                expect: "tenant/workload/a1",
             },
             Case {
                 name: "deep append",
@@ -529,8 +509,8 @@ mod tests {
         }
 
         let root = CgroupPath::root().unwrap();
-        assert_eq!(path("docker").join(&root), path("docker"));
-        assert_eq!(root.join(&path("kata/a1")), path("kata/a1"));
+        assert_eq!(path("tenant").join(&root), path("tenant"));
+        assert_eq!(root.join(&path("workload/a1")), path("workload/a1"));
         assert_eq!(root.join(&root), root);
     }
 
@@ -546,8 +526,8 @@ mod tests {
 
     #[test]
     fn test_join_does_not_mutate_operands() {
-        let a = path("docker");
-        let b = path("kata/a1");
+        let a = path("tenant");
+        let b = path("workload/a1");
         let (a_before, b_before) = (a.clone(), b.clone());
         let _joined = a.join(&b);
         assert_eq!(a, a_before);
@@ -605,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_parent_after_single_component_join() {
-        let base = path("docker/kata");
+        let base = path("tenant/workload");
         let leaf = path("a1");
         assert_eq!(base.join(&leaf).parent(), Some(base));
     }
@@ -627,8 +607,8 @@ mod tests {
             },
             Case {
                 name: "nested components",
-                input: "docker/kata/a1",
-                expect: "docker/kata/a1",
+                input: "tenant/workload/a1",
+                expect: "tenant/workload/a1",
             },
             Case {
                 name: "colon in component",
@@ -653,9 +633,9 @@ mod tests {
 
     #[test]
     fn test_as_ref_path() {
-        let p = path("docker/kata/a1");
+        let p = path("tenant/workload/a1");
         let r: &Path = AsRef::as_ref(&p);
-        assert_eq!(r, Path::new("docker/kata/a1"));
+        assert_eq!(r, Path::new("tenant/workload/a1"));
         assert_eq!(r, p.as_path());
     }
 
@@ -676,7 +656,7 @@ mod tests {
         const INPUTS: &[&str] = &[
             "",
             "a",
-            "docker/kata/a1",
+            "tenant/workload/a1",
             "a:b/c",
             "foo.bar",
             "a..b",
@@ -718,7 +698,7 @@ mod tests {
             CgroupPath::from_component(OsStr::from_bytes(b"\xff")).unwrap(),
             path_bytes(b"\xff")
         );
-        let single = CgroupPath::from_component("docker").unwrap();
+        let single = CgroupPath::from_component("tenant").unwrap();
         assert_eq!(single.as_path().components().count(), 1);
 
         struct Case {
@@ -814,8 +794,8 @@ mod tests {
         );
         assert_eq!(CgroupPath::from_proc_membership("/a").unwrap(), path("a"));
         assert_eq!(
-            CgroupPath::from_proc_membership("/docker/kata/a1").unwrap(),
-            path("docker/kata/a1")
+            CgroupPath::from_proc_membership("/tenant/workload/a1").unwrap(),
+            path("tenant/workload/a1")
         );
         assert_eq!(
             CgroupPath::from_proc_membership("/a:b/c").unwrap(),

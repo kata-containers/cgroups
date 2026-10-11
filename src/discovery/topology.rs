@@ -178,7 +178,7 @@ impl CgroupTopology {
             if let Ok(rel) = original.strip_prefix(&natural_root) {
                 return self.cgroupfs_root.join(rel);
             }
-        } else if let Some(candidate) = self.mounts.unified_mounts().first() {
+        } else if let Some(candidate) = self.mounts.unified_mount() {
             if original == candidate.mount_point {
                 return self.cgroupfs_root.clone();
             }
@@ -307,12 +307,7 @@ fn assemble_topology(
     host_paths: &HostPaths,
 ) -> CoreResult<CgroupTopology> {
     let v1_mounts = mounts.cgroup_mounts();
-    let unified_mounts = mounts.unified_mounts();
-
-    let unified_candidate = unified_mounts
-        .iter()
-        .find(|mount| mount.mount_root == Path::new("/"))
-        .or_else(|| unified_mounts.first());
+    let unified_candidate = mounts.unified_mount();
 
     let (version, v2_available, cgroupfs_root) = if !v1_mounts.is_empty() {
         let natural_root = determine_v1_natural_root(&v1_mounts);

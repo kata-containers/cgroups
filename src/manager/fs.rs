@@ -254,12 +254,12 @@ impl FsManager {
                 let proc_cgroup = self
                     .host_paths
                     .procfs
-                    .join(ref_pid.pid.to_string())
+                    .join(ref_pid.get().to_string())
                     .join("cgroup");
                 let content = std::fs::read_to_string(&proc_cgroup).map_err(|e| {
                     Error::Attachment(format!(
                         "failed to read membership for reference pid {} from {}: {}",
-                        ref_pid.pid,
+                        ref_pid.get(),
                         proc_cgroup.display(),
                         e
                     ))
@@ -267,7 +267,8 @@ impl FsManager {
                 let membership = parse_membership(&content).map_err(|e| {
                     Error::Attachment(format!(
                         "failed to parse membership for reference pid {}: {}",
-                        ref_pid.pid, e
+                        ref_pid.get(),
+                        e
                     ))
                 })?;
 
@@ -275,7 +276,7 @@ impl FsManager {
                     let record = membership.unified().ok_or_else(|| {
                         Error::Attachment(format!(
                             "unified membership record (0::) not found for pid {}",
-                            ref_pid.pid
+                            ref_pid.get()
                         ))
                     })?;
                     let rel_path = record.path.strip_prefix("/").unwrap_or(&record.path);
@@ -284,7 +285,7 @@ impl FsManager {
                     if !rel_path.starts_with(base_path) {
                         return Err(Error::Attachment(format!(
                             "reference process {} (cgroup {:?}) is outside managed cgroup {:?}",
-                            ref_pid.pid,
+                            ref_pid.get(),
                             record.path,
                             self.base.as_path()
                         )));
@@ -293,7 +294,7 @@ impl FsManager {
                     let sub = rel_path.strip_prefix(base_path).map_err(|_| {
                         Error::Attachment(format!(
                             "reference process {} is not within managed cgroup",
-                            ref_pid.pid
+                            ref_pid.get()
                         ))
                     })?;
 
@@ -311,7 +312,7 @@ impl FsManager {
                         .ok_or_else(|| {
                             Error::Attachment(format!(
                                 "no membership records found for pid {}",
-                                ref_pid.pid
+                                ref_pid.get()
                             ))
                         })?;
 
@@ -321,7 +322,7 @@ impl FsManager {
                     if !rel_path.starts_with(base_path) {
                         return Err(Error::Attachment(format!(
                             "reference process {} (cgroup {:?}) is outside managed cgroup {:?}",
-                            ref_pid.pid,
+                            ref_pid.get(),
                             record.path,
                             self.base.as_path()
                         )));
@@ -330,7 +331,7 @@ impl FsManager {
                     let sub = rel_path.strip_prefix(base_path).map_err(|_| {
                         Error::Attachment(format!(
                             "reference process {} is not within managed cgroup",
-                            ref_pid.pid
+                            ref_pid.get()
                         ))
                     })?;
 
@@ -2087,13 +2088,13 @@ mod parse_tests {
         },
         Case {
             name: "colon-path: colons survive, v2 path exposed via the empty key",
-            input: "0::/user.slice/session:c1.scope\n6:memory:/docker/ab:cd/init\n0::/a:b:c",
-            expect: Some(&[("memory", "/docker/ab:cd/init"), ("", "/a:b:c")]),
+            input: "0::/user.slice/session:c1.scope\n6:memory:/docker/ab:cd/init",
+            expect: Some(&[("memory", "/docker/ab:cd/init"), ("", "/user.slice/session:c1.scope")]),
         },
         Case {
-            name: "v2-only: last unified line wins for the empty key",
+            name: "malformed: duplicate unified records are rejected",
             input: "0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/init\n0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec",
-            expect: Some(&[("", "/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec")]),
+            expect: None,
         },
         Case {
             name: "malformed: missing path field is rejected",
@@ -2560,7 +2561,8 @@ mod attachment_tests {
         let manager =
             FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
 
-        let dest = AttachDestination::SameCgroupAs(CgroupPid::from(12345u64));
+        let pid = crate::model::pid::ProcessId::new(12345).unwrap();
+        let dest = AttachDestination::same_cgroup_as(pid);
         let resolved = manager.resolve_destination(&dest).unwrap();
         assert_eq!(resolved, CgroupPath::new("init").unwrap());
     }
@@ -2588,7 +2590,8 @@ mod attachment_tests {
         let manager =
             FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
 
-        let dest = AttachDestination::SameCgroupAs(CgroupPid::from(23456u64));
+        let pid = crate::model::pid::ProcessId::new(23456).unwrap();
+        let dest = AttachDestination::same_cgroup_as(pid);
         let resolved = manager.resolve_destination(&dest).unwrap();
         assert!(resolved.is_root());
     }
@@ -2616,7 +2619,8 @@ mod attachment_tests {
         let manager =
             FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
 
-        let dest = AttachDestination::SameCgroupAs(CgroupPid::from(34567u64));
+        let pid = crate::model::pid::ProcessId::new(34567).unwrap();
+        let dest = AttachDestination::same_cgroup_as(pid);
         let result = manager.resolve_destination(&dest);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2644,7 +2648,8 @@ mod attachment_tests {
         let manager =
             FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
 
-        let dest = AttachDestination::SameCgroupAs(CgroupPid::from(999999u64));
+        let pid = crate::model::pid::ProcessId::new(999999).unwrap();
+        let dest = AttachDestination::same_cgroup_as(pid);
         let result = manager.resolve_destination(&dest);
         assert!(result.is_err());
         match result.unwrap_err() {
