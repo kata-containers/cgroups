@@ -22,11 +22,18 @@ use crate::fs::freezer::FreezerController;
 use crate::fs::hugetlb::HugeTlbController;
 use crate::fs::memory::MemController;
 use crate::fs::net_cls::NetClsController;
+use std::convert::TryFrom;
+
+use crate::discovery::attachment::{
+    plan_attachment as pure_plan_attachment, AttachmentPlan, CreationPolicy, Placement,
+};
+use crate::error::AttachmentError;
 use crate::fs::net_prio::NetPrioController;
 use crate::fs::pid::PidController;
 use crate::fs::{hierarchies, Cgroup, ControllIdentifier, Controller, MaxValue, Subsystem};
 use crate::manager::error::Error;
 use crate::manager::{conv, Manager, Result};
+use crate::model::pid::ProcessId;
 use crate::model::{
     AttachDestination, BlkIoPatch, CgroupPath, CpuPatch, CpuSetPatch, DevicePatch, HugePagePatch,
     MemoryPatch, NetworkPatch, PidsPatch, ResourcePatch, Update,
@@ -63,8 +70,6 @@ pub struct FsManager {
     base: CgroupPath,
     /// Cgroup managed by this manager.
     cgroup: Cgroup,
-    /// Default attachment destination for processes and threads.
-    default_destination: AttachDestination,
 }
 
 impl FsManager {
@@ -193,7 +198,6 @@ impl FsManager {
             host_paths,
             base,
             cgroup,
-            default_destination: AttachDestination::default(),
         }
     }
 
@@ -219,140 +223,233 @@ impl FsManager {
         &self.base
     }
 
-    /// Set the default attachment destination used by [`Manager::add_proc`]
-    /// and [`Manager::add_thread`].
-    pub fn set_default_destination(&mut self, destination: AttachDestination) {
-        self.default_destination = destination;
+    /// Read one membership snapshot from the configured procfs.
+    pub(crate) fn read_membership(&self, pid: ProcessId) -> Result<Membership> {
+        let path = self.host_paths.procfs.join(pid.to_string()).join("cgroup");
+        let content = std::fs::read_to_string(&path)
+            .map_err(|source| AttachmentError::ReadMembership { pid, path, source })?;
+        parse_membership(&content)
+            .map_err(|source| AttachmentError::ParseMembership { pid, source }.into())
     }
 
-    /// Builder method to set the default attachment destination.
-    pub fn with_default_destination(mut self, destination: AttachDestination) -> Self {
-        self.default_destination = destination;
-        self
+    /// Only mounted hierarchies are managed; a procfs record alone does not
+    /// make a hierarchy visible in the caller's mount namespace.
+    pub(crate) fn managed_subsystems(&self) -> Vec<String> {
+        let mut subsystems: Vec<_> = self.mounts.keys().cloned().collect();
+        subsystems.sort();
+        subsystems
     }
 
-    /// Return the current default attachment destination.
-    pub fn default_destination(&self) -> &AttachDestination {
-        &self.default_destination
+    /// Generate a resolved plan before creating or migrating anything.
+    pub(crate) fn plan_attachment(
+        &self,
+        destination: &AttachDestination,
+    ) -> Result<AttachmentPlan> {
+        let membership = match destination {
+            AttachDestination::SameCgroupAs(pid) => Some(self.read_membership(*pid)?),
+            _ => None,
+        };
+        pure_plan_attachment(
+            &self.topology,
+            &self.base,
+            &self.managed_subsystems(),
+            destination,
+            membership.as_ref(),
+        )
+        .map_err(Error::Attachment)
     }
 
-    /// Resolve an [`AttachDestination`] into a concrete relative [`CgroupPath`]
-    /// below `self.base`.
-    ///
-    /// - [`AttachDestination::ManagedCgroup`] resolves to [`CgroupPath::root()`],
-    ///   meaning attachment directly to the managed cgroup.
-    /// - [`AttachDestination::Subgroup(path)`] resolves directly to `path`.
-    /// - [`AttachDestination::SameCgroupAs(ref_pid)`] reads the membership
-    ///   of `ref_pid` from `<procfs>/<ref_pid>/cgroup`, verifies that it is
-    ///   inside the managed cgroup subtree (`self.base`), and computes the
-    ///   relative subpath below `self.base`.
+    /// Resolve a destination to one subgroup below the managed cgroup.
+    /// Divergent v1 hierarchy placements cannot be represented by this API.
     pub fn resolve_destination(&self, destination: &AttachDestination) -> Result<CgroupPath> {
-        match destination {
-            AttachDestination::ManagedCgroup => Ok(CgroupPath::root()?),
-            AttachDestination::Subgroup(path) => Ok(path.clone()),
-            AttachDestination::SameCgroupAs(ref_pid) => {
-                let proc_cgroup = self
-                    .host_paths
-                    .procfs
-                    .join(ref_pid.get().to_string())
-                    .join("cgroup");
-                let content = std::fs::read_to_string(&proc_cgroup).map_err(|e| {
-                    Error::Attachment(format!(
-                        "failed to read membership for reference pid {} from {}: {}",
-                        ref_pid.get(),
-                        proc_cgroup.display(),
-                        e
-                    ))
+        let plan = self.plan_attachment(destination)?;
+        let target = match &plan.placement {
+            Placement::Unified(target) => target,
+            Placement::Legacy(targets) => {
+                let target = targets.values().next().ok_or_else(|| {
+                    Error::Attachment(AttachmentError::Unsupported {
+                        backend: "systemd",
+                        operation: "attachment requires a visible managed hierarchy",
+                    })
                 })?;
-                let membership = parse_membership(&content).map_err(|e| {
-                    Error::Attachment(format!(
-                        "failed to parse membership for reference pid {}: {}",
-                        ref_pid.get(),
-                        e
-                    ))
-                })?;
+                if targets.values().any(|path| path != target) {
+                    return Err(Error::Attachment(AttachmentError::Unsupported {
+                        backend: "systemd",
+                        operation:
+                            "different v1 hierarchy destinations cannot be encoded as one subgroup",
+                    }));
+                }
+                target
+            }
+        };
+        let sub = target
+            .as_path()
+            .strip_prefix(self.base.as_path())
+            .map_err(|_| {
+                Error::Core(crate::error::CoreError::InvalidPath {
+                    input: target.as_path().to_path_buf(),
+                    reason: crate::error::PathReason::ContainmentViolation,
+                    operation: "resolve_destination",
+                })
+            })?;
+        Ok(if sub.as_os_str().is_empty() {
+            CgroupPath::root()?
+        } else {
+            CgroupPath::new(sub)?
+        })
+    }
 
-                if self.v2() {
-                    let record = membership.unified().ok_or_else(|| {
-                        Error::Attachment(format!(
-                            "unified membership record (0::) not found for pid {}",
-                            ref_pid.get()
-                        ))
-                    })?;
-                    let rel_path = record.path.strip_prefix("/").unwrap_or(&record.path);
-
-                    let base_path = self.base.as_path();
-                    if !rel_path.starts_with(base_path) {
-                        return Err(Error::Attachment(format!(
-                            "reference process {} (cgroup {:?}) is outside managed cgroup {:?}",
-                            ref_pid.get(),
-                            record.path,
-                            self.base.as_path()
-                        )));
-                    }
-
-                    let sub = rel_path.strip_prefix(base_path).map_err(|_| {
-                        Error::Attachment(format!(
-                            "reference process {} is not within managed cgroup",
-                            ref_pid.get()
-                        ))
-                    })?;
-
-                    if sub.as_os_str().is_empty() {
-                        Ok(CgroupPath::root()?)
-                    } else {
-                        Ok(CgroupPath::new(sub)?)
-                    }
-                } else {
-                    let record = membership
-                        .records()
-                        .iter()
-                        .find(|r| r.controllers.iter().any(|c| self.paths.contains_key(c)))
-                        .or_else(|| membership.records().first())
-                        .ok_or_else(|| {
-                            Error::Attachment(format!(
-                                "no membership records found for pid {}",
-                                ref_pid.get()
-                            ))
+    /// Resolve the plan using the same mount selector as discovery. Co-mounted
+    /// controllers share one directory and therefore one membership write.
+    fn attachment_targets(
+        &self,
+        plan: &AttachmentPlan,
+    ) -> Result<std::collections::BTreeMap<PathBuf, Vec<String>>> {
+        let mut resolved = std::collections::BTreeMap::new();
+        match &plan.placement {
+            Placement::Unified(path) => {
+                let cg = Cgroup::load_validated_with_topology(self.topology.clone(), path.clone());
+                for dir in cg.attachment_leaf_dirs() {
+                    resolved.insert(dir, vec!["0::".to_string()]);
+                }
+            }
+            Placement::Legacy(targets) => {
+                for (controller, path) in targets {
+                    let mount = self
+                        .topology
+                        .mounts
+                        .controller_mount(controller)
+                        .ok_or_else(|| AttachmentError::MissingHierarchyMount {
+                            hierarchy: controller.clone(),
+                            root: self.topology.cgroupfs_root.clone(),
                         })?;
-
-                    let rel_path = record.path.strip_prefix("/").unwrap_or(&record.path);
-
-                    let base_path = self.base.as_path();
-                    if !rel_path.starts_with(base_path) {
-                        return Err(Error::Attachment(format!(
-                            "reference process {} (cgroup {:?}) is outside managed cgroup {:?}",
-                            ref_pid.get(),
-                            record.path,
-                            self.base.as_path()
-                        )));
-                    }
-
-                    let sub = rel_path.strip_prefix(base_path).map_err(|_| {
-                        Error::Attachment(format!(
-                            "reference process {} is not within managed cgroup",
-                            ref_pid.get()
-                        ))
-                    })?;
-
-                    if sub.as_os_str().is_empty() {
-                        Ok(CgroupPath::root()?)
-                    } else {
-                        Ok(CgroupPath::new(sub)?)
-                    }
+                    let dir = self
+                        .topology
+                        .resolve_mount_point(&mount.mount_point)
+                        .join(path.as_path());
+                    resolved
+                        .entry(dir)
+                        .or_insert_with(Vec::new)
+                        .push(controller.clone());
                 }
             }
         }
+        Ok(resolved)
+    }
+
+    fn check_attachment_directory(
+        pid: ProcessId,
+        target: &Path,
+        controllers: &[String],
+    ) -> Result<()> {
+        match std::fs::metadata(target) {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            result => {
+                let source = match result {
+                    Ok(_) => std::io::Error::from_raw_os_error(libc::ENOTDIR),
+                    Err(source) => source,
+                };
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    Err(AttachmentError::MissingResolvedTarget {
+                        pid,
+                        target: target.to_path_buf(),
+                        source,
+                    }
+                    .into())
+                } else {
+                    Err(AttachmentError::TargetIo {
+                        backend: "cgroupfs",
+                        pid,
+                        operation: "inspect attachment directory",
+                        target: target.to_path_buf(),
+                        controllers: controllers.to_vec(),
+                        source,
+                    }
+                    .into())
+                }
+            }
+        }
+    }
+
+    fn prepare_attachment_plan(&self, plan: &AttachmentPlan, pid: ProcessId) -> Result<()> {
+        for (target, controllers) in self.attachment_targets(plan)? {
+            if plan.creation == CreationPolicy::MayCreateLeaf {
+                std::fs::create_dir_all(&target).map_err(|source| AttachmentError::TargetIo {
+                    backend: "cgroupfs",
+                    pid,
+                    operation: "create attachment directory",
+                    target: target.clone(),
+                    controllers: controllers.clone(),
+                    source,
+                })?;
+            }
+            Self::check_attachment_directory(pid, &target, &controllers)?;
+        }
+        Ok(())
+    }
+
+    fn execute_attachment_plan(
+        &self,
+        plan: &AttachmentPlan,
+        pid: ProcessId,
+        is_proc: bool,
+    ) -> Result<()> {
+        self.prepare_attachment_plan(plan, pid)?;
+        match &plan.placement {
+            Placement::Unified(path) => {
+                let cg = Cgroup::load_validated_with_topology(self.topology.clone(), path.clone());
+                let raw_pid = CgroupPid::from(u64::from(pid.get()));
+                if is_proc {
+                    cg.add_task_by_tgid(raw_pid)?;
+                } else {
+                    cg.add_task(raw_pid)?;
+                }
+            }
+            Placement::Legacy(_) => {
+                let mut completed = Vec::new();
+                let file_name = if is_proc { "cgroup.procs" } else { "tasks" };
+                for (target, controllers) in self.attachment_targets(plan)? {
+                    let file = target.join(file_name);
+                    // Kernel membership files must already exist. Opening without
+                    // O_CREAT also prevents a missing pseudo-file from being faked.
+                    use std::io::Write;
+                    let write = std::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open(&file)
+                        .and_then(|mut file| file.write_all(pid.to_string().as_bytes()));
+                    if let Err(source) = write {
+                        return Err(AttachmentError::WriteMembership {
+                            backend: "cgroupfs",
+                            pid,
+                            operation: if is_proc {
+                                "attach process"
+                            } else {
+                                "attach thread"
+                            },
+                            controllers,
+                            target: file,
+                            completed,
+                            source,
+                        }
+                        .into());
+                    }
+                    completed.push(controllers);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Ensure that a destination below a systemd-delegated cgroup exists
     /// without enabling cgroup v2 controllers on the managed unit root.
     pub(crate) fn prepare_delegated_destination(&self, destination: &CgroupPath) -> Result<()> {
         if !self.exists() {
-            return Err(Error::Attachment(
-                "cannot prepare an attachment destination before the managed cgroup exists"
-                    .to_string(),
-            ));
+            return Err(Error::Attachment(AttachmentError::Unsupported {
+                backend: "cgroupfs",
+                operation:
+                    "cannot prepare an attachment destination before the managed cgroup exists",
+            }));
         }
         if destination.is_root() {
             return Ok(());
@@ -360,7 +457,7 @@ impl FsManager {
 
         let target_path = self.base.join(destination);
         let target_cg = Cgroup::load_validated_with_topology(self.topology.clone(), target_path);
-        target_cg.create_delegated_subgroup()?;
+        target_cg.create_attachment_leaf()?;
         Ok(())
     }
 
@@ -393,32 +490,18 @@ impl FsManager {
         Ok(())
     }
 
-    /// Get the subcgroup path, which is useful for Docker-in-Docker (DinD)
-    /// with cgroup v2, see [1].
+    /// Get the subcgroup path.
     ///
-    /// 1: https://github.com/kata-containers/kata-containers/issues/10733
+    /// This is a backwards-compatibility shim that unconditionally returns `"/"`.
+    /// Callers that need to attach to a leaf subgroup must use
+    /// [`AttachDestination::subgroup`] or [`AttachDestination::same_cgroup_as`]
+    /// with [`Manager::add_proc_to`].
     #[deprecated(
         since = "0.5.2",
-        note = "use explicit AttachDestination with add_proc_to or with_default_destination"
+        note = "use explicit AttachDestination with add_proc_to"
     )]
     pub fn subcgroup(&self) -> &str {
-        // Check if we're in a Docker-in-Docker setup by verifying:
-        // 1. We're using cgroups v2 (which restricts direct process control)
-        // 2. An "init" subdirectory exists (used by DinD for process
-        //    delegation)
-        let init_exists = self
-            .topology
-            .cgroupfs_root
-            .join(self.base.as_path())
-            .join("init")
-            .exists();
-        let is_dind = self.v2() && init_exists;
-
-        if is_dind {
-            "/init/"
-        } else {
-            "/"
-        }
+        "/"
     }
 
     fn controller<'a, T>(&'a self) -> FsResult<&'a T>
@@ -1261,60 +1344,31 @@ impl FsManager {
 
 impl Manager for FsManager {
     fn add_proc(&mut self, tgid: CgroupPid) -> Result<()> {
-        let dest = self.default_destination.clone();
-        self.add_proc_to(tgid, &dest)
+        self.add_proc_to(tgid, &AttachDestination::ManagedCgroup)
     }
 
     fn add_proc_to(&mut self, tgid: CgroupPid, destination: &AttachDestination) -> Result<()> {
-        self.create_cgroups()?;
-        let sub = self.resolve_destination(destination)?;
-        if sub.is_root() {
-            self.cgroup.add_task_by_tgid(tgid)?;
-        } else {
-            let target_path = self.base.join(&sub);
-            let target_cg =
-                Cgroup::load_validated_with_topology(self.topology.clone(), target_path);
-            if !target_cg.exists() {
-                target_cg.create()?;
-            }
-            target_cg.add_task_by_tgid(tgid)?;
+        let pid = ProcessId::try_from(tgid)
+            .map_err(|_| AttachmentError::InvalidProcessId { value: tgid.pid })?;
+        let plan = self.plan_attachment(destination)?;
+        if plan.creation == CreationPolicy::MayCreateLeaf {
+            self.create_cgroups()?;
         }
-        Ok(())
+        self.execute_attachment_plan(&plan, pid, true)
     }
 
     fn add_thread(&mut self, pid: CgroupPid) -> Result<()> {
-        let dest = self.default_destination.clone();
-        self.add_thread_to(pid, &dest)
+        self.add_thread_to(pid, &AttachDestination::ManagedCgroup)
     }
 
     fn add_thread_to(&mut self, pid: CgroupPid, destination: &AttachDestination) -> Result<()> {
-        self.create_cgroups()?;
-        let sub = self.resolve_destination(destination)?;
-        if sub.is_root() {
-            self.cgroup.add_task(pid).or_else(|err| {
-                // Try to add_proc with the pid when threaded cgroup is
-                // disabled in cgroup v2.
-                if err.kind() == &FsErrorKind::CgroupMode && self.v2() {
-                    self.add_proc_to(pid, destination)
-                } else {
-                    Err(Error::Cgroupfs(err))
-                }
-            })
-        } else {
-            let target_path = self.base.join(&sub);
-            let target_cg =
-                Cgroup::load_validated_with_topology(self.topology.clone(), target_path);
-            if !target_cg.exists() {
-                target_cg.create()?;
-            }
-            target_cg.add_task(pid).or_else(|err| {
-                if err.kind() == &FsErrorKind::CgroupMode && self.v2() {
-                    self.add_proc_to(pid, destination)
-                } else {
-                    Err(Error::Cgroupfs(err))
-                }
-            })
+        let pid = ProcessId::try_from(pid)
+            .map_err(|_| AttachmentError::InvalidProcessId { value: pid.pid })?;
+        let plan = self.plan_attachment(destination)?;
+        if plan.creation == CreationPolicy::MayCreateLeaf {
+            self.create_cgroups()?;
         }
+        self.execute_attachment_plan(&plan, pid, false)
     }
 
     fn pids(&self) -> Result<Vec<CgroupPid>> {
@@ -1475,28 +1529,20 @@ fn controller_mounts(
     topology: &CgroupTopology,
     paths: &HashMap<String, String>,
 ) -> HashMap<String, String> {
-    let mut controller_mounts = HashMap::new();
-    for record in topology
-        .mounts
-        .cgroup_mounts()
-        .iter()
-        .chain(topology.mounts.unified_mounts().iter())
-    {
-        let mut resolved = None;
-        for opt in &record.super_opts {
-            // If opt matches one of the cgroup subsystems
-            if paths.contains_key(opt) {
-                let point = resolved.get_or_insert_with(|| {
+    paths
+        .keys()
+        .filter_map(|controller| {
+            topology.mounts.controller_mount(controller).map(|record| {
+                (
+                    controller.clone(),
                     topology
                         .resolve_mount_point(&record.mount_point)
                         .to_string_lossy()
-                        .into_owned()
-                });
-                controller_mounts.insert(opt.clone(), point.clone());
-            }
-        }
-    }
-    controller_mounts
+                        .into_owned(),
+                )
+            })
+        })
+        .collect()
 }
 
 /// Join a base path with a validated [`CgroupPath`].
@@ -2088,12 +2134,12 @@ mod parse_tests {
         },
         Case {
             name: "colon-path: colons survive, v2 path exposed via the empty key",
-            input: "0::/user.slice/session:c1.scope\n6:memory:/docker/ab:cd/init",
-            expect: Some(&[("memory", "/docker/ab:cd/init"), ("", "/user.slice/session:c1.scope")]),
+            input: "0::/user.slice/session:c1.scope\n6:memory:/org:dept/ab:cd/leaf",
+            expect: Some(&[("memory", "/org:dept/ab:cd/leaf"), ("", "/user.slice/session:c1.scope")]),
         },
         Case {
             name: "malformed: duplicate unified records are rejected",
-            input: "0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/init\n0::/kubepods/burstable/pod-abc123/cri-containerd-xyz/exec",
+            input: "0::/tenant/burstable/pod-abc123/sandbox-xyz/init\n0::/tenant/burstable/pod-abc123/sandbox-xyz/exec",
             expect: None,
         },
         Case {
@@ -2455,8 +2501,10 @@ mod attachment_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use crate::discovery::{CgroupTopology, CgroupVersion, ControllerSet, HostPaths, MountTable};
+    use crate::discovery::{CgroupTopology, CgroupVersion, ControllerSet, HostPaths};
+    use crate::error::AttachmentError;
     use crate::manager::{Error, FsManager, Manager};
+    use crate::model::pid::ProcessId;
     use crate::model::{AttachDestination, CgroupPath};
     use crate::CgroupPid;
 
@@ -2487,7 +2535,10 @@ mod attachment_tests {
         Arc::new(CgroupTopology {
             version: CgroupVersion::V2,
             v2_available: true,
-            mounts: MountTable::default(),
+            mounts: crate::discovery::parse_mountinfo(
+                "32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            )
+            .unwrap(),
             membership: Default::default(),
             controllers: ControllerSet::default(),
             cgroupfs_root,
@@ -2511,12 +2562,6 @@ mod attachment_tests {
         let manager =
             FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
 
-        // Default destination must be ManagedCgroup
-        assert_eq!(
-            manager.default_destination(),
-            &AttachDestination::ManagedCgroup
-        );
-
         // Resolve ManagedCgroup -> root CgroupPath
         let resolved = manager
             .resolve_destination(&AttachDestination::ManagedCgroup)
@@ -2529,13 +2574,6 @@ mod attachment_tests {
             .resolve_destination(&AttachDestination::Subgroup(sub.clone()))
             .unwrap();
         assert_eq!(resolved, sub);
-
-        // with_default_destination builder
-        let manager = manager.with_default_destination(AttachDestination::Subgroup(sub.clone()));
-        assert_eq!(
-            manager.default_destination(),
-            &AttachDestination::Subgroup(sub)
-        );
     }
 
     #[test]
@@ -2561,7 +2599,7 @@ mod attachment_tests {
         let manager =
             FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
 
-        let pid = crate::model::pid::ProcessId::new(12345).unwrap();
+        let pid = ProcessId::new(12345).unwrap();
         let dest = AttachDestination::same_cgroup_as(pid);
         let resolved = manager.resolve_destination(&dest).unwrap();
         assert_eq!(resolved, CgroupPath::new("init").unwrap());
@@ -2590,7 +2628,7 @@ mod attachment_tests {
         let manager =
             FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
 
-        let pid = crate::model::pid::ProcessId::new(23456).unwrap();
+        let pid = ProcessId::new(23456).unwrap();
         let dest = AttachDestination::same_cgroup_as(pid);
         let resolved = manager.resolve_destination(&dest).unwrap();
         assert!(resolved.is_root());
@@ -2619,15 +2657,18 @@ mod attachment_tests {
         let manager =
             FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
 
-        let pid = crate::model::pid::ProcessId::new(34567).unwrap();
+        let pid = ProcessId::new(34567).unwrap();
         let dest = AttachDestination::same_cgroup_as(pid);
         let result = manager.resolve_destination(&dest);
         assert!(result.is_err());
         match result.unwrap_err() {
-            Error::Attachment(msg) => {
-                assert!(msg.contains("outside managed cgroup"), "error: {}", msg);
+            Error::Attachment(AttachmentError::OutsideManagedCgroup { pid: err_pid, .. }) => {
+                assert_eq!(err_pid, pid);
             }
-            other => panic!("expected Error::Attachment, got {:?}", other),
+            other => panic!(
+                "expected AttachmentError::OutsideManagedCgroup, got {:?}",
+                other
+            ),
         }
     }
 
@@ -2648,15 +2689,170 @@ mod attachment_tests {
         let manager =
             FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
 
-        let pid = crate::model::pid::ProcessId::new(999999).unwrap();
+        let pid = ProcessId::new(999999).unwrap();
         let dest = AttachDestination::same_cgroup_as(pid);
         let result = manager.resolve_destination(&dest);
         assert!(result.is_err());
         match result.unwrap_err() {
-            Error::Attachment(msg) => {
-                assert!(msg.contains("failed to read membership"), "error: {}", msg);
+            Error::Attachment(AttachmentError::ReadMembership { pid: err_pid, .. }) => {
+                assert_eq!(err_pid, pid);
             }
-            other => panic!("expected Error::Attachment, got {:?}", other),
+            other => panic!("expected AttachmentError::ReadMembership, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_subcgroup_returns_root_regardless_of_init_directory() {
+        let fixture = TestDir::new("subcgroup_shim");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let init_dir = cgroupfs_root.join("container.slice/init");
+        fs::create_dir_all(&init_dir).unwrap();
+
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let manager =
+            FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
+
+        // Even though container.slice/init exists, subcgroup must return "/" unconditionally
+        #[allow(deprecated)]
+        let sub = manager.subcgroup();
+        assert_eq!(sub, "/");
+    }
+
+    #[test]
+    fn test_same_cgroup_as_dynamic_membership_change() {
+        let fixture = TestDir::new("dynamic_membership");
+        let procfs = fixture.path().join("proc");
+        let cgroupfs_root = fixture.path().join("cgroup");
+
+        let worker1_dir = cgroupfs_root.join("container.slice/worker1");
+        let worker2_dir = cgroupfs_root.join("container.slice/worker2");
+        fs::create_dir_all(&worker1_dir).unwrap();
+        fs::create_dir_all(&worker2_dir).unwrap();
+        File::create(worker1_dir.join("cgroup.procs")).unwrap();
+        File::create(worker2_dir.join("cgroup.procs")).unwrap();
+
+        let pid_dir = procfs.join("1111");
+        fs::create_dir_all(&pid_dir).unwrap();
+        let cgroup_file = pid_dir.join("cgroup");
+
+        // Initially worker1
+        fs::write(
+            &cgroup_file,
+            "0::/container.slice/worker1
+",
+        )
+        .unwrap();
+
+        let host_paths = HostPaths {
+            procfs,
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let mut manager =
+            FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
+
+        let ref_pid = ProcessId::new(1111).unwrap();
+        let dest = AttachDestination::same_cgroup_as(ref_pid);
+
+        // First attach -> worker1
+        manager.add_proc_to(CgroupPid::from(100u64), &dest).unwrap();
+        assert_eq!(
+            fs::read_to_string(worker1_dir.join("cgroup.procs"))
+                .unwrap()
+                .trim(),
+            "100"
+        );
+
+        // Now reference process moves to worker2!
+        fs::write(
+            &cgroup_file,
+            "0::/container.slice/worker2
+",
+        )
+        .unwrap();
+
+        // Second attach -> worker2 (re-read per attach, not cached!)
+        manager.add_proc_to(CgroupPid::from(200u64), &dest).unwrap();
+        assert_eq!(
+            fs::read_to_string(worker2_dir.join("cgroup.procs"))
+                .unwrap()
+                .trim(),
+            "200"
+        );
+    }
+
+    #[test]
+    fn test_same_cgroup_as_must_exist_does_not_recreate_vanished_target() {
+        let fixture = TestDir::new("must_exist_vanished");
+        let procfs = fixture.path().join("proc");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        let container_dir = cgroupfs_root.join("container.slice");
+        fs::create_dir_all(&container_dir).unwrap();
+        File::create(container_dir.join("cgroup.procs")).unwrap();
+
+        let pid_dir = procfs.join("2222");
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(
+            pid_dir.join("cgroup"),
+            "0::/container.slice/vanished
+",
+        )
+        .unwrap();
+
+        let host_paths = HostPaths {
+            procfs,
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let mut manager =
+            FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
+
+        let ref_pid = ProcessId::new(2222).unwrap();
+        let dest = AttachDestination::same_cgroup_as(ref_pid);
+
+        let result = manager.add_proc_to(CgroupPid::from(42u64), &dest);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Attachment(AttachmentError::MissingResolvedTarget { pid, .. }) => {
+                assert_eq!(pid, ProcessId::new(42).unwrap());
+            }
+            other => panic!("expected MissingResolvedTarget, got {:?}", other),
+        }
+
+        // Must NOT create vanished directory!
+        assert!(!container_dir.join("vanished").exists());
+    }
+
+    #[test]
+    fn test_invalid_process_id_rejected() {
+        let fixture = TestDir::new("invalid_pid");
+        let cgroupfs_root = fixture.path().join("cgroup");
+        fs::create_dir_all(&cgroupfs_root).unwrap();
+
+        let host_paths = HostPaths {
+            procfs: fixture.path().join("proc"),
+            cgroupfs_override: Some(cgroupfs_root.clone()),
+            hugepages: PathBuf::from("/sys/kernel/mm/hugepages"),
+        };
+
+        let topo = make_test_topology_v2(cgroupfs_root);
+        let mut manager =
+            FsManager::with_topology_and_host_paths("container.slice", topo, host_paths).unwrap();
+
+        let err = manager.add_proc(CgroupPid::from(0u64)).unwrap_err();
+        match err {
+            Error::Attachment(AttachmentError::InvalidProcessId { value: 0 }) => {}
+            other => panic!("expected InvalidProcessId, got {:?}", other),
         }
     }
 
@@ -2702,7 +2898,10 @@ mod attachment_tests {
         let topology = Arc::new(CgroupTopology {
             version: CgroupVersion::V2,
             v2_available: true,
-            mounts: MountTable::default(),
+            mounts: crate::discovery::parse_mountinfo(
+                "32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            )
+            .unwrap(),
             membership: Default::default(),
             controllers: vec!["memory".to_string()].into_iter().collect(),
             cgroupfs_root: cgroupfs_root.clone(),
@@ -2735,7 +2934,6 @@ mod attachment_tests {
         assert!(!managed_dir.join("cgroup.subtree_control").exists());
     }
 }
-
 #[cfg(all(test, feature = "oci"))]
 mod resource_tests {
     use std::fs;
@@ -2784,7 +2982,10 @@ mod resource_tests {
         Arc::new(CgroupTopology {
             version: CgroupVersion::V2,
             v2_available: true,
-            mounts: MountTable::default(),
+            mounts: crate::discovery::parse_mountinfo(
+                "32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            )
+            .unwrap(),
             membership: Default::default(),
             controllers,
             cgroupfs_root,
@@ -3307,5 +3508,338 @@ mod resource_tests {
         assert_eq!(stats.pids.current, 2);
         assert!(stats.blkio.io_service_bytes_recursive.is_empty());
         assert!(stats.hugetlb.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod attachment_regression_tests {
+    use super::*;
+    use crate::discovery::{parse_mountinfo, CgroupVersion, ControllerSet};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "p2-probe-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn manager(
+            &self,
+            version: CgroupVersion,
+            mounts: &str,
+            own: &str,
+            base: &str,
+        ) -> FsManager {
+            let cg = self.0.join("cg");
+            let topo = Arc::new(CgroupTopology {
+                version,
+                v2_available: version == CgroupVersion::V2,
+                mounts: parse_mountinfo(mounts).unwrap(),
+                membership: parse_membership(own).unwrap(),
+                controllers: ControllerSet::default(),
+                cgroupfs_root: cg.clone(),
+                hugepages: self.0.join("hugepages"),
+            });
+            FsManager::with_topology_and_host_paths(
+                base,
+                topo,
+                HostPaths {
+                    procfs: self.0.join("proc"),
+                    cgroupfs_override: Some(cg),
+                    hugepages: self.0.join("hugepages"),
+                },
+            )
+            .unwrap()
+        }
+        fn reference(&self, contents: &str) -> AttachDestination {
+            std::fs::create_dir_all(self.0.join("proc/100")).unwrap();
+            std::fs::write(self.0.join("proc/100/cgroup"), contents).unwrap();
+            AttachDestination::same_cgroup_as(ProcessId::new(100).unwrap())
+        }
+        fn procs(&self, path: &str) -> PathBuf {
+            let dir = self.0.join("cg").join(path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("cgroup.procs");
+            std::fs::write(&file, "").unwrap();
+            file
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    const V2: &str = "32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+
+    const V1: &str = "31 23 0:27 / /sys/fs/cgroup/cpu,cpuacct rw - cgroup cgroup rw,cpu,cpuacct\n32 23 0:28 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n";
+
+    #[test]
+    fn test_split_v1_process_and_thread_placement() {
+        let f = Fixture::new();
+        let mut manager = f.manager(
+            CgroupVersion::V1,
+            V1,
+            "1:cpu,cpuacct:/\n2:memory:/\n",
+            "app",
+        );
+        let cpu = f.procs("cpu,cpuacct/app/cpu_leaf");
+        let memory = f.procs("memory/app/mem_leaf");
+        let cpu_tasks = cpu.with_file_name("tasks");
+        let memory_tasks = memory.with_file_name("tasks");
+        std::fs::write(&cpu_tasks, "").unwrap();
+        std::fs::write(&memory_tasks, "").unwrap();
+        let destination = f.reference("1:cpu,cpuacct:/app/cpu_leaf\n2:memory:/app/mem_leaf\n");
+        manager
+            .add_proc_to(CgroupPid::from(42u64), &destination)
+            .unwrap();
+        manager
+            .add_thread_to(CgroupPid::from(43u64), &destination)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&cpu).unwrap(), "42");
+        assert_eq!(std::fs::read_to_string(&memory).unwrap(), "42");
+        assert_eq!(std::fs::read_to_string(cpu_tasks).unwrap(), "43");
+        assert_eq!(std::fs::read_to_string(memory_tasks).unwrap(), "43");
+        let plan = manager.plan_attachment(&destination).unwrap();
+        let targets = manager.attachment_targets(&plan).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets[&cpu.parent().unwrap().to_path_buf()],
+            ["cpu", "cpuacct"]
+        );
+        assert!(matches!(
+            manager.resolve_destination(&destination),
+            Err(Error::Attachment(AttachmentError::Unsupported { .. }))
+        ));
+    }
+
+    #[test]
+    fn test_missing_v1_target_prevents_all_writes() {
+        let f = Fixture::new();
+        let mut manager = f.manager(
+            CgroupVersion::V1,
+            V1,
+            "1:cpu,cpuacct:/\n2:memory:/\n",
+            "app",
+        );
+        let cpu = f.procs("cpu,cpuacct/app/leaf");
+        let destination = f.reference("1:cpu,cpuacct:/app/leaf\n2:memory:/app/gone\n");
+        assert!(matches!(
+            manager.add_proc_to(CgroupPid::from(42u64), &destination),
+            Err(Error::Attachment(
+                AttachmentError::MissingResolvedTarget { .. }
+            ))
+        ));
+        assert_eq!(std::fs::read_to_string(cpu).unwrap(), "");
+        assert!(!f.0.join("cg/memory/app").exists());
+    }
+
+    #[test]
+    fn test_invalid_membership_does_not_create_managed_root() {
+        let f = Fixture::new();
+        let mut manager = f.manager(CgroupVersion::V2, V2, "0::/\n", "app");
+        let destination = f.reference("0::/app/leaf\n0::/outside\n");
+        assert!(matches!(
+            manager.add_proc_to(CgroupPid::from(42u64), &destination),
+            Err(Error::Attachment(AttachmentError::ParseMembership { .. }))
+        ));
+        assert!(!f.0.join("cg/app").exists());
+    }
+
+    #[test]
+    fn test_non_directory_preserves_enotdir() {
+        let f = Fixture::new();
+        let mut manager = f.manager(CgroupVersion::V2, V2, "0::/\n", "app");
+        f.procs("app");
+        std::fs::write(f.0.join("cg/app/leaf"), "").unwrap();
+        let destination = f.reference("0::/app/leaf\n");
+        match manager
+            .add_proc_to(CgroupPid::from(42u64), &destination)
+            .unwrap_err()
+        {
+            Error::Attachment(AttachmentError::TargetIo { source, .. }) => {
+                assert_eq!(source.raw_os_error(), Some(libc::ENOTDIR));
+            }
+            error => panic!("unexpected error: {:?}", error),
+        }
+    }
+
+    #[test]
+    fn test_missing_membership_file_is_not_created() {
+        let f = Fixture::new();
+        let mut manager = f.manager(
+            CgroupVersion::V1,
+            V1,
+            "1:cpu,cpuacct:/\n2:memory:/\n",
+            "app",
+        );
+        std::fs::create_dir_all(f.0.join("cg/cpu,cpuacct/app/leaf")).unwrap();
+        f.procs("memory/app/leaf");
+        let destination = f.reference("1:cpu,cpuacct:/app/leaf\n2:memory:/app/leaf\n");
+        match manager
+            .add_proc_to(CgroupPid::from(42u64), &destination)
+            .unwrap_err()
+        {
+            Error::Attachment(AttachmentError::WriteMembership {
+                controllers,
+                completed,
+                source,
+                ..
+            }) => {
+                assert_eq!(controllers, ["cpu", "cpuacct"]);
+                assert!(completed.is_empty());
+                assert_eq!(source.raw_os_error(), Some(libc::ENOENT));
+            }
+            error => panic!("unexpected error: {:?}", error),
+        }
+        assert!(!f.0.join("cg/cpu,cpuacct/app/leaf/cgroup.procs").exists());
+    }
+
+    #[test]
+    fn test_reject_direct_root_subgroup() {
+        let f = Fixture::new();
+        let mut m = f.manager(CgroupVersion::V2, V2, "0::/\n", "app");
+        let result = m.add_proc_to(
+            CgroupPid::from(42u64),
+            &AttachDestination::Subgroup(CgroupPath::root().unwrap()),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Attachment(
+                AttachmentError::InvalidDestination { .. }
+            ))
+        ));
+        assert!(!f.0.join("cg/app").exists());
+    }
+
+    #[test]
+    fn test_use_selected_v2_mount() {
+        let f = Fixture::new();
+        let mounts = "31 23 0:27 /tenant /bind/cgroup rw - cgroup2 cgroup2 rw\n32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+        let m = f.manager(CgroupVersion::V2, mounts, "0::/\n", "app");
+        let dest = f.reference("0::/tenant/app/leaf\n");
+        let result = m.resolve_destination(&dest);
+        assert!(
+            matches!(
+                result,
+                Err(Error::Attachment(
+                    AttachmentError::OutsideManagedCgroup { .. }
+                ))
+            ),
+            "reference outside app was accepted via first bind mount: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_v1_mount_plan_and_execution_agree() {
+        let f = Fixture::new();
+        let mounts = "31 23 0:27 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n32 23 0:27 /tenant /sys/fs/cgroup/cpu-view rw - cgroup cgroup rw,cpu\n33 23 0:28 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n";
+        let mut m = f.manager(CgroupVersion::V1, mounts, "1:cpu:/\n2:memory:/\n", "app");
+        f.procs("cpu/app");
+        f.procs("memory/app");
+        let expected = f.procs("cpu/app/leaf");
+        let wrong = f.procs("cpu-view/app/leaf");
+        f.procs("memory/app/leaf");
+        let dest = f.reference("1:cpu:/app/leaf\n2:memory:/app/leaf\n");
+        m.add_proc_to(CgroupPid::from(42u64), &dest).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(expected).unwrap(),
+            "42",
+            "wrong bind-mount path received {:?}",
+            std::fs::read_to_string(wrong).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_do_not_fabricate_unmounted_v1_controller() {
+        let f = Fixture::new();
+        let mounts = "32 23 0:28 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n";
+        let mut m = f.manager(CgroupVersion::V1, mounts, "1:cpu:/\n2:memory:/\n", "app");
+        f.procs("memory/app");
+        let memory = f.procs("memory/app/leaf");
+        assert!(!m.mounts.contains_key("cpu"));
+        let result = m.add_proc_to(
+            CgroupPid::from(42u64),
+            &AttachDestination::subgroup("leaf").unwrap(),
+        );
+        result.unwrap();
+        assert_eq!(std::fs::read_to_string(memory).unwrap(), "42");
+        assert!(!f.0.join("cg/cpu").exists());
+    }
+
+    #[test]
+    fn test_preserve_target_permission_errno() {
+        crate::skip_if_root!();
+        let f = Fixture::new();
+        let mut m = f.manager(CgroupVersion::V2, V2, "0::/\n", "app");
+        f.procs("app");
+        f.procs("app/locked/leaf");
+        let dest = f.reference("0::/app/locked/leaf\n");
+        let locked = f.0.join("cg/app/locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let result = m.add_proc_to(CgroupPid::from(42u64), &dest);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match result.unwrap_err() {
+            Error::Attachment(AttachmentError::TargetIo {
+                pid,
+                target,
+                controllers,
+                source,
+                ..
+            }) => {
+                assert_eq!(pid.get(), 42);
+                assert_eq!(target, locked.join("leaf"));
+                assert_eq!(controllers, ["0::"]);
+                assert_eq!(source.raw_os_error(), Some(libc::EACCES));
+            }
+            err => panic!("unexpected error: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_reject_ambiguous_reference_membership() {
+        let f = Fixture::new();
+        let m = f.manager(CgroupVersion::V2, V2, "0::/\n", "app");
+        let dest = f.reference("0::/app/leaf\n0::/outside\n");
+        let result = m.resolve_destination(&dest);
+        assert!(
+            result.is_err(),
+            "contradictory unified records accepted: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_report_partial_v1_migration() {
+        let f = Fixture::new();
+        let mounts = "31 23 0:27 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n32 23 0:28 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n";
+        let mut m = f.manager(CgroupVersion::V1, mounts, "1:cpu:/\n2:memory:/\n", "app");
+        f.procs("cpu/app");
+        f.procs("memory/app");
+        let cpu = f.procs("cpu/app/leaf");
+        std::fs::create_dir_all(f.0.join("cg/memory/app/leaf/cgroup.procs")).unwrap();
+        let dest = f.reference("1:cpu:/app/leaf\n2:memory:/app/leaf\n");
+        let err = m.add_proc_to(CgroupPid::from(42u64), &dest).unwrap_err();
+        assert_eq!(std::fs::read_to_string(cpu).unwrap(), "42");
+        match err {
+            Error::Attachment(AttachmentError::WriteMembership {
+                controllers,
+                target,
+                completed,
+                source,
+                ..
+            }) => {
+                assert_eq!(controllers, ["memory"]);
+                assert_eq!(target, f.0.join("cg/memory/app/leaf/cgroup.procs"));
+                assert_eq!(completed, vec![vec!["cpu".to_string()]]);
+                assert_eq!(source.raw_os_error(), Some(libc::EISDIR));
+            }
+            other => panic!("expected partial migration error, got {:?}", other),
+        }
     }
 }

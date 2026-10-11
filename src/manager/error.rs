@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
-use crate::error::CoreError;
+use crate::error::{AttachmentError, CoreError};
 use crate::fs::error::Error as CgroupfsError;
 use crate::systemd::dbus::error::Error as SystemdDbusError;
 use crate::systemd::error::Error as SystemdCgroupError;
@@ -19,7 +19,7 @@ pub enum Error {
     InvalidLinuxResource,
 
     #[error("attachment error: {0}")]
-    Attachment(String),
+    Attachment(#[from] AttachmentError),
 
     #[error("cgroupfs error: {0}")]
     Cgroupfs(#[from] CgroupfsError),
