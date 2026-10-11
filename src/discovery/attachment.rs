@@ -12,7 +12,7 @@
 //! All calculations are pure: no pseudo-filesystems are read and no cgroups are
 //! created or modified here.
 
-#![allow(dead_code)]
+#![cfg_attr(not(feature = "oci"), allow(dead_code))]
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path};

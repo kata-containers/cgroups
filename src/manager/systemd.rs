@@ -350,8 +350,9 @@ impl Manager for SystemdManager<'_> {
         // intra-unit move through the delegated cgroupfs tree. Processes
         // outside the unit still go through systemd so it can perform the
         // privileged cross-cgroup migration.
-        let proc_id = crate::model::pid::ProcessId::try_from(pid)
-            .map_err(|e| Error::Attachment(format!("invalid pid {}: {}", pid.pid, e)))?;
+        let proc_id = crate::model::pid::ProcessId::try_from(pid).map_err(|_| {
+            Error::Attachment(crate::error::AttachmentError::InvalidProcessId { value: pid.pid })
+        })?;
         let current = self
             .fs_manager
             .resolve_destination(&AttachDestination::same_cgroup_as(proc_id));
@@ -910,7 +911,10 @@ mod topology_tests {
         let topology = Arc::new(CgroupTopology {
             version: CgroupVersion::V2,
             v2_available: true,
-            mounts: crate::discovery::MountTable::default(),
+            mounts: crate::discovery::parse_mountinfo(
+                "32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            )
+            .unwrap(),
             membership: crate::discovery::Membership::default(),
             controllers: crate::discovery::ControllerSet::default(),
             cgroupfs_root: cgroupfs.clone(),
@@ -944,7 +948,10 @@ mod topology_tests {
         let topology = Arc::new(CgroupTopology {
             version: CgroupVersion::V2,
             v2_available: true,
-            mounts: crate::discovery::MountTable::default(),
+            mounts: crate::discovery::parse_mountinfo(
+                "32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            )
+            .unwrap(),
             membership: crate::discovery::Membership::default(),
             controllers: crate::discovery::ControllerSet::default(),
             cgroupfs_root: PathBuf::from("/sys/fs/cgroup"),
@@ -1002,7 +1009,10 @@ mod topology_tests {
         let topology = Arc::new(CgroupTopology {
             version: CgroupVersion::V2,
             v2_available: true,
-            mounts: crate::discovery::MountTable::default(),
+            mounts: crate::discovery::parse_mountinfo(
+                "32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            )
+            .unwrap(),
             membership: crate::discovery::Membership::default(),
             controllers: crate::discovery::ControllerSet::default(),
             cgroupfs_root: PathBuf::from("/sys/fs/cgroup"),
@@ -1033,7 +1043,10 @@ mod topology_tests {
         let topology = Arc::new(CgroupTopology {
             version: CgroupVersion::V2,
             v2_available: true,
-            mounts: crate::discovery::MountTable::default(),
+            mounts: crate::discovery::parse_mountinfo(
+                "32 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            )
+            .unwrap(),
             membership: crate::discovery::Membership::default(),
             controllers: crate::discovery::ControllerSet::default(),
             cgroupfs_root: PathBuf::from("/sys/fs/cgroup"),

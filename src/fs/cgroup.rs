@@ -157,13 +157,45 @@ impl Cgroup {
     /// no-internal-process rule.  Creating the leaf and moving the process are
     /// separate operations; controllers can be enabled after the parent is
     /// empty.
+    /// controllers on any ancestor.
     #[cfg(feature = "oci")]
+    #[allow(dead_code)]
     pub(crate) fn create_delegated_subgroup(&self) -> Result<()> {
+        self.create_attachment_leaf()
+    }
+
+    /// Create this cgroup as an attachment leaf directory without enabling
+    /// controllers on any ancestor or writing to `cgroup.subtree_control`.
+    pub fn create_attachment_leaf(&self) -> Result<()> {
         if self.v2() {
             let path = self.hier.root().join(self.path.as_path());
             fs::create_dir_all(path).map_err(|e| Error::with_cause(ErrorKind::FsError, e))
         } else {
-            self.create()
+            self.subsystems
+                .iter()
+                .try_for_each(|subsystem| subsystem.to_controller().create())?;
+            Ok(())
+        }
+    }
+
+    /// Return the directories that [`Cgroup::create_attachment_leaf`] would
+    /// create, without touching the filesystem.
+    ///
+    /// On cgroup v2 this is the single unified directory.  On cgroup v1 it is
+    /// one directory per controller hierarchy, because each hierarchy has an
+    /// independent copy of the path and any of them may have been removed.
+    /// Callers that must not create a cgroup use this to check that every
+    /// directory already exists instead of relying on [`Cgroup::exists`],
+    /// which is satisfied by any single hierarchy.
+    #[cfg(feature = "oci")]
+    pub(crate) fn attachment_leaf_dirs(&self) -> Vec<PathBuf> {
+        if self.v2() {
+            vec![self.hier.root().join(self.path.as_path())]
+        } else {
+            self.subsystems
+                .iter()
+                .map(|subsystem| subsystem.to_controller().path().to_path_buf())
+                .collect()
         }
     }
 
