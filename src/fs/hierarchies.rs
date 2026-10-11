@@ -347,15 +347,10 @@ impl V1 {
     pub fn get_mount_point(&self, controller: Controllers) -> Option<(PathBuf, PathBuf)> {
         self.topology
             .mounts
-            .cgroup_mounts()
-            .iter()
-            .find_map(|mount| {
-                if mount.super_opts.contains(&controller.to_string()) {
-                    let point = self.topology.resolve_mount_point(&mount.mount_point);
-                    Some((point, mount.mount_root.clone()))
-                } else {
-                    None
-                }
+            .controller_mount(&controller.to_string())
+            .map(|mount| {
+                let point = self.topology.resolve_mount_point(&mount.mount_point);
+                (point, mount.mount_root.clone())
             })
     }
 }

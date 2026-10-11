@@ -9,6 +9,7 @@
 //! cgroup version verdict, and returns an immutable
 //! [`CgroupTopology`] shared through `Arc`.
 
+pub(crate) mod attachment;
 pub mod membership;
 pub mod mountinfo;
 pub mod topology;

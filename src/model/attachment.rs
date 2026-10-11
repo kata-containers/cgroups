@@ -1,4 +1,5 @@
 // Copyright (c) 2026 Ant Group
+// Copyright (c) 2026 Kata Contributors
 //
 // SPDX-License-Identifier: Apache-2.0 or MIT
 
@@ -6,9 +7,9 @@
 
 use std::path::Path;
 
-use crate::error::CoreResult;
+use crate::error::{CoreError, CoreResult, PathReason};
 use crate::model::path::CgroupPath;
-use crate::CgroupPid;
+use crate::model::pid::ProcessId;
 
 /// Destination for process or thread attachment within a cgroup hierarchy.
 ///
@@ -31,19 +32,30 @@ pub enum AttachDestination {
     /// Resolve the reference process's current cgroup membership at
     /// attach time and attach there (verifying it is inside the managed
     /// cgroup subtree).
-    SameCgroupAs(CgroupPid),
+    SameCgroupAs(ProcessId),
 }
 
 impl AttachDestination {
     /// Construct a subgroup attachment destination, validating the path as a
     /// [`CgroupPath`].
+    ///
+    /// Root paths (empty, `/`, or `.`) are explicitly rejected: targeting the
+    /// managed root must be expressed via [`AttachDestination::ManagedCgroup`].
     pub fn subgroup<P: AsRef<Path>>(path: P) -> CoreResult<Self> {
-        Ok(Self::Subgroup(CgroupPath::new(path)?))
+        let cpath = CgroupPath::new(path)?;
+        if cpath.is_root() {
+            return Err(CoreError::InvalidPath {
+                input: cpath.as_path().to_path_buf(),
+                reason: PathReason::Root,
+                operation: "AttachDestination::subgroup",
+            });
+        }
+        Ok(Self::Subgroup(cpath))
     }
 
-    /// Construct a reference-process destination.
-    pub fn same_cgroup_as<P: Into<CgroupPid>>(pid: P) -> Self {
-        Self::SameCgroupAs(pid.into())
+    /// Construct a reference-process destination from a validated [`ProcessId`].
+    pub fn same_cgroup_as(pid: ProcessId) -> Self {
+        Self::SameCgroupAs(pid)
     }
 
     /// Returns `true` if this destination targets the managed cgroup root.
@@ -74,18 +86,19 @@ mod tests {
         );
         assert!(!dest.is_managed_cgroup());
 
-        // Invalid path (absolute or escaping) must fail
+        // Invalid path (absolute, escaping, or root) must fail
         assert!(AttachDestination::subgroup("/init").is_err());
         assert!(AttachDestination::subgroup("../escape").is_err());
+        assert!(AttachDestination::subgroup("").is_err());
+        assert!(AttachDestination::subgroup("/").is_err());
+        assert!(AttachDestination::subgroup(".").is_err());
     }
 
     #[test]
     fn test_same_cgroup_as_construction() {
-        let dest = AttachDestination::same_cgroup_as(1234u64);
-        assert_eq!(
-            dest,
-            AttachDestination::SameCgroupAs(CgroupPid::from(1234u64))
-        );
+        let pid = ProcessId::new(1234).unwrap();
+        let dest = AttachDestination::same_cgroup_as(pid);
+        assert_eq!(dest, AttachDestination::SameCgroupAs(pid));
         assert!(!dest.is_managed_cgroup());
     }
 }

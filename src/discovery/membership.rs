@@ -6,6 +6,7 @@
 //! The functions here transform supplied text into [`Membership`] values
 //! and never perform I/O; reading the host belongs to the topology layer.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::error::{CoreError, CoreResult, ParseSource};
@@ -57,10 +58,30 @@ impl Membership {
 /// - A malformed line returns [`crate::error::CoreError::ParseError`]
 ///   carrying the 1-based line number and the reason. Empty input
 ///   parses to an empty `Membership`.
+/// - Each hierarchy ID and each controller may occur only once in the stream.
+///   Duplicates are rejected at the offending line instead of selecting a record.
 pub fn parse_membership(input: &str) -> CoreResult<Membership> {
     let mut records = Vec::new();
+    let mut hierarchies = BTreeSet::new();
+    let mut controllers = BTreeSet::new();
     for (index, line) in input.lines().enumerate() {
-        records.push(parse_membership_line(line, index + 1)?);
+        let line_no = index + 1;
+        let record = parse_membership_line(line, line_no)?;
+        if !hierarchies.insert(record.hierarchy_id) {
+            return Err(membership_error(
+                line_no,
+                format!("duplicate hierarchy ID {}", record.hierarchy_id),
+            ));
+        }
+        for controller in &record.controllers {
+            if !controllers.insert(controller.clone()) {
+                return Err(membership_error(
+                    line_no,
+                    format!("duplicate controller `{}`", controller),
+                ));
+            }
+        }
+        records.push(record);
     }
     Ok(Membership { records })
 }
@@ -389,6 +410,34 @@ mod tests {
                 assert_eq!(line, 2);
             }
             other => panic!("expected a ParseError at line 2, got `{:?}`", other),
+        }
+    }
+
+    #[test]
+    fn duplicate_records_preserve_parse_context() {
+        for (input, line, reason) in [
+            ("0::/a\n0::/b\n", 2, "hierarchy ID 0"),
+            ("1:cpu:/a\n1:memory:/b\n", 2, "hierarchy ID 1"),
+            ("1:cpu:/a\n2:cpu:/b\n", 2, "controller `cpu`"),
+            ("1:cpu,cpu:/a\n", 1, "controller `cpu`"),
+            (
+                "1:name=systemd:/a\n2:name=systemd:/b\n",
+                2,
+                "controller `name=systemd`",
+            ),
+        ] {
+            match parse_membership(input).unwrap_err() {
+                CoreError::ParseError {
+                    kind,
+                    line: actual_line,
+                    reason: actual_reason,
+                } => {
+                    assert_eq!(kind, ParseSource::Membership);
+                    assert_eq!(actual_line, line);
+                    assert!(actual_reason.contains(reason), "{}", actual_reason);
+                }
+                error => panic!("unexpected error: {:?}", error),
+            }
         }
     }
 }

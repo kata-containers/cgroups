@@ -4,6 +4,7 @@
 //
 
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::sync::Arc;
 
 use oci_spec::runtime::LinuxResources;
@@ -349,9 +350,11 @@ impl Manager for SystemdManager<'_> {
         // intra-unit move through the delegated cgroupfs tree. Processes
         // outside the unit still go through systemd so it can perform the
         // privileged cross-cgroup migration.
+        let proc_id = crate::model::pid::ProcessId::try_from(pid)
+            .map_err(|e| Error::Attachment(format!("invalid pid {}: {}", pid.pid, e)))?;
         let current = self
             .fs_manager
-            .resolve_destination(&AttachDestination::SameCgroupAs(pid));
+            .resolve_destination(&AttachDestination::same_cgroup_as(proc_id));
         match current {
             Ok(current) if current == sub => return Ok(()),
             Ok(_) => self
@@ -832,7 +835,6 @@ mod topology_tests {
     use crate::discovery::{CgroupTopology, CgroupVersion, HostPaths};
     use crate::manager::conv;
     use crate::model::{AttachDestination, MemoryPatch, PidsPatch, Update};
-    use crate::CgroupPid;
     use crate::Manager;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -928,7 +930,8 @@ mod topology_tests {
         .unwrap();
         assert_eq!(manager.fs_manager.host_paths(), &host_paths);
 
-        let destination = AttachDestination::SameCgroupAs(CgroupPid::from(4242u64));
+        let pid = crate::model::pid::ProcessId::new(4242).unwrap();
+        let destination = AttachDestination::same_cgroup_as(pid);
         let resolved = manager
             .fs_manager
             .resolve_destination(&destination)

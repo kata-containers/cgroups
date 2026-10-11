@@ -1,4 +1,5 @@
 // Copyright (c) 2026 Ant Group
+// Copyright (c) 2026 Kata Contributors
 //
 // SPDX-License-Identifier: Apache-2.0 or MIT
 
