@@ -27,4 +27,7 @@ pub enum Error {
 
     #[error("dbus error: {0}")]
     Dbus(#[from] zbus::Error),
+
+    #[error("invalid process ID: {0}")]
+    InvalidProcessId(#[from] crate::error::CoreError),
 }
