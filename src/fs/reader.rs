@@ -258,7 +258,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_existing_path_uses_the_configured_v1_mounts() {
         let fixture = Fixture::new();
         fixture.write("self", b"1:memory:/delegated/current\n");

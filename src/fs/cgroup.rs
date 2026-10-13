@@ -891,7 +891,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_cgroup_preserves_non_utf8_path() {
         let non_utf8_bytes = b"\xff\xfe/test_subgroup";
         let path = CgroupPath::new(Path::new(OsStr::from_bytes(non_utf8_bytes))).unwrap();
@@ -965,7 +964,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_cgroup_threads_topology() {
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "");
         let topology = fixture.topology.clone();
@@ -1010,7 +1008,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_cgroup_clone_preserves_hierarchy_type() {
         // Create a topology with version == V2
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "");
@@ -1090,7 +1087,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_controller_selection_applies_to_root_and_child() {
         let legacy = crate::tests::TopologyFixture::new(
             b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
@@ -2041,7 +2037,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_root_selection_limits_v1_creation_and_membership_writes() {
         let fixture = crate::tests::TopologyFixture::new(
             b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
@@ -2081,7 +2076,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_handle_builder_maps_v1_paths_and_preserves_v2_paths() {
         let fixture = crate::tests::TopologyFixture::new(
             b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
@@ -2134,7 +2128,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_parent_retains_controller_selection_and_v1_prefixes() {
         let fixture = crate::tests::TopologyFixture::new(
             b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
@@ -2227,7 +2220,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_parent_at_empty_path_preserves_distinct_v1_prefixes() {
         use std::error::Error as _;
 
@@ -2348,7 +2340,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_load_does_not_create_and_new_preserves_creation_errors() {
         use std::error::Error as _;
 
@@ -2372,7 +2363,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_cgroup_path_accessor() {
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V1, "");
         let topology = fixture.topology.clone();
@@ -2402,7 +2392,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_parent_and_move_task_fails_closed_on_root() {
         use crate::core::error::PathError;
         use std::error::Error as _;
@@ -2427,7 +2416,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_parent_preserves_non_utf8_path() {
         let non_utf8_bytes = b"\xff\xfe/test_subgroup";
         let path = CgroupPath::new(Path::new(OsStr::from_bytes(non_utf8_bytes))).unwrap();

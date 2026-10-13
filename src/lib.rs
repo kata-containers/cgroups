@@ -83,13 +83,11 @@ pub mod tests {
     use std::process::{Child, Command, Stdio};
 
     /// Own synthetic discovery files for topology-based handle tests.
-    #[cfg(feature = "fixtures")]
     pub(crate) struct TopologyFixture {
         pub(crate) topology: std::sync::Arc<crate::core::CgroupTopology>,
         root: std::path::PathBuf,
     }
 
-    #[cfg(feature = "fixtures")]
     impl TopologyFixture {
         pub(crate) fn new(mountinfo: &[u8], membership: &[u8], controllers: &str) -> Self {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -113,14 +111,12 @@ pub mod tests {
         }
     }
 
-    #[cfg(feature = "fixtures")]
     impl Drop for TopologyFixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
 
-    #[cfg(feature = "fixtures")]
     pub(crate) fn topology_fixture(
         version: crate::core::CgroupVersion,
         controllers: &str,

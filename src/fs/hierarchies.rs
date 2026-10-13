@@ -625,7 +625,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_v1_controller_match_with_non_utf8_super_option() {
         let input = b"43 33 0:38 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory,release_agent=/tmp/agent-\xff\n";
         let fixture = crate::tests::TopologyFixture::new(input, b"1:memory:/\n", "");
@@ -644,7 +643,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_v1_hierarchy_mountpoint_and_hugetlb_override() {
         struct TempGuard(PathBuf);
         impl Drop for TempGuard {
@@ -690,7 +688,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_strict_detection_is_scoped_to_host_paths() {
         struct TempGuard(PathBuf);
         impl Drop for TempGuard {
@@ -737,7 +734,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "fixtures")]
     fn test_v2_constructors_reject_v1_topology_before_mutation() {
         struct TempGuard(PathBuf);
         impl Drop for TempGuard {
