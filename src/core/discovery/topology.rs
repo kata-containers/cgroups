@@ -30,14 +30,12 @@ use crate::core::error::{CoreError, CoreResult, LayoutError};
 /// Host paths used to build a topology snapshot.
 ///
 /// `procfs` supplies the discovery records, and `hugepages` records the
-/// sysfs metadata root for huge-page size discovery. With the `fixtures`
-/// feature, `cgroupfs_fixture_root` supplies an ordinary-filesystem tree
-/// for unprivileged tests while retaining the mountinfo-derived roots.
+/// sysfs metadata root for huge-page size discovery.
 ///
 /// Construct with [`HostPaths::new`] or [`HostPaths::default`], then update
 /// individual fields as needed. Struct literals, including functional update
 /// syntax, are unavailable outside this crate so construction remains stable
-/// when Cargo unifies features from other dependencies.
+/// as internal fields evolve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HostPaths {
@@ -45,8 +43,8 @@ pub struct HostPaths {
     pub procfs: PathBuf,
     /// Root of a fixture cgroup tree on an ordinary filesystem.
     ///
-    /// Requires the `fixtures` feature. When set, discovery still derives
-    /// the natural root from `mountinfo` so
+    /// Available only to this crate's unit tests. When set, discovery still
+    /// derives the natural root from `mountinfo` so
     /// [`CgroupTopology::resolve_mount_point`] knows which prefix to strip,
     /// but reports this directory as [`CgroupTopology::cgroupfs_root`] and
     /// skips the cgroup2 statfs check. Mount points under the natural root
@@ -56,44 +54,8 @@ pub struct HostPaths {
     /// Nothing is auto-populated and no kernel cgroup semantics apply:
     /// tests must seed any file they expect to read. This field does not
     /// configure a bind-mounted cgroup filesystem or enforce resource limits.
-    /// Downstream tests can enable `fixtures` on their `cgroups-rs`
-    /// dev-dependency and use Cargo resolver 2 to keep those test features
-    /// out of normal builds. The feature is off by default; explicitly
-    /// enabling it also exposes this field in release builds.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use std::fs;
-    /// use std::path::Path;
-    /// use cgroups_rs::core::{discover, HostPaths};
-    ///
-    /// // Synthetic procfs records describe a v1 memory mount.
-    /// let fixture = Path::new("/tmp/fixture");
-    /// fs::create_dir_all(fixture.join("proc/self")).unwrap();
-    /// fs::write(
-    ///     fixture.join("proc/self/mountinfo"),
-    ///     "30 26 0:26 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
-    /// ).unwrap();
-    /// fs::write(fixture.join("proc/self/cgroup"), "1:memory:/\n").unwrap();
-    ///
-    /// // The fixture tree starts as an empty directory owned by the test.
-    /// let tree = fixture.join("cgroup");
-    /// fs::create_dir_all(&tree).unwrap();
-    /// let host_paths = HostPaths::new(
-    ///     fixture.join("proc"),
-    ///     fixture.join("hugepages"),
-    /// ).with_fixture_root(tree.clone());
-    /// let topology = discover(&host_paths).unwrap();
-    ///
-    /// assert_eq!(topology.cgroupfs_root(), tree);
-    /// assert_eq!(
-    ///     topology.resolve_mount_point(Path::new("/sys/fs/cgroup/memory")),
-    ///     tree.join("memory"),
-    /// );
-    /// ```
-    #[cfg(feature = "fixtures")]
-    pub cgroupfs_fixture_root: Option<PathBuf>,
+    #[cfg(test)]
+    cgroupfs_fixture_root: Option<PathBuf>,
     /// Sysfs root for discovering supported huge-page sizes.
     pub hugepages: PathBuf,
 }
@@ -110,9 +72,6 @@ impl Default for HostPaths {
 impl HostPaths {
     /// Configure the procfs and huge-page metadata roots without performing I/O.
     ///
-    /// This constructor is available with every feature combination. Fixture
-    /// redirection is initially disabled, even when `fixtures` is enabled.
-    ///
     /// ```
     /// use cgroups_rs::core::HostPaths;
     ///
@@ -124,7 +83,7 @@ impl HostPaths {
     pub fn new(procfs: PathBuf, hugepages: PathBuf) -> Self {
         Self {
             procfs,
-            #[cfg(feature = "fixtures")]
+            #[cfg(test)]
             cgroupfs_fixture_root: None,
             hugepages,
         }
@@ -132,25 +91,26 @@ impl HostPaths {
 
     /// Redirect cgroupfs operations to an ordinary-filesystem fixture tree.
     ///
-    /// Requires the `fixtures` feature. See [`Self::cgroupfs_fixture_root`] for
-    /// the discovery and statfs semantics; this method only records the path.
-    #[cfg(feature = "fixtures")]
-    pub fn with_fixture_root(mut self, root: PathBuf) -> Self {
+    /// Available only to this crate's unit tests. See
+    /// [`Self::cgroupfs_fixture_root`] for the discovery and statfs semantics;
+    /// this method only records the path.
+    #[cfg(test)]
+    pub(crate) fn with_fixture_root(mut self, root: PathBuf) -> Self {
         self.cgroupfs_fixture_root = Some(root);
         self
     }
 
-    /// The configured fixture tree root, or constant `None` without `fixtures`.
+    /// The unit-test fixture tree root, or constant `None` in normal builds.
     ///
-    /// With the feature disabled, discovery uses the natural root and
+    /// In normal builds, discovery uses the natural root and
     /// verifies every selected cgroup2 candidate with statfs.
     #[inline]
     pub(crate) fn fixture_root(&self) -> Option<&Path> {
-        #[cfg(feature = "fixtures")]
+        #[cfg(test)]
         {
             self.cgroupfs_fixture_root.as_deref()
         }
-        #[cfg(not(feature = "fixtures"))]
+        #[cfg(not(test))]
         {
             None
         }
@@ -281,7 +241,7 @@ pub struct CgroupTopology {
     /// Controller names visible on the primary hierarchy.
     controllers: ControllerSet,
     /// The directory used for cgroup filesystem operations: the fixture
-    /// root when set with the `fixtures` feature, otherwise the natural
+    /// root when configured in unit tests, otherwise the natural
     /// root derived from the parsed mounts.
     cgroupfs_root: PathBuf,
     /// The natural root shared by visible v1 mounts when v1 is primary.
@@ -327,8 +287,7 @@ impl CgroupTopology {
         &self.controllers
     }
 
-    /// The natural root derived from mountinfo, or the fixture tree root
-    /// when configured with the `fixtures` feature.
+    /// The root directory for cgroupfs operations, derived from the parsed mounts.
     pub fn cgroupfs_root(&self) -> &Path {
         &self.cgroupfs_root
     }
@@ -340,15 +299,15 @@ impl CgroupTopology {
 
     /// Map a mount point under the selected natural root to `cgroupfs_root`.
     ///
-    /// A configured fixture root changes the destination while the natural
-    /// root remains the prefix to strip. Paths outside that prefix are
-    /// returned unchanged.
+    /// The natural root is the prefix to strip before joining the remaining
+    /// components to `cgroupfs_root`. Paths outside that prefix are returned
+    /// unchanged.
     ///
     /// V1-primary layouts, including hybrid hosts, use only the v1 root
     /// prefix. V2-primary layouts use the selected unified mount prefix.
     /// On hybrid hosts, the unified prefix is not tried after a v1 mismatch.
     ///
-    /// Without the `fixtures` feature, or with no fixture root configured,
+    /// In normal library builds, the cgroupfs root is the natural root, so
     /// every mount point maps to itself.
     pub fn resolve_mount_point(&self, original: &Path) -> PathBuf {
         if let Some(natural_root) = &self.v1_mount_root {
@@ -523,10 +482,10 @@ fn cgroup_mount_contains(mount_root: &Path, membership_path: &Path) -> bool {
 ///   a v2-primary host. Namespace-relative ancestor roots such as `/..` can
 ///   contain the process even without a textual prefix; sibling subtrees cannot.
 ///   Without a fixture root, a statfs recheck on the chosen root guards
-///   against stale or forged mountinfo. A fixture root (available with the
-///   `fixtures` feature) uses an ordinary filesystem tree and skips the recheck.
-///   With `fixtures` disabled, selected cgroup2 candidates always undergo statfs
-///   verification in both hybrid and v2-primary layouts.
+///   against stale or forged mountinfo. A fixture root (available only to
+///   this crate's unit tests) uses an ordinary filesystem tree and skips the
+///   recheck. Normal library builds always verify selected cgroup2 candidates
+///   with statfs in both hybrid and v2-primary layouts.
 ///   A failed recheck of an optional cgroup2 mount on a v1 host leaves v2
 ///   unavailable; a v2-primary host returns the error even when named v1
 ///   hierarchies are also visible.
@@ -1000,6 +959,28 @@ mod tests {
             }
             other => panic!("expected a ReadControllers error, got `{:?}`", other),
         }
+    }
+
+    #[test]
+    fn test_fixture_root_example() {
+        let (root, host_paths) = fixture_host(
+            "fixture-root-example",
+            "30 26 0:26 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+            "1:memory:/\n",
+        );
+
+        // The fixture tree is an ordinary empty directory owned by the test.
+        let tree = root.join("cgroup");
+        fs::create_dir_all(&tree).unwrap();
+        let host_paths = host_paths.with_fixture_root(tree.clone());
+        let topology = discover(&host_paths).unwrap();
+
+        assert_eq!(topology.cgroupfs_root(), tree);
+        assert_eq!(
+            topology.resolve_mount_point(Path::new("/sys/fs/cgroup/memory")),
+            tree.join("memory"),
+        );
+        assert_eq!(fs::read_dir(&tree).unwrap().count(), 0);
     }
 
     #[test]
