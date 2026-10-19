@@ -55,6 +55,22 @@ impl CgroupMountTable {
             .collect()
     }
 
+    /// Find the first v1 mount whose super options contain `controller`, byte-exact.
+    ///
+    /// Preserve the existing handle policy of taking the first match in
+    /// mountinfo order: duplicate binds can expose different `mount_root`s,
+    /// so handles and manager maps must use the same record for the mount
+    /// point and root.
+    pub(crate) fn find_v1_record(&self, controller: &str) -> Option<&MountRecord> {
+        self.records.iter().find(|mount| {
+            mount.fs_type.0 == "cgroup"
+                && mount
+                    .super_opts
+                    .iter()
+                    .any(|option| option.as_slice() == controller.as_bytes())
+        })
+    }
+
     /// cgroup v2 (unified) mounts, in input order.
     pub fn unified_mounts(&self) -> Vec<&MountRecord> {
         self.records

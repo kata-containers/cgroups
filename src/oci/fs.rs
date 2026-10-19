@@ -1166,7 +1166,7 @@ mod tests {
 
         for version in [CgroupVersion::V1, CgroupVersion::V2] {
             let fixture = crate::tests::topology_fixture(version, "memory");
-            let root = fixture.topology.cgroupfs_root();
+            let root = fixture.topology.fixture_root().unwrap();
             let cgroup = Cgroup::load(
                 hierarchies::from_topology(fixture.topology.clone()),
                 CgroupPath::new("workloads").unwrap(),
