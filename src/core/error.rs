@@ -21,9 +21,9 @@ pub type CoreResult<T> = std::result::Result<T, CoreError>;
 pub enum CoreError {
     /// The requested hierarchy version differs from the topology's primary
     /// cgroup version.
-    #[error("cannot build a cgroup {requested:?} hierarchy from a {found:?} topology at {path:?}")]
+    #[error("cannot build a cgroup {requested:?} hierarchy from a {found:?} topology in {path:?}")]
     VersionMismatch {
-        /// The cgroupfs root of the supplied topology.
+        /// The mountinfo file supplying the conflicting topology.
         path: PathBuf,
         /// The cgroup version requested for the hierarchy.
         requested: CgroupVersion,
@@ -130,12 +130,13 @@ pub enum LayoutError {
     #[error("no cgroup or cgroup2 mounts found")]
     NoCgroupMounts,
 
-    /// The visible v1 mounts imply different natural roots.
+    /// Unit-test fixture mapping cannot infer one prefix for the v1 mounts.
     ///
-    /// Duplicate bind mounts of an already-visible hierarchy are deliberately
-    /// rejected when they imply different natural roots, rather than deduplicated
-    /// by hierarchy.
-    #[error("v1 cgroup mounts have different inferred roots: {roots:?}")]
+    /// Normal discovery accepts v1 mounts in unrelated directories, including
+    /// duplicate binds. This error is limited to tests explicitly requesting
+    /// that all v1 mounts be re-rooted into one ordinary-filesystem tree.
+    #[cfg(test)]
+    #[error("cannot map v1 cgroup mounts into one fixture tree; inferred roots: {roots:?}")]
     AmbiguousV1Roots {
         /// The distinct inferred roots, sorted for deterministic diagnostics.
         roots: BTreeSet<PathBuf>,

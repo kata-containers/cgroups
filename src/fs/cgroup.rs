@@ -917,7 +917,7 @@ mod tests {
             let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
             let prefix = CgroupPath::new(OsStr::from_bytes(prefix)).unwrap();
             let path = CgroupPath::new(OsStr::from_bytes(path)).unwrap();
-            let mount = fixture.topology.cgroupfs_root().join("cpuset");
+            let mount = fixture.topology.fixture_root().unwrap().join("cpuset");
             let base = mount.join(&prefix);
             fs::create_dir_all(&base).unwrap();
             for (file, root_value, prefix_value) in [
@@ -975,8 +975,8 @@ mod tests {
         // 1. Cgroup exposes its hierarchy's topology
         assert!(cg.topology().is_some());
         assert_eq!(
-            cg.topology().unwrap().cgroupfs_root(),
-            topology.cgroupfs_root()
+            cg.topology().unwrap().fixture_root().unwrap(),
+            topology.fixture_root().unwrap()
         );
 
         // 2. Clone preserves the exact same Arc<CgroupTopology>
@@ -1117,7 +1117,8 @@ mod tests {
                 expected.sort();
                 let subtree_control = fixture
                     .topology
-                    .cgroupfs_root()
+                    .fixture_root()
+                    .unwrap()
                     .join("cgroup.subtree_control");
                 if hierarchy.v2() {
                     fs::write(&subtree_control, b"unchanged").unwrap();
@@ -1166,7 +1167,7 @@ mod tests {
         for version in [CgroupVersion::V1, CgroupVersion::V2] {
             let fixture = crate::tests::topology_fixture(version, "memory");
             let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
-            let root = fixture.topology.cgroupfs_root();
+            let root = fixture.topology.fixture_root().unwrap();
             let subtree_control = root.join("cgroup.subtree_control");
             fs::write(&subtree_control, b"unchanged").unwrap();
             for names in [
@@ -1219,7 +1220,7 @@ mod tests {
         let unified = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu memory");
         for fixture in [&legacy, &unified] {
             let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
-            let root = fixture.topology.cgroupfs_root();
+            let root = fixture.topology.fixture_root().unwrap();
             // Loading uses the hierarchy's reported set even after its
             // control files disappear. It must not read or recreate them.
             fs::remove_dir_all(root).unwrap();
@@ -1266,7 +1267,7 @@ mod tests {
         let unified = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "io");
         for (fixture, name, wrong_name) in [(&legacy, "blkio", "io"), (&unified, "io", "blkio")] {
             let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
-            let root = fixture.topology.cgroupfs_root();
+            let root = fixture.topology.fixture_root().unwrap();
             fs::remove_dir_all(root).unwrap();
             for path in [CgroupPath::root(), CgroupPath::new("child").unwrap()] {
                 for selection in [
@@ -1329,7 +1330,12 @@ mod tests {
         let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
         let handle = Cgroup::load(hierarchy, CgroupPath::new("child").unwrap());
         assert_eq!(handle.kill().unwrap_err().kind(), &CgroupVersion);
-        assert!(!fixture.topology.cgroupfs_root().join("child").exists());
+        assert!(!fixture
+            .topology
+            .fixture_root()
+            .unwrap()
+            .join("child")
+            .exists());
     }
 
     #[test]
@@ -1382,7 +1388,7 @@ mod tests {
     fn test_v2_creation_with_no_resource_controllers() {
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "");
         let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         let subtree_control = root.join("cgroup.subtree_control");
         fs::write(&subtree_control, b"unchanged").unwrap();
 
@@ -1429,7 +1435,7 @@ mod tests {
         }
 
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu");
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         let hierarchy: Arc<dyn Hierarchy> = Arc::new(CustomHierarchy(root.to_path_buf()));
         seed_v2_directory(root, "child", "cpu", "");
         let handle = Cgroup::new(hierarchy.clone(), CgroupPath::new("child").unwrap()).unwrap();
@@ -1455,7 +1461,7 @@ mod tests {
             (&unified, "io", "blkio", "child"),
         ] {
             let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
-            let root = fixture.topology.cgroupfs_root();
+            let root = fixture.topology.fixture_root().unwrap();
             if hierarchy.v2() {
                 seed_v2_directory(root, "child", "io", "");
             }
@@ -1498,7 +1504,7 @@ mod tests {
 
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu memory");
         let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         let controller_list = root.join("cgroup.controllers");
         let subtree_control = root.join("cgroup.subtree_control");
         let handle = Cgroup::builder(hierarchy.clone(), CgroupPath::new("child").unwrap())
@@ -1561,7 +1567,7 @@ mod tests {
             for failed_directory in ["", "parent"] {
                 let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu");
                 let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
-                let root = fixture.topology.cgroupfs_root();
+                let root = fixture.topology.fixture_root().unwrap();
                 let root_control = root.join("cgroup.subtree_control");
                 fs::write(&root_control, b"unchanged").unwrap();
                 let failed_file = root.join(failed_directory).join("cgroup.subtree_control");
@@ -1608,7 +1614,7 @@ mod tests {
                 "cpuset memory pids rdma",
             );
             let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
-            let root = fixture.topology.cgroupfs_root();
+            let root = fixture.topology.fixture_root().unwrap();
             let mut ancestors = vec![(root.to_path_buf(), "cpuset memory pids rdma")];
             for path in [
                 "user.slice",
@@ -1670,7 +1676,7 @@ mod tests {
         for missing_at in ["parent", "parent/child"] {
             let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "pids");
             let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
-            let root = fixture.topology.cgroupfs_root();
+            let root = fixture.topology.fixture_root().unwrap();
             fs::write(root.join("cgroup.subtree_control"), b"pids").unwrap();
             let parent = seed_v2_directory(root, "parent", "pids", "pids");
             let target = seed_v2_directory(root, "parent/child", "pids", "unchanged");
@@ -1702,7 +1708,7 @@ mod tests {
         use std::error::Error as _;
 
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu pids");
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         let file = root.join("cgroup.subtree_control");
         fs::write(&file, b"pids\n").unwrap();
         let selected = vec!["pids".to_string(), "cpu".to_string(), "cpu".to_string()];
@@ -1747,7 +1753,7 @@ mod tests {
     fn test_v2_all_skips_individual_ancestor_enable_failures() {
         let fixture =
             crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpuset cpu pids");
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         // user.slice offers cpuset without distributing it to the delegated
         // branch. Inject the error so this also works in a root test harness.
         let ancestor = seed_v2_directory(root, "user.slice", "cpuset cpu pids", "pids");
@@ -1818,7 +1824,7 @@ mod tests {
             "",
         );
         let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         let names = ["cpu", "memory", "pids", "blkio"];
         let files = [
             ("tasks", "100"),
@@ -1924,7 +1930,7 @@ mod tests {
             b"1:memory:/\n2:cpu:/\n",
             "",
         );
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         for file in ["delegated/tasks", "delegated/cgroup.procs", "release_agent"] {
             // A directory at the write target fails even in a root harness.
             fs::create_dir_all(root.join("cpu").join(file)).unwrap();
@@ -2003,7 +2009,7 @@ mod tests {
     #[test]
     fn test_remove_task_ignores_v1_prefixes_on_v2() {
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpu");
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         // A regular file models thread mode for destination checks only.
         fs::write(root.join("cgroup.type"), CGROUP_MODE_DOMAIN_THREADED).unwrap();
         for relative in ["", "delegated", "child", "delegated/child"] {
@@ -2044,7 +2050,7 @@ mod tests {
             b"1:memory:/\n2:cpu:/\n",
             "",
         );
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         let memory = root.join("memory/delegated");
         let cpu = root.join("cpu/delegated");
         let handle = Cgroup::builder(
@@ -2092,7 +2098,7 @@ mod tests {
         assert_eq!(child.path().as_path(), Path::new("child"));
         let memory: &crate::fs::memory::MemController = child.controller_of().unwrap();
         let cpu: &crate::fs::cpu::CpuController = child.controller_of().unwrap();
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         assert_eq!(memory.path(), root.join("memory/delegated/child"));
         assert_eq!(cpu.path(), root.join("cpu/child"));
         assert!(Arc::ptr_eq(&hierarchy, &child.hier));
@@ -2123,7 +2129,7 @@ mod tests {
         let memory: &crate::fs::memory::MemController = child.controller_of().unwrap();
         assert_eq!(
             memory.path(),
-            unified.topology.cgroupfs_root().join("child")
+            unified.topology.fixture_root().unwrap().join("child")
         );
     }
 
@@ -2156,7 +2162,11 @@ mod tests {
             let memory: &crate::fs::memory::MemController = parent.controller_of().unwrap();
             assert_eq!(
                 memory.path(),
-                fixture.topology.cgroupfs_root().join("memory/delegated/a")
+                fixture
+                    .topology
+                    .fixture_root()
+                    .unwrap()
+                    .join("memory/delegated/a")
             );
 
             // The empty relative path stays at the configured v1 prefix and
@@ -2172,7 +2182,11 @@ mod tests {
             let memory: &crate::fs::memory::MemController = boundary.controller_of().unwrap();
             assert_eq!(
                 memory.path(),
-                fixture.topology.cgroupfs_root().join("memory/delegated")
+                fixture
+                    .topology
+                    .fixture_root()
+                    .unwrap()
+                    .join("memory/delegated")
             );
             assert!(boundary.parent().is_err());
         }
@@ -2201,7 +2215,7 @@ mod tests {
 
         let narrow = handle("kubepods/pod1", "ctr1");
         let broad = handle("kubepods", "pod1/ctr1");
-        let mount = fixture.topology.cgroupfs_root().join("memory");
+        let mount = fixture.topology.fixture_root().unwrap().join("memory");
         assert_eq!(directory(&narrow), mount.join("kubepods/pod1/ctr1"));
         assert_eq!(directory(&narrow), directory(&broad));
 
@@ -2238,7 +2252,7 @@ mod tests {
             ),
             ("cpu".to_string(), CgroupPath::new("workloads/cpu").unwrap()),
         ]);
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         let memory_parent = root
             .join("memory")
             .join(OsStr::from_bytes(b"delegated/\xff"));
@@ -2345,7 +2359,7 @@ mod tests {
 
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "memory");
         let hierarchy = crate::fs::hierarchies::from_topology(fixture.topology.clone());
-        let root = fixture.topology.cgroupfs_root();
+        let root = fixture.topology.fixture_root().unwrap();
         let handle = Cgroup::load(hierarchy.clone(), CgroupPath::new("missing").unwrap());
         assert!(!root.join("missing").exists());
         assert!(!handle.exists());

@@ -115,8 +115,8 @@ cg.delete();
   topologies.
 - Discovery no longer falls back to a partial hierarchy after required read,
   parse, or layout failures, including empty `/proc/self/cgroup`, malformed
-  mountinfo, ambiguous v1 roots, and missing `cgroup.controllers` on v2-primary
-  hosts. These return `CoreError` with source paths and original causes.
+  mountinfo, and missing `cgroup.controllers` on v2-primary hosts. These return
+  `CoreError` with source paths and original causes.
 - Removed the legacy `Mountinfo` / `MountinfoError` types and
   `mountinfo_self()` / `try_mountinfo_self()` readers. Use `MountRecord` and
   the strict parsers in `core::discovery`, or read mounts from a discovered

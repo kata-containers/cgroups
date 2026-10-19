@@ -242,7 +242,6 @@ pub mod tests {
     //!   --show-output --test-threads=1
 
     use std::fs;
-    use std::path::Path;
     use std::process::Command;
     use std::thread::sleep;
     use std::time::Duration;
@@ -250,7 +249,8 @@ pub mod tests {
     use rand::distributions::Alphanumeric;
     use rand::Rng;
 
-    use crate::fs::hierarchies;
+    use crate::fs::hierarchies::{self, V1};
+    use crate::fs::Controllers;
     use crate::skip_if_not_root;
     use crate::systemd::dbus::client::*;
     use crate::systemd::dbus::error::Error;
@@ -346,20 +346,27 @@ pub mod tests {
 
         let base = expand_slice(TEST_SLICE).unwrap();
 
-        // Check if the cgroup exists in the filesystem
+        let topology =
+            crate::core::discovery::discover(&crate::core::discovery::HostPaths::default())
+                .unwrap();
+        let base_cpath = crate::core::CgroupPath::new(&base).unwrap();
         let full_base = if v2 {
-            format!("/sys/fs/cgroup/{}", base)
+            topology.cgroupfs_root().unwrap().join(base_cpath.as_path())
         } else {
-            format!("/sys/fs/cgroup/memory/{}", base)
+            let (memory_mount, _) = V1::from(topology.clone())
+                .get_mount_point(Controllers::Mem)
+                .expect("v1 memory hierarchy");
+            memory_mount.join(base_cpath.as_path())
         };
         assert!(
-            Path::new(&full_base).exists(),
-            "Cgroup base path does not exist: {}",
+            full_base.exists(),
+            "Cgroup base path does not exist: {:?}",
             full_base
         );
 
         // PIDs
-        let cgroup_procs_path = format!("{}/{}/cgroup.procs", full_base, unit);
+        let unit_cpath = crate::core::CgroupPath::new(&unit).unwrap();
+        let cgroup_procs_path = full_base.join(unit_cpath.as_path()).join("cgroup.procs");
         for i in 0..5 {
             let content = fs::read_to_string(&cgroup_procs_path);
             if let Ok(content) = &content {
@@ -617,14 +624,22 @@ pub mod tests {
         let pid1 = CgroupPid::from(child1.id() as u64);
         cgroup.add_process(pid1, "/").unwrap();
 
+        let topology =
+            crate::core::discovery::discover(&crate::core::discovery::HostPaths::default())
+                .unwrap();
         let cgroup_root = if v2 {
-            Path::new("/sys/fs/cgroup")
+            topology.cgroupfs_root().unwrap().to_path_buf()
         } else {
-            Path::new("/sys/fs/cgroup/memory")
+            let (memory_mount, _) = V1::from(topology.clone())
+                .get_mount_point(Controllers::Mem)
+                .expect("v1 memory hierarchy");
+            memory_mount
         };
+        let slice_cpath = crate::core::CgroupPath::new(expand_slice(TEST_SLICE).unwrap()).unwrap();
+        let unit_cpath = crate::core::CgroupPath::new(&unit).unwrap();
         let cgroup_procs_path = cgroup_root
-            .join(expand_slice(TEST_SLICE).unwrap())
-            .join(&unit)
+            .join(slice_cpath.as_path())
+            .join(unit_cpath.as_path())
             .join("cgroup.procs");
         for i in 0..5 {
             let content = fs::read_to_string(&cgroup_procs_path);

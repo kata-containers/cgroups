@@ -64,6 +64,8 @@ pub struct V1 {
 #[derive(Debug, Clone)]
 pub struct V2 {
     topology: Arc<CgroupTopology>,
+    /// The verified unified root, retained when converting the snapshot.
+    root: PathBuf,
 }
 
 impl Hierarchy for V1 {
@@ -148,7 +150,7 @@ impl Hierarchy for V2 {
 
     fn subsystems(&self) -> Vec<Subsystem> {
         let mut subs = vec![];
-        let root = self.topology.cgroupfs_root();
+        let root = &self.root;
 
         let mut controller_list: Vec<&str> = self.topology.controllers().iter().collect();
 
@@ -217,7 +219,7 @@ impl Hierarchy for V2 {
     }
 
     fn root(&self) -> Result<PathBuf> {
-        Ok(self.topology.cgroupfs_root().to_path_buf())
+        Ok(self.root.clone())
     }
 
     fn topology(&self) -> Option<Arc<CgroupTopology>> {
@@ -242,25 +244,19 @@ impl V1 {
     }
 
     /// Return the visible mount point and mount root for a v1 controller.
+    ///
+    /// If duplicate binds expose the controller, use the first match in
+    /// mountinfo order, as the legacy manager mount map does.
     pub fn get_mount_point(&self, controller: Controllers) -> Option<(PathBuf, PathBuf)> {
         let controller_name = controller.to_string();
         self.topology
             .mounts()
-            .cgroup_mounts()
-            .iter()
-            .find_map(|mount| {
-                if mount
-                    .super_opts
-                    .iter()
-                    .any(|opt| opt.as_slice() == controller_name.as_bytes())
-                {
-                    Some((
-                        self.topology.resolve_mount_point(&mount.mount_point),
-                        mount.mount_root.clone(),
-                    ))
-                } else {
-                    None
-                }
+            .find_v1_record(&controller_name)
+            .map(|mount| {
+                (
+                    self.topology.resolve_mount_point(&mount.mount_point),
+                    mount.mount_root.clone(),
+                )
             })
     }
 }
@@ -272,17 +268,18 @@ impl TryFrom<Arc<CgroupTopology>> for V2 {
     ///
     /// Returns a [`CoreError::VersionMismatch`] error before constructing the
     /// hierarchy if `topology` has a v1 primary version, including hybrid hosts.
-    /// This prevents v2 creation logic from treating a v1 cgroupfs root as a
-    /// unified hierarchy.
+    /// The error names the source mountinfo file because v1 has no single
+    /// cgroupfs root. This prevents v2 creation on a v1 hierarchy's mount.
     fn try_from(topology: Arc<CgroupTopology>) -> CoreResult<V2> {
-        if topology.version() != CgroupVersion::V2 {
-            return Err(CoreError::VersionMismatch {
-                path: topology.cgroupfs_root().to_path_buf(),
+        let root = topology
+            .cgroupfs_root()
+            .ok_or_else(|| CoreError::VersionMismatch {
+                path: topology.mountinfo_path().to_path_buf(),
                 requested: CgroupVersion::V2,
                 found: topology.version(),
-            });
-        }
-        Ok(V2 { topology })
+            })?
+            .to_path_buf();
+        Ok(V2 { topology, root })
     }
 }
 
@@ -325,9 +322,13 @@ fn auto_with_host_paths(host_paths: &HostPaths) -> CoreResult<Arc<dyn Hierarchy>
 /// Discover from any [`HostPaths`] first, then reuse the snapshot across
 /// hierarchies and control group handles.
 pub fn from_topology(topology: Arc<CgroupTopology>) -> Arc<dyn Hierarchy> {
-    match topology.version() {
-        CgroupVersion::V1 => Arc::new(V1::from(topology)),
-        CgroupVersion::V2 => Arc::new(V2 { topology }),
+    // Discovery supplies a unified root exactly when v2 is primary.
+    match topology.cgroupfs_root() {
+        Some(root) => {
+            let root = root.to_path_buf();
+            Arc::new(V2 { topology, root })
+        }
+        None => Arc::new(V1::from(topology)),
     }
 }
 
@@ -489,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_rejects_ambiguous_v1_roots() {
+    fn test_auto_fixture_rejects_ambiguous_v1_mapping() {
         let fixture = Fixture::new(
             &format!("{V1_MOUNT}44 33 0:39 / /other/cgroups/cpu rw - cgroup cgroup rw,cpu\n"),
             "1:memory:/\n2:cpu:/\n",
@@ -553,7 +554,10 @@ mod tests {
             let fixture = Fixture::new(&mounts, "0::/\n1:name=systemd:/delegated/work\n");
             let topology = discover(&fixture.paths).unwrap();
             assert_eq!(topology.version(), CgroupVersion::V2);
-            assert_eq!(topology.cgroupfs_root(), fixture.root.join("cgroupfs"));
+            assert_eq!(
+                topology.fixture_root().unwrap(),
+                fixture.root.join("cgroupfs")
+            );
             // Converting the snapshot and querying the view need no live procfs.
             fs::remove_dir_all(fixture.paths.procfs.join("self")).unwrap();
             let v1 = V1::from(topology.clone());
@@ -636,7 +640,7 @@ mod tests {
         assert_eq!(
             hierarchy.get_mount_point(Controllers::Mem),
             Some((
-                fixture.topology.cgroupfs_root().join("memory"),
+                fixture.topology.fixture_root().unwrap().join("memory"),
                 PathBuf::from("/")
             ))
         );
@@ -770,7 +774,7 @@ mod tests {
                 requested,
                 found,
             }) => {
-                assert_eq!(path, cgroupfs_root);
+                assert_eq!(path, v1_paths.procfs.join("self/mountinfo"));
                 assert_eq!(requested, CgroupVersion::V2);
                 assert_eq!(found, CgroupVersion::V1);
             }
