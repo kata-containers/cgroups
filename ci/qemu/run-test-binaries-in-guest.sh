@@ -49,7 +49,9 @@ require_test() {
     local test_binary="$1"
     local test_name="$2"
 
-    if ! "./${test_binary}" --list --format terse | grep -Fqx "${test_name}: test"; then
+    # Consume the entire list: grep -q can close the pipe after a match,
+    # causing the harness to fail with EPIPE and pipefail to reject the test.
+    if ! "./${test_binary}" --list --format terse | grep -Fx "${test_name}: test" >/dev/null; then
         echo "required test '${test_name}' not found in ${test_binary}" >&2
         exit 1
     fi
