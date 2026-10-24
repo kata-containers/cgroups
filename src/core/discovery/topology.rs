@@ -46,10 +46,9 @@ pub struct HostPaths {
     /// Root of a fixture cgroup tree on an ordinary filesystem.
     ///
     /// Available only to this crate's unit tests. When set, discovery still
-    /// derives a mapping prefix from `mountinfo` so
-    /// [`CgroupTopology::resolve_mount_point`] knows which prefix to strip,
-    /// and skips the cgroup2 statfs check. Mount points under that prefix
-    /// are re-rooted here, allowing tests to use filesystem-backed cgroup
+    /// derives a mapping prefix from `mountinfo` and skips the cgroup2 statfs
+    /// check. Before storing the snapshot, discovery re-roots mount points
+    /// under that prefix here, allowing tests to use filesystem-backed cgroup
     /// operations without privileges. V1 mounts must imply the same prefix
     /// when this fixture mapping is requested; normal discovery has no such
     /// restriction. Only v2-primary snapshots expose this directory through
@@ -249,9 +248,6 @@ pub struct CgroupTopology {
     /// The destination of test-only mount mapping.
     #[cfg(test)]
     fixture_root: Option<PathBuf>,
-    /// The prefix replaced by `fixture_root`. V1 inference is needed only here.
-    #[cfg(test)]
-    fixture_mount_root: Option<PathBuf>,
     /// The selected cgroup2 mount point from `mountinfo`, if available.
     ///
     /// Selection considers only roots containing the unified membership
@@ -274,6 +270,9 @@ impl CgroupTopology {
     }
 
     /// All parsed mount records on the host.
+    ///
+    /// Unit-test fixtures store mount points rebased to the fixture tree.
+    /// Mount roots and paths outside the mapping prefix remain unchanged.
     pub fn mounts(&self) -> &CgroupMountTable {
         &self.mounts
     }
@@ -297,10 +296,6 @@ impl CgroupTopology {
         if self.version != CgroupVersion::V2 {
             return None;
         }
-        #[cfg(test)]
-        if let Some(root) = self.fixture_root() {
-            return Some(root);
-        }
         self.unified_mount_point.as_deref()
     }
 
@@ -316,25 +311,6 @@ impl CgroupTopology {
     /// Sysfs root for discovering supported huge-page sizes.
     pub fn hugepages(&self) -> &Path {
         &self.hugepages
-    }
-
-    /// Return a mount point unchanged outside unit-test fixture mapping.
-    ///
-    /// A configured fixture replaces its inferred v1 prefix or selected v2
-    /// mount prefix with the fixture root. Paths outside that prefix remain
-    /// unchanged. Hybrid fixtures use only the v1 prefix, preserving the
-    /// separate optional unified mount.
-    pub fn resolve_mount_point(&self, original: &Path) -> PathBuf {
-        #[cfg(test)]
-        if let (Some(prefix), Some(root)) = (&self.fixture_mount_root, &self.fixture_root) {
-            if original == prefix {
-                return root.clone();
-            }
-            if let Ok(relative) = original.strip_prefix(prefix) {
-                return root.join(relative);
-            }
-        }
-        original.to_path_buf()
     }
 }
 
@@ -668,6 +644,24 @@ fn assemble_topology(
         None => v1_controllers,
     };
 
+    // Rebase the stored mount paths after selecting and validating the
+    // original mounts. In v2 fixture mode, the controller read above already
+    // uses the fixture root.
+    #[cfg(test)]
+    let (mounts, unified_mount_point) = match (&fixture_mount_root, fixture_root) {
+        (Some(prefix), Some(root)) => {
+            let rebase = |path: &Path| match path.strip_prefix(prefix) {
+                Ok(relative) => root.join(relative),
+                Err(_) => path.to_path_buf(),
+            };
+            (
+                mounts.map_mount_points(&rebase),
+                unified_mount_point.map(|path| rebase(&path)),
+            )
+        }
+        _ => (mounts, unified_mount_point),
+    };
+
     Ok(CgroupTopology {
         version,
         v2_available,
@@ -677,8 +671,6 @@ fn assemble_topology(
         mountinfo_path: mountinfo_path.to_path_buf(),
         #[cfg(test)]
         fixture_root: fixture_root.map(Path::to_path_buf),
-        #[cfg(test)]
-        fixture_mount_root,
         unified_mount_point,
         hugepages: host_paths.hugepages.clone(),
     })
@@ -787,7 +779,10 @@ mod tests {
         assert_eq!(topology.version, CgroupVersion::V1);
         assert!(!topology.v2_available);
         assert!(topology.cgroupfs_root().is_none());
-        assert!(topology.fixture_mount_root.is_none());
+        assert_eq!(
+            topology.mounts(),
+            &parse_mountinfo_bytes(V1_MOUNTINFO.as_bytes()).unwrap(),
+        );
         assert!(topology.controllers.contains("memory"));
         assert!(topology.controllers.contains("cpu"));
         assert!(topology.controllers.contains("cpuacct"));
@@ -900,30 +895,16 @@ mod tests {
                     .iter()
                     .any(|controller| controller == "name=openrc")));
                 assert_eq!(
-                    topology.fixture_mount_root.as_deref(),
-                    Some(Path::new("/sys/fs/cgroup"))
-                );
-                assert_eq!(
                     topology.controllers(),
                     &["cpu", "io", "memory", "pids"]
                         .iter()
                         .map(|name| name.to_string())
                         .collect::<ControllerSet>(),
                 );
-                assert_eq!(
-                    topology.resolve_mount_point(Path::new("/sys/fs/cgroup")),
-                    cgroupfs,
-                );
-                assert_eq!(
-                    topology.resolve_mount_point(Path::new("/sys/fs/cgroup/work")),
-                    cgroupfs.join("work"),
-                );
-                for mount in topology.mounts().cgroup_mounts() {
-                    assert_eq!(
-                        topology.resolve_mount_point(&mount.mount_point),
-                        mount.mount_point,
-                    );
-                }
+                assert_eq!(topology.mounts().unified_mounts()[0].mount_point, cgroupfs);
+                // Named hierarchies outside the unified prefix stay unchanged.
+                let original = parse_mountinfo_bytes(mountinfo.as_bytes()).unwrap();
+                assert_eq!(topology.mounts().cgroup_mounts(), original.cgroup_mounts());
             }
         }
     }
@@ -989,7 +970,7 @@ mod tests {
 
         assert_eq!(topology.fixture_root().unwrap(), tree);
         assert_eq!(
-            topology.resolve_mount_point(Path::new("/sys/fs/cgroup/memory")),
+            topology.mounts().cgroup_mounts()[0].mount_point,
             tree.join("memory"),
         );
         assert_eq!(fs::read_dir(&tree).unwrap().count(), 0);
@@ -1011,16 +992,12 @@ mod tests {
         assert_eq!(topology.version, CgroupVersion::V1);
         assert_eq!(topology.fixture_root().unwrap(), custom_cgroupfs);
         assert_eq!(topology.hugepages, custom_hugepages);
-        assert_eq!(
-            topology.fixture_mount_root.as_deref(),
-            Some(Path::new("/sys/fs/cgroup")),
-        );
         assert_eq!(fs::read_dir(&custom_cgroupfs).unwrap().count(), 0);
 
-        // Verify resolve_mount_point re-roots the V1 mountpoint
-        let orig_mem_mount = Path::new("/sys/fs/cgroup/memory");
-        let resolved = topology.resolve_mount_point(orig_mem_mount);
-        assert_eq!(resolved, custom_cgroupfs.join("memory"));
+        assert_eq!(
+            topology.mounts().cgroup_mounts()[0].mount_point,
+            custom_cgroupfs.join("memory"),
+        );
     }
 
     #[test]
@@ -1039,6 +1016,44 @@ mod tests {
         assert_eq!(topology.fixture_root().unwrap(), root.join("cgroupfs"));
         // Primary-hierarchy controllers only.
         assert!(!topology.controllers.contains("io"));
+    }
+
+    #[test]
+    fn test_fixture_snapshot_rebases_only_mount_points_under_the_prefix() {
+        const MOUNTINFO: &str = "\
+30 26 0:26 /delegated /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory
+31 26 0:27 / /sys/fs/cgroup-sibling/unified rw - cgroup2 cgroup2 rw
+32 26 0:28 /scratch /sys/fs/cgroup/scratch rw - tmpfs tmpfs rw
+33 26 0:29 /outside /sys/fs/cgroup-sibling/scratch rw - tmpfs tmpfs rw";
+        const MEMBERSHIP: &str = "1:memory:/delegated/work\n0::/work";
+        let (root, host_paths) = fixture_host("snapshot-rebase", MOUNTINFO, MEMBERSHIP);
+        let fixture_root = root.join("cgroupfs");
+        let host_paths = host_paths.with_fixture_root(fixture_root.clone());
+
+        let topology = discover(&host_paths).unwrap();
+        assert_eq!(topology.version(), CgroupVersion::V1);
+        assert!(topology.v2_available());
+        assert!(topology.cgroupfs_root().is_none());
+        assert_eq!(
+            topology.unified_mount_point.as_deref(),
+            Some(Path::new("/sys/fs/cgroup-sibling/unified")),
+        );
+        let original = parse_mountinfo_bytes(MOUNTINFO.as_bytes()).unwrap();
+        let stored = topology.mounts().records();
+        assert_eq!(stored.len(), original.records().len());
+        assert_eq!(stored[0].mount_point, fixture_root.join("memory"));
+        assert_eq!(stored[1], original.records()[1]);
+        assert_eq!(stored[2].mount_point, fixture_root.join("scratch"));
+        assert_eq!(stored[3], original.records()[3]);
+        for (stored, original) in stored.iter().zip(original.records()) {
+            assert_eq!(stored.mount_root, original.mount_root);
+            assert_eq!(stored.fs_type, original.fs_type);
+            assert_eq!(stored.super_opts, original.super_opts);
+        }
+        assert_eq!(
+            topology.membership(),
+            &parse_membership_bytes(MEMBERSHIP.as_bytes()).unwrap(),
+        );
     }
 
     #[test]
@@ -1064,15 +1079,11 @@ mod tests {
             assert_eq!(topology.version(), CgroupVersion::V1);
             assert!(topology.v2_available());
             assert_eq!(topology.fixture_root().unwrap(), cgroupfs);
-            assert_eq!(
-                topology.fixture_mount_root.as_deref(),
-                Some(Path::new("/sys/fs/cgroup")),
-            );
             assert_eq!(topology.controllers().len(), 2);
             assert!(topology.controllers().contains(controller));
             assert!(topology.controllers().contains("name=legacy"));
             assert_eq!(
-                topology.resolve_mount_point(Path::new("/sys/fs/cgroup/legacy")),
+                topology.mounts().cgroup_mounts()[0].mount_point,
                 cgroupfs.join("legacy"),
             );
         }
@@ -1292,16 +1303,13 @@ mod tests {
                 assert_eq!(topology.version(), CgroupVersion::V1);
                 assert!(topology.cgroupfs_root().is_none());
                 assert_eq!(
-                    topology.fixture_mount_root.as_deref(),
-                    with_fixture_root.then_some(Path::new("/sys/fs/cgroup")),
-                );
-                assert_eq!(
-                    topology.resolve_mount_point(Path::new("/sys/fs/cgroup")),
-                    expected_root,
-                );
-                assert_eq!(
-                    topology.resolve_mount_point(Path::new("/sys/fs/cgroup/systemd")),
-                    expected_root.join("systemd"),
+                    topology
+                        .mounts()
+                        .cgroup_mounts()
+                        .iter()
+                        .map(|mount| mount.mount_point.clone())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from([expected_root.clone(), expected_root.join("systemd")]),
                 );
                 assert!(topology.controllers().contains("cpu"));
                 assert!(topology.controllers().contains("memory"));
@@ -1339,16 +1347,13 @@ mod tests {
                     let topology = discover(&host_paths).unwrap();
                     assert_eq!(topology.version(), CgroupVersion::V1);
                     assert!(topology.cgroupfs_root().is_none());
-                    assert!(topology.fixture_mount_root.is_none());
                     assert_eq!(topology.mounts().cgroup_mounts().len(), 4);
                     assert!(topology.controllers().contains("memory"));
                     assert!(topology.controllers().contains("name=custom"));
-                    for mount in topology.mounts().cgroup_mounts() {
-                        assert_eq!(
-                            topology.resolve_mount_point(&mount.mount_point),
-                            mount.mount_point
-                        );
-                    }
+                    assert_eq!(
+                        topology.mounts(),
+                        &parse_mountinfo_bytes(mountinfo.as_bytes()).unwrap(),
+                    );
                     continue;
                 }
                 match discover(&host_paths) {
@@ -1395,15 +1400,12 @@ mod tests {
                 let topology = discover(&host_paths).unwrap();
                 assert_eq!(topology.version(), CgroupVersion::V1);
                 assert!(topology.cgroupfs_root().is_none());
-                assert!(topology.fixture_mount_root.is_none());
                 assert_eq!(topology.mounts().cgroup_mounts().len(), 2);
                 assert!(topology.controllers().contains("memory"));
-                for mount in topology.mounts().cgroup_mounts() {
-                    assert_eq!(
-                        topology.resolve_mount_point(&mount.mount_point),
-                        mount.mount_point,
-                    );
-                }
+                assert_eq!(
+                    topology.mounts(),
+                    &parse_mountinfo_bytes(mountinfo.as_bytes()).unwrap(),
+                );
             }
         }
     }
@@ -1561,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_mount_point_single_co_mount_fixture_root() {
+    fn test_stored_mount_point_single_co_mount_fixture_root() {
         const SINGLE_CO_MOUNT: &str =
             "30 26 0:26 / /sys/fs/cgroup rw - cgroup cgroup rw,cpu,cpuacct,memory";
         const SINGLE_MEMBERSHIP: &str = "1:cpu,cpuacct,memory:/user.slice";
@@ -1577,14 +1579,15 @@ mod tests {
         assert_eq!(topology.version, CgroupVersion::V1);
         assert_eq!(topology.fixture_root().unwrap(), custom_cgroupfs);
 
-        // Single co-mount must resolve directly to custom_cgroupfs, NOT custom_cgroupfs/cgroup
-        let resolved = topology.resolve_mount_point(Path::new("/sys/fs/cgroup"));
-        assert_eq!(resolved, custom_cgroupfs);
-        assert_eq!(resolved.as_os_str(), custom_cgroupfs.as_os_str());
+        // Store the co-mount directly at the fixture root.
+        assert_eq!(
+            topology.mounts().cgroup_mounts()[0].mount_point,
+            custom_cgroupfs,
+        );
     }
 
     #[test]
-    fn test_resolve_mount_point_single_controller_directory_fixture_root() {
+    fn test_stored_mount_point_single_controller_directory_fixture_root() {
         const CASES: &[(&str, &str)] = &[
             (
                 "30 26 0:26 / /sys/fs/cgroup/cpu,cpuacct rw - cgroup cgroup rw,cpu,cpuacct",
@@ -1614,9 +1617,8 @@ mod tests {
             let topology = discover(&host_paths).unwrap();
             assert_eq!(topology.version(), CgroupVersion::V1);
             assert!(!topology.v2_available());
-            let original = Path::new("/sys/fs/cgroup").join(directory);
             assert_eq!(
-                topology.resolve_mount_point(&original),
+                topology.mounts().cgroup_mounts()[0].mount_point,
                 custom_cgroupfs.join(directory)
             );
         }
@@ -1687,14 +1689,18 @@ mod tests {
         let cgroupfs = root.join("cgroupfs");
         fs::create_dir_all(&cgroupfs).unwrap();
         fs::write(cgroupfs.join("cgroup.controllers"), "memory\n").unwrap();
-        let host_paths = host_paths.with_fixture_root(cgroupfs);
+        let host_paths = host_paths.with_fixture_root(cgroupfs.clone());
 
         let topology = discover(&host_paths).unwrap();
         assert_eq!(topology.version(), CgroupVersion::V2);
         assert_eq!(
             topology.unified_mount_point.as_deref(),
-            Some(Path::new("/sys/fs/cgroup/ancestor")),
+            Some(cgroupfs.as_path()),
         );
+        let mounts = topology.mounts().unified_mounts();
+        assert_eq!(mounts[0].mount_point, Path::new("/sys/fs/cgroup/root"));
+        assert_eq!(mounts[1].mount_point, cgroupfs);
+        assert_eq!(mounts[1].mount_root, Path::new("/.."));
     }
 
     #[test]
@@ -1739,20 +1745,30 @@ mod tests {
                 let topology = discover(&host_paths).unwrap();
                 assert_eq!(topology.version(), version);
                 assert!(topology.v2_available());
+                let expected = if version == CgroupVersion::V2 {
+                    cgroupfs.clone()
+                } else {
+                    cgroupfs.join("b")
+                };
                 assert_eq!(
                     topology.unified_mount_point.as_deref(),
-                    Some(Path::new("/sys/fs/cgroup/b")),
+                    Some(expected.as_path()),
                 );
-                assert_eq!(topology.mounts().unified_mounts().len(), 2);
-                if version == CgroupVersion::V2 {
-                    assert_eq!(
-                        topology.resolve_mount_point(Path::new("/sys/fs/cgroup/b/work")),
-                        cgroupfs.join("work"),
-                    );
-                    assert_eq!(
-                        topology.resolve_mount_point(Path::new("/sys/fs/cgroup/a")),
-                        PathBuf::from("/sys/fs/cgroup/a"),
-                    );
+                let mounts = topology.mounts().unified_mounts();
+                assert_eq!(mounts.len(), 2);
+                for mount in mounts {
+                    match mount.mount_root.to_str().unwrap() {
+                        "/delegation-b" => assert_eq!(mount.mount_point, expected),
+                        "/delegation-a" => assert_eq!(
+                            mount.mount_point,
+                            if version == CgroupVersion::V2 {
+                                PathBuf::from("/sys/fs/cgroup/a")
+                            } else {
+                                cgroupfs.join("a")
+                            },
+                        ),
+                        other => panic!("unexpected mount root: {}", other),
+                    }
                 }
             }
         }
@@ -1788,12 +1804,16 @@ mod tests {
             assert!(topology.v2_available());
             assert_eq!(
                 topology.unified_mount_point.as_deref(),
-                Some(Path::new("/sys/fs/cgroup")),
+                Some(cgroupfs.as_path()),
             );
-            assert_eq!(
-                topology.resolve_mount_point(Path::new("/sys/fs/cgroup/nested/work")),
-                cgroupfs.join("nested/work"),
-            );
+            for mount in topology.mounts().unified_mounts() {
+                if mount.mount_root == Path::new("/docker/abc") {
+                    assert_eq!(mount.mount_point, cgroupfs);
+                } else {
+                    assert_eq!(mount.mount_root, Path::new("/docker/abc/nested"));
+                    assert_eq!(mount.mount_point, cgroupfs.join("nested"));
+                }
+            }
         }
     }
 
@@ -1832,12 +1852,16 @@ mod tests {
                 assert!(topology.v2_available());
                 assert_eq!(
                     topology.unified_mount_point.as_deref(),
-                    Some(Path::new("/sys/fs/cgroup/a")),
+                    Some(cgroupfs.as_path()),
                 );
-                assert_eq!(
-                    topology.resolve_mount_point(Path::new("/sys/fs/cgroup/a/work")),
-                    cgroupfs.join("work"),
-                );
+                for mount in topology.mounts().unified_mounts() {
+                    if mount.mount_root == Path::new("/..") {
+                        assert_eq!(mount.mount_point, Path::new("/sys/fs/cgroup/host"));
+                    } else {
+                        assert_eq!(mount.mount_root, Path::new(subtree_root));
+                        assert_eq!(mount.mount_point, cgroupfs);
+                    }
+                }
             }
         }
     }
@@ -1937,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_mount_point_v2_delegated_before_root() {
+    fn test_stored_mount_points_v2_delegated_before_root() {
         // Both mounts contain membership; the root mount must win even
         // though the delegated subtree mount appears first.
         const DELEGATED_FIRST: &str = "\
@@ -1962,22 +1986,12 @@ mod tests {
         // selected, not the delegated subtree at /sys/fs/cgroup/delegated.
         assert_eq!(topology.cgroupfs_root().unwrap(), custom_cgroupfs);
 
-        // resolve_mount_point must relocate the *root* mount's
-        // mount_point even though the delegated mount appeared first
-        // in the mountinfo list.
-        let resolved = topology.resolve_mount_point(Path::new("/sys/fs/cgroup"));
-        assert_eq!(
-            resolved, custom_cgroupfs,
-            "root mount_point should resolve to cgroupfs_fixture_root"
-        );
-
-        // A child under the root mount should also be relocated.
-        let resolved_child = topology.resolve_mount_point(Path::new("/sys/fs/cgroup/user.slice"));
-        assert_eq!(
-            resolved_child,
-            custom_cgroupfs.join("user.slice"),
-            "child of root mount should resolve under cgroupfs_fixture_root"
-        );
+        // Both stored mount points are rebased after selecting the root.
+        let mounts = topology.mounts().unified_mounts();
+        assert_eq!(mounts[0].mount_point, custom_cgroupfs.join("delegated"));
+        assert_eq!(mounts[0].mount_root, Path::new("/sub"));
+        assert_eq!(mounts[1].mount_point, custom_cgroupfs);
+        assert_eq!(mounts[1].mount_root, Path::new("/"));
     }
 
     #[test]
