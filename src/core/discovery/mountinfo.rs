@@ -11,6 +11,8 @@
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+#[cfg(test)]
+use std::path::Path;
 use std::path::PathBuf;
 
 use crate::core::error::ParseMountError;
@@ -45,6 +47,15 @@ impl CgroupMountTable {
     /// All parsed mount records, in input order.
     pub fn records(&self) -> &[MountRecord] {
         &self.records
+    }
+
+    /// Rebase stored mount points for unit-test fixtures, retaining other fields.
+    #[cfg(test)]
+    pub(crate) fn map_mount_points(mut self, rebase: &impl Fn(&Path) -> PathBuf) -> Self {
+        for record in &mut self.records {
+            record.mount_point = rebase(&record.mount_point);
+        }
+        self
     }
 
     /// cgroup v1 mounts, in input order.

@@ -252,12 +252,7 @@ impl V1 {
         self.topology
             .mounts()
             .find_v1_record(&controller_name)
-            .map(|mount| {
-                (
-                    self.topology.resolve_mount_point(&mount.mount_point),
-                    mount.mount_root.clone(),
-                )
-            })
+            .map(|mount| (mount.mount_point.clone(), mount.mount_root.clone()))
     }
 }
 
