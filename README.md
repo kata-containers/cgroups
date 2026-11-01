@@ -47,6 +47,13 @@ cg.delete();
 
 ## Breaking changes for 1.0
 
+- On cgroup v2, `MemController::set_swappiness()` and `Controller::apply()` /
+  `Cgroup::apply()` with `Resources.memory.swappiness = Some(...)` now return
+  `ErrorKind::CgroupVersion`. In 0.5.1 these requests wrote the swappiness value
+  into `memory.swap.max`, changing the swap byte limit. Leave swappiness as
+  `None` on v2; set swap limits with `set_memswap_limit()` or
+  `Resources.memory.memory_swap_limit` instead.
+
 - `Controller` and `Cgroup` membership readers (`tasks()` / `procs()`),
   `CpuSetController::cpuset()`, and `CpuAcctController::cpuacct()` now return
   `fs::error::Result<T>` instead of bare values. Propagate I/O and parse errors

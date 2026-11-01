@@ -441,6 +441,9 @@ impl Cgroup {
     ///
     /// Updates are not rolled back; earlier writes may have taken effect.
     pub fn apply(&self, res: &Resources) -> Result<()> {
+        if self.v2() && res.memory.swappiness.is_some() {
+            return Err(Error::new(CgroupVersion));
+        }
         self.subsystems
             .iter()
             .try_for_each(|subsystem| subsystem.to_controller().apply(res))
@@ -2642,5 +2645,37 @@ mod tests {
                     .join(OsStr::from_bytes(expected_parent))
             );
         }
+    }
+
+    #[test]
+    fn test_swappiness_v2_cgroup_apply_rejects_before_modifying_earlier_controllers() {
+        let fixture =
+            crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpuset memory pids");
+        let cgroup = Cgroup::load(
+            crate::fs::hierarchies::from_topology(fixture.topology.clone()),
+            CgroupPath::new("test_swappiness_preflight").unwrap(),
+        );
+        let cpuset_ctrl: &crate::fs::cpuset::CpuSetController = cgroup.controller_of().unwrap();
+        let pids_ctrl: &crate::fs::pid::PidController = cgroup.controller_of().unwrap();
+
+        fs::create_dir_all(cpuset_ctrl.path()).unwrap();
+        fs::write(cpuset_ctrl.path().join("cpuset.cpus"), "0-1\n").unwrap();
+        fs::write(pids_ctrl.path().join("pids.max"), "max\n").unwrap();
+
+        let mut resources = Resources::default();
+        resources.cpu.cpus = Some("0".to_string());
+        resources.memory.swappiness = Some(60);
+        resources.pid.maximum_number_of_processes = Some(crate::fs::MaxValue::Value(100));
+
+        let error = cgroup.apply(&resources).unwrap_err();
+        assert_eq!(error.kind(), &CgroupVersion);
+        assert_eq!(
+            fs::read_to_string(cpuset_ctrl.path().join("cpuset.cpus")).unwrap(),
+            "0-1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(pids_ctrl.path().join("pids.max")).unwrap(),
+            "max\n"
+        );
     }
 }

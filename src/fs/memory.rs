@@ -507,13 +507,17 @@ impl ControllerInternal for MemController {
         // get the resources that apply to this controller
         let memres: &MemoryResources = &res.memory;
 
+        // v2 has no per-cgroup swappiness setting. Reject it before any
+        // memory writes, rather than letting the best-effort update ignore it.
+        if self.v2 && memres.swappiness.is_some() {
+            return Err(Error::new(CgroupVersion));
+        }
+
         update!(self, set_limit, memres.memory_hard_limit);
         update!(self, set_soft_limit, memres.memory_soft_limit);
         update!(self, set_kmem_limit, memres.kernel_memory_limit);
         update!(self, set_memswap_limit, memres.memory_swap_limit);
-        if !self.v2 {
-            update!(self, set_tcp_limit, memres.kernel_tcp_memory_limit);
-        }
+        update!(self, set_tcp_limit, memres.kernel_tcp_memory_limit);
         update!(self, set_swappiness, memres.swappiness);
 
         memres.attrs.iter().for_each(|(k, v)| {
@@ -880,11 +884,13 @@ impl MemController {
     /// group.
     ///
     /// Note that a value of zero does not imply that the process will not be swapped out.
+    /// Returns [`ErrorKind::CgroupVersion`] on cgroup v2, which has no
+    /// per-cgroup swappiness setting. No file is written in that case.
     pub fn set_swappiness(&self, swp: u64) -> Result<()> {
-        let mut file_name = "memory.swappiness";
         if self.v2 {
-            file_name = "memory.swap.max"
+            return Err(Error::new(CgroupVersion));
         }
+        let file_name = "memory.swappiness";
 
         self.write_value(file_name, &swp.to_string())
     }
@@ -937,6 +943,93 @@ mod tests {
         OomControl,
     };
     use std::path::PathBuf;
+
+    fn swappiness_fixture(
+        version: crate::core::CgroupVersion,
+    ) -> (crate::tests::TopologyFixture, crate::fs::Cgroup) {
+        use crate::core::CgroupPath;
+        use crate::fs::{hierarchies, Cgroup, Controller};
+
+        let fixture = crate::tests::topology_fixture(version, "memory");
+        let cgroup = Cgroup::load(
+            hierarchies::from_topology(fixture.topology.clone()),
+            CgroupPath::root(),
+        );
+        let controller: &MemController = cgroup.controller_of().unwrap();
+        std::fs::create_dir_all(controller.path()).unwrap();
+        (fixture, cgroup)
+    }
+
+    #[test]
+    fn test_swappiness_v2_setter_rejects_without_changing_swap_limit() {
+        use crate::core::CgroupVersion;
+        use crate::fs::Controller;
+        use std::fs;
+
+        let (_fixture, cgroup) = swappiness_fixture(CgroupVersion::V2);
+        let controller: &MemController = cgroup.controller_of().unwrap();
+        let swap_path = controller.path().join("memory.swap.max");
+        fs::write(&swap_path, "1048576").unwrap();
+
+        let error = controller.set_swappiness(60).unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::CgroupVersion);
+        assert_eq!(fs::read_to_string(&swap_path).unwrap(), "1048576");
+        assert!(!controller.path().join("memory.swappiness").exists());
+    }
+
+    #[test]
+    fn test_swappiness_v2_apply_rejects_before_memory_writes() {
+        use crate::core::CgroupVersion;
+        use crate::fs::{Controller, Resources};
+        use std::fs;
+
+        let (_fixture, cgroup) = swappiness_fixture(CgroupVersion::V2);
+        let controller: &MemController = cgroup.controller_of().unwrap();
+        let memory_path = controller.path().join("memory.max");
+        let swap_path = controller.path().join("memory.swap.max");
+        fs::write(&memory_path, "65536").unwrap();
+        fs::write(&swap_path, "1048576").unwrap();
+        let mut resources = Resources::default();
+        resources.memory.memory_hard_limit = Some(4096);
+        resources.memory.memory_swap_limit = Some(8192);
+        resources.memory.swappiness = Some(60);
+
+        for error in [
+            controller.apply(&resources).unwrap_err(),
+            cgroup.apply(&resources).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), &ErrorKind::CgroupVersion);
+            assert_eq!(fs::read_to_string(&memory_path).unwrap(), "65536");
+            assert_eq!(fs::read_to_string(&swap_path).unwrap(), "1048576");
+            assert!(!controller.path().join("memory.swappiness").exists());
+        }
+
+        resources.memory.swappiness = None;
+        cgroup.apply(&resources).unwrap();
+        assert_eq!(fs::read_to_string(memory_path).unwrap(), "4096");
+        assert_eq!(fs::read_to_string(swap_path).unwrap(), "8192");
+    }
+
+    #[test]
+    fn test_swappiness_v1_setter_and_apply_use_swappiness_file() {
+        use crate::core::CgroupVersion;
+        use crate::fs::{Controller, Resources};
+        use std::fs;
+
+        let (_fixture, cgroup) = swappiness_fixture(CgroupVersion::V1);
+        let controller: &MemController = cgroup.controller_of().unwrap();
+        let path = controller.path().join("memory.swappiness");
+        controller.set_swappiness(60).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "60");
+
+        let mut resources = Resources::default();
+        resources.memory.swappiness = Some(75);
+        controller.apply(&resources).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "75");
+        cgroup.apply(&resources).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "75");
+        assert!(!controller.path().join("memory.swap.max").exists());
+    }
 
     static GOOD_VALUE: &str = "\
 total=51189 N0=51189 N1=123
