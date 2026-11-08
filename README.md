@@ -47,6 +47,44 @@ cg.delete();
 
 ## Breaking changes for 1.0
 
+- On cgroup v2, `MemController::set_swappiness()` and `Controller::apply()` /
+  `Cgroup::apply()` with `Resources.memory.swappiness = Some(...)` now return
+  `ErrorKind::CgroupVersion`. In 0.5.1 these requests wrote the swappiness value
+  into `memory.swap.max`, changing the swap byte limit. Leave swappiness as
+  `None` on v2; set swap limits with `set_memswap_limit()` or
+  `Resources.memory.memory_swap_limit` instead.
+
+- `Controller` and `Cgroup` membership readers (`tasks()` / `procs()`),
+  `CpuSetController::cpuset()`, and `CpuAcctController::cpuacct()` now return
+  `fs::error::Result<T>` instead of bare values. Propagate I/O and parse errors
+  with `?` or handle them explicitly. Custom `Controller` implementations must
+  update both membership signatures and propagate failures.
+  `cpuset()` / `cpuacct()` attach `ReadFileError` with the full path and original
+  I/O or parser error as its source.
+  OCI `FsManager::pids()` / `SystemdManager::pids()` now propagate membership-read
+  failures, but still return an empty list when the corresponding cgroup
+  directory is confirmed absent. `FsManager::destroy()` tolerates absent cgroups
+  and v2 threaded `cgroup.procs` reads returning `EOPNOTSUPP`; other membership
+  read failures propagate and removal enforces emptiness.
+  `stats()` remains best effort and omits CPU accounting on required-read failure.
+- `CpuSet::sched_relax_domain_level` changed from `u64` in 0.5.1 to
+  `Option<i64>`. Handle `None` for an unavailable interface and preserve
+  `Some(-1)` as the system-default request.
+- `Cgroup::apply()` and `CpuSetController::apply()` now propagate cpuset write
+  failures ignored in 0.5.1. Updates are not rolled back; earlier writes may
+  have taken effect.
+- Resource write errors use controller file names and serialized values;
+  open failures previously reported a full path and placeholder. Update
+  `WriteFailed` matches and downcast the immediate source to
+  `fs::error::WriteFileError` for the full path and original I/O error.
+- Customized keys in `Resources.memory.attrs`, `cpu.attrs`, and `blkio.attrs`
+  must now be single nonempty filenames, excluding `.`, `..`, `/`, and NUL
+  bytes. In 0.5.1, keys could be interpreted as paths outside the cgroup.
+  `apply()` now rejects invalid keys with `ErrorKind::InvalidPath` and an
+  `fs::error::AttributeNameError` source. Pass a filename such as `memory.high`
+  and select the cgroup directory through `CgroupPath` instead.
+- `fs::error::ErrorKind` is now `#[non_exhaustive]`; add a wildcard arm
+  (`_ => ...`) to downstream matches so future variants do not break them.
 - `Cgroup::new` and `Cgroup::load` now take `Arc<dyn Hierarchy>` and a
   validated `CgroupPath`, replacing `Box<dyn Hierarchy>` and `AsRef<Path>`.
   Wrap custom hierarchies with `Arc::new(...)` (or convert an existing `Box`

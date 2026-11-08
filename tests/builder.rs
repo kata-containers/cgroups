@@ -46,7 +46,10 @@ pub fn test_memory_res_build() {
         .unwrap();
     let mut resources = Resources::default();
     resources.memory.kernel_memory_limit = Some(128 * 1024 * 1024);
-    resources.memory.swappiness = Some(70);
+    if !cg.v2() {
+        // Only v1 supports a per-cgroup swappiness setting.
+        resources.memory.swappiness = Some(70);
+    }
     resources.memory.memory_hard_limit = Some(1024 * 1024 * 1024);
     cg.apply(&resources).unwrap();
 

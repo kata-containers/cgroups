@@ -10,7 +10,7 @@
 //!  [Documentation/scheduler/sched-design-CFS.txt](https://www.kernel.org/doc/Documentation/scheduler/sched-design-CFS.txt)
 //!  paragraph 7 ("GROUP SCHEDULER EXTENSIONS TO CFS").
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 
 use crate::fs::error::ErrorKind::*;
@@ -79,9 +79,7 @@ impl ControllerInternal for CpuController {
         update_and_test!(self, set_cfs_period, res.period, cfs_period);
         update_and_test!(self, set_cfs_quota, res.quota, cfs_quota);
 
-        res.attrs.iter().for_each(|(k, v)| {
-            let _ = self.set(k, v);
-        });
+        self.apply_attributes(&res.attrs)?;
 
         // TODO: rt properties (CONFIG_RT_GROUP_SCHED) are not yet supported
 
@@ -149,11 +147,7 @@ impl CpuController {
             file_name = "cpu.weight";
         }
         // NOTE: .CpuShares is not used here. Conversion is the caller's responsibility.
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(shares.to_string().as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed(file_name.to_string(), shares.to_string()), e)
-            })
-        })
+        self.write_value(file_name, &shares.to_string())
     }
 
     /// Retrieve the CPU bandwidth that this control group (relative to other control groups and
@@ -172,15 +166,7 @@ impl CpuController {
         if self.v2 {
             return self.set_cfs_quota_and_period(None, Some(us));
         }
-        self.open_path("cpu.cfs_period_us", true)
-            .and_then(|mut file| {
-                file.write_all(us.to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("cpu.cfs_period_us".to_string(), us.to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("cpu.cfs_period_us", &us.to_string())
     }
 
     /// Retrieve the period of time of how often this cgroup's access to the CPU should be
@@ -202,15 +188,7 @@ impl CpuController {
         if self.v2 {
             return self.set_cfs_quota_and_period(Some(us), None);
         }
-        self.open_path("cpu.cfs_quota_us", true)
-            .and_then(|mut file| {
-                file.write_all(us.to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("cpu.cfs_quota_us".to_string(), us.to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("cpu.cfs_quota_us", &us.to_string())
     }
 
     /// Retrieve the quota of time for which all tasks in this cgroup can run during one period, in
@@ -268,34 +246,15 @@ impl CpuController {
         };
 
         let line = format!("{} {}", new_quota, new_period);
-        self.open_path("cpu.max", true).and_then(|mut file| {
-            file.write_all(line.as_ref())
-                .map_err(|e| Error::with_cause(WriteFailed("cpu.max".to_string(), line), e))
-        })
+        self.write_value("cpu.max", &line)
     }
 
     pub fn set_rt_runtime(&self, us: i64) -> Result<()> {
-        self.open_path("cpu.rt_runtime_us", true)
-            .and_then(|mut file| {
-                file.write_all(us.to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("cpu.rt_runtime_us".to_string(), us.to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("cpu.rt_runtime_us", &us.to_string())
     }
 
     pub fn set_rt_period_us(&self, us: u64) -> Result<()> {
-        self.open_path("cpu.rt_period_us", true)
-            .and_then(|mut file| {
-                file.write_all(us.to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("cpu.rt_period_us".to_string(), us.to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("cpu.rt_period_us", &us.to_string())
     }
 }
 

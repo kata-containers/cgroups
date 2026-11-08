@@ -80,23 +80,53 @@ macro_rules! skip_if_cgroups_v2 {
 #[cfg(test)]
 pub mod tests {
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
+
+    /// Remove a test's scratch directory on return or panic unwinding.
+    pub(crate) struct TestDir(PathBuf);
+
+    impl TestDir {
+        pub(crate) fn new(prefix: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "cgroups-{}-{}-{}",
+                prefix,
+                std::process::id(),
+                rand::random::<u64>(),
+            ));
+            fs::create_dir(&path).expect("failed to create test directory");
+            Self(path)
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl std::ops::Deref for TestDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            self.path()
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// Own synthetic discovery files for topology-based handle tests.
     pub(crate) struct TopologyFixture {
         pub(crate) topology: std::sync::Arc<crate::core::CgroupTopology>,
-        root: std::path::PathBuf,
+        _root: TestDir,
     }
 
     impl TopologyFixture {
         pub(crate) fn new(mountinfo: &[u8], membership: &[u8], controllers: &str) -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "cgroups-topology-fixture-{}-{}",
-                std::process::id(),
-                NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            ));
+            let directory = TestDir::new("topology-fixture");
+            let root = directory.path();
             fs::create_dir_all(root.join("proc/self")).unwrap();
             fs::create_dir_all(root.join("cgroup")).unwrap();
             fs::create_dir_all(root.join("hugepages")).unwrap();
@@ -107,13 +137,10 @@ pub mod tests {
             let paths = crate::core::HostPaths::new(root.join("proc"), root.join("hugepages"))
                 .with_fixture_root(root.join("cgroup"));
             let topology = crate::core::discover(&paths).unwrap();
-            Self { topology, root }
-        }
-    }
-
-    impl Drop for TopologyFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
+            Self {
+                topology,
+                _root: directory,
+            }
         }
     }
 

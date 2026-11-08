@@ -34,7 +34,13 @@ pub trait Manager: Send + Sync {
     /// Add a thread specified by its pid.
     fn add_thread(&mut self, pid: CgroupPid) -> Result<()>;
 
-    /// Get the list of pids joint to the cgroups.
+    /// Return the task IDs currently in the managed cgroup.
+    ///
+    /// Both [`FsManager`] and [`SystemdManager`] return an empty list when a
+    /// membership read reports `ENOENT` and the corresponding cgroup directory
+    /// is also confirmed absent, including before creation or after removal.
+    /// A missing membership file in an existing directory, other I/O errors,
+    /// parse errors, and controller-selection errors still propagate.
     fn pids(&self) -> Result<Vec<CgroupPid>>;
 
     /// Set the freezer cgroup to the specified state.

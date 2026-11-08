@@ -706,6 +706,7 @@ fn read_controller_names(cgroupfs_root: &Path) -> CoreResult<ControllerSet> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::TestDir;
     use std::error::Error as _;
     use std::os::unix::ffi::OsStrExt;
 
@@ -738,37 +739,17 @@ mod tests {
 1:name=systemd:/user.slice
 0::/user.slice";
 
-    struct TempDir(PathBuf);
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    impl std::ops::Deref for TempDir {
-        type Target = Path;
-        fn deref(&self) -> &Path {
-            &self.0
-        }
-    }
-
     /// Create a scratch procfs root containing `self/mountinfo` and
     /// `self/cgroup` with the given fixture contents.
-    fn fixture_host(tag: &str, mountinfo: &str, cgroup: &str) -> (TempDir, HostPaths) {
-        let root = std::env::temp_dir().join(format!(
-            "cgroups-rs-topology-{}-{}",
-            tag,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+    fn fixture_host(tag: &str, mountinfo: &str, cgroup: &str) -> (TestDir, HostPaths) {
+        let root = TestDir::new(tag);
         let self_dir = root.join("self");
         fs::create_dir_all(&self_dir).unwrap();
         fs::write(self_dir.join("mountinfo"), mountinfo).unwrap();
         fs::write(self_dir.join("cgroup"), cgroup).unwrap();
 
-        let host_paths = HostPaths::new(root.clone(), PathBuf::from("/nonexistent"));
-        (TempDir(root), host_paths)
+        let host_paths = HostPaths::new(root.path().to_path_buf(), PathBuf::from("/nonexistent"));
+        (root, host_paths)
     }
 
     #[test]

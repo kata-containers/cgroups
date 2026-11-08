@@ -28,7 +28,9 @@ use crate::fs::memory::MemController;
 use crate::fs::net_cls::NetClsController;
 use crate::fs::net_prio::NetPrioController;
 use crate::fs::pid::PidController;
-use crate::fs::{hierarchies, Cgroup, ControllIdentifier, Controller, MaxValue, Subsystem};
+use crate::fs::{
+    hierarchies, Cgroup, ControllIdentifier, Controller, ControllerSelection, MaxValue, Subsystem,
+};
 use crate::oci::error::Error;
 use crate::oci::{conv, Manager, Result};
 use crate::stats::{
@@ -87,12 +89,135 @@ impl FsManager {
 }
 
 impl FsManager {
+    // Keep the read boundary injectable to exercise concurrent removal and
+    // permission failures without depending on host privileges.
+    fn pids_with(
+        &self,
+        read_tasks: impl FnOnce(&MemController) -> FsResult<Vec<CgroupPid>>,
+    ) -> Result<Vec<CgroupPid>> {
+        let controller = self.controller::<MemController>()?;
+        match read_tasks(controller) {
+            Ok(pids) => Ok(pids),
+            Err(error)
+                if error.is_not_found()
+                    && matches!(
+                        std::fs::metadata(controller.path()),
+                        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound
+                    ) =>
+            {
+                // An uncreated or removed cgroup has no members. A missing
+                // membership file in an existing directory remains an error.
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Create the cgroups if they are not created yet.
     pub(crate) fn create_cgroups(&mut self) -> Result<()> {
         if self.exists() {
             return Ok(());
         }
         self.cgroup.create()?;
+        Ok(())
+    }
+
+    // Keep deletion separate from membership reads and migration. Filesystem
+    // fixtures can then remove ordinary files before rmdir, unlike cgroupfs.
+    fn destroy_with(&self, delete: impl FnOnce(&Cgroup) -> FsResult<()>) -> Result<()> {
+        // Membership read failures propagate; individual migration failures
+        // remain best effort, and deletion reports its own failure.
+        if self.v2() {
+            return self.destroy_v2_with(Cgroup::procs, delete);
+        }
+
+        let mut controllers = Vec::new();
+        let mut tasks = Vec::new();
+        for subsystem in self.cgroup.subsystems() {
+            let controller = subsystem.to_controller();
+            match controller.tasks() {
+                Ok(mut members) => tasks.append(&mut members),
+                Err(error)
+                    if error.is_not_found()
+                        && matches!(
+                            std::fs::metadata(controller.path()),
+                            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound
+                        ) =>
+                {
+                    // A previous create or delete may have left only a subset
+                    // of the v1 directories. A missing tasks file in an
+                    // existing directory is still an error.
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            controllers.push(subsystem.controller_name());
+        }
+
+        // Finish every read before migrating anything, then use the same
+        // controller subset for migration and deletion. An absent controller
+        // must not stop migration out of a surviving hierarchy.
+        let cgroup = Cgroup::builder(self.cgroup.hierarchy().clone(), self.base.clone())
+            .controllers(ControllerSelection::Only(controllers))
+            .load();
+        tasks.sort_unstable();
+        tasks.dedup();
+        for pid in tasks {
+            // PID 0 can denote a task outside the reader's PID namespace.
+            // Writing it back would attach the caller instead.
+            if pid.pid == 0 {
+                continue;
+            }
+            let _ = cgroup.remove_task(pid);
+        }
+        delete(&cgroup)?;
+        Ok(())
+    }
+
+    // Keep the read boundary injectable to exercise removal after exists().
+    fn destroy_v2_with(
+        &self,
+        read_procs: impl FnOnce(&Cgroup) -> FsResult<Vec<CgroupPid>>,
+        delete: impl FnOnce(&Cgroup) -> FsResult<()>,
+    ) -> Result<()> {
+        if !self.exists() {
+            return Ok(());
+        }
+        let procs = match read_procs(&self.cgroup) {
+            Ok(procs) => procs,
+            Err(error)
+                if error.io_error().and_then(std::io::Error::raw_os_error)
+                    == Some(libc::EOPNOTSUPP) =>
+            {
+                // Threaded cgroups reject cgroup.procs reads: their processes
+                // belong to the thread root. Still attempt rmdir, which checks
+                // that no threads or descendants remain in this cgroup.
+                Vec::new()
+            }
+            Err(error)
+                if error.is_not_found()
+                    && matches!(
+                        std::fs::metadata(
+                            self.cgroup.hierarchy().root()?.join(self.base.as_path())
+                        ),
+                        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound
+                    ) =>
+            {
+                // Another remover won the race after exists(). A missing
+                // cgroup.procs in an existing directory remains an error.
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        for tgid in procs {
+            // PID 0 can denote a process outside the reader's PID namespace.
+            // Writing it back would migrate the caller instead.
+            if tgid.pid == 0 {
+                continue;
+            }
+            let _ = self.cgroup.remove_task_by_tgid(tgid);
+        }
+        delete(&self.cgroup)?;
         Ok(())
     }
 
@@ -505,7 +630,7 @@ impl FsManager {
 
     fn cpu_acct_stats(&self) -> Result<CpuAcctStats> {
         let controller: &CpuAcctController = self.controller()?;
-        let cpu_acct = controller.cpuacct();
+        let cpu_acct = controller.cpuacct()?;
 
         let user_usage = parse_value_from_tuples(&cpu_acct.stat, "user").unwrap_or_default();
 
@@ -757,10 +882,7 @@ impl Manager for FsManager {
     }
 
     fn pids(&self) -> Result<Vec<CgroupPid>> {
-        Ok(self
-            .controller::<MemController>()
-            .map_err(Error::Cgroupfs)?
-            .tasks())
+        self.pids_with(MemController::tasks)
     }
 
     fn freeze(&self, state: FreezerState) -> Result<()> {
@@ -776,27 +898,7 @@ impl Manager for FsManager {
     }
 
     fn destroy(&mut self) -> Result<()> {
-        if !self.exists() {
-            return Ok(());
-        }
-
-        // Before deleting the cgroup, we should move processes in the
-        // cgroup to the root cgroup. Otherwise, we'll have a "Device or
-        // resource busy" error.
-        if self.v2() {
-            for tgid in self.cgroup.procs() {
-                // Ignore all errors as long as the cgroup is deleted.
-                let _ = self.cgroup.remove_task_by_tgid(tgid);
-            }
-        } else {
-            for pid in self.cgroup.tasks() {
-                // Ditto.
-                let _ = self.cgroup.remove_task(pid);
-            }
-        }
-
-        self.cgroup.delete()?;
-        Ok(())
+        self.destroy_with(Cgroup::delete)
     }
 
     fn set(&mut self, resources: &LinuxResources) -> Result<()> {
@@ -1063,6 +1165,7 @@ mod tests {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     use oci_spec::runtime::{LinuxCpuBuilder, LinuxMemoryBuilder, LinuxResourcesBuilder};
+    use std::error::Error as _;
 
     use crate::core::{discover, CgroupVersion, HostPaths};
     use crate::oci::fs::*;
@@ -1074,6 +1177,525 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     const TEST_BASE: &str = "cgroupsrs/pod";
+
+    fn v1_cleanup_fixture() -> (crate::tests::TopologyFixture, FsManager) {
+        let fixture = crate::tests::TopologyFixture::new(
+            b"41 33 0:31 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+              42 33 0:32 / /sys/fs/cgroup/pids rw - cgroup cgroup rw,pids\n",
+            b"1:memory:/\n2:pids:/\n",
+            "",
+        );
+        let manager = FsManager::new(
+            fixture.topology.clone(),
+            CgroupPath::new("cleanup").unwrap(),
+        )
+        .unwrap();
+        (fixture, manager)
+    }
+
+    fn delete_fixture_cgroup(cgroup: &Cgroup) -> FsResult<()> {
+        // Real cgroupfs rmdir removes the pseudo-files automatically.
+        for subsystem in cgroup.subsystems() {
+            fs::remove_file(subsystem.to_controller().path().join("tasks")).unwrap();
+        }
+        cgroup.delete()
+    }
+
+    #[test]
+    fn test_destroy_v1_after_partial_creation() {
+        for present in ["memory", "pids"] {
+            let (fixture, mut manager) = v1_cleanup_fixture();
+            let root = fixture.topology.fixture_root().unwrap();
+            let mount = root.join(present);
+            let directory = mount.join("cleanup");
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("tasks"), "123\n123\n").unwrap();
+
+            manager
+                .destroy_with(|cgroup| {
+                    assert_eq!(cgroup.subsystems().len(), 1);
+                    assert_eq!(cgroup.subsystems()[0].controller_name(), present);
+                    assert_eq!(fs::read_to_string(mount.join("tasks")).unwrap(), "123");
+                    delete_fixture_cgroup(cgroup)
+                })
+                .unwrap();
+
+            assert!(!directory.exists());
+            let absent = if present == "memory" {
+                "pids"
+            } else {
+                "memory"
+            };
+            assert!(!root.join(absent).exists());
+            manager.destroy().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_destroy_v1_retries_after_partial_deletion() {
+        use std::error::Error as _;
+
+        let (fixture, mut manager) = v1_cleanup_fixture();
+        let root = fixture.topology.fixture_root().unwrap();
+        let memory = root.join("memory/cleanup");
+        let pids = root.join("pids/cleanup");
+        for directory in [&memory, &pids] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join("tasks"), "").unwrap();
+        }
+
+        let error = manager
+            .destroy_with(|cgroup| {
+                assert_eq!(cgroup.subsystems().len(), 2);
+                fs::remove_file(memory.join("tasks")).unwrap();
+                fs::remove_dir(&memory).unwrap();
+                Err(FsError::with_cause(
+                    FsErrorKind::RemoveFailed,
+                    std::io::Error::from_raw_os_error(libc::EBUSY),
+                ))
+            })
+            .unwrap_err();
+        let Error::Cgroupfs(error) = error else {
+            panic!("expected cgroupfs deletion failure");
+        };
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EBUSY)
+        );
+        assert!(!memory.exists());
+        assert!(pids.is_dir());
+
+        fs::write(root.join("memory/tasks"), "untouched").unwrap();
+        fs::write(pids.join("tasks"), "456\n").unwrap();
+        manager
+            .destroy_with(|cgroup| {
+                assert_eq!(cgroup.subsystems().len(), 1);
+                assert_eq!(cgroup.subsystems()[0].controller_name(), "pids");
+                assert_eq!(fs::read_to_string(root.join("pids/tasks")).unwrap(), "456");
+                assert_eq!(
+                    fs::read_to_string(root.join("memory/tasks")).unwrap(),
+                    "untouched"
+                );
+                delete_fixture_cgroup(cgroup)
+            })
+            .unwrap();
+        assert!(!pids.exists());
+        manager.destroy().unwrap();
+    }
+
+    #[test]
+    fn test_destroy_v1_read_failures_precede_all_migration() {
+        use std::error::Error as _;
+
+        for errno in [libc::ENOENT, libc::EISDIR] {
+            let (fixture, mut manager) = v1_cleanup_fixture();
+            let root = fixture.topology.fixture_root().unwrap();
+            let memory = root.join("memory/cleanup");
+            let pids = root.join("pids/cleanup");
+            fs::create_dir_all(&memory).unwrap();
+            fs::create_dir_all(&pids).unwrap();
+            fs::write(memory.join("tasks"), "123\n").unwrap();
+            fs::write(root.join("memory/tasks"), "untouched").unwrap();
+            if errno == libc::EISDIR {
+                fs::create_dir(pids.join("tasks")).unwrap();
+            }
+
+            let error = manager.destroy().unwrap_err();
+            let Error::Cgroupfs(error) = error else {
+                panic!("expected cgroupfs membership failure");
+            };
+            assert_eq!(
+                error.kind(),
+                &FsErrorKind::ReadFailed(pids.join("tasks").display().to_string())
+            );
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(errno)
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("memory/tasks")).unwrap(),
+                "untouched"
+            );
+            assert!(!root.join("pids/tasks").exists());
+            assert!(memory.is_dir());
+            assert!(pids.is_dir());
+        }
+    }
+
+    #[test]
+    fn test_destroy_v2_does_not_replay_pid_zero() {
+        for (members, expected_root) in [("0\n", "unchanged"), ("123\n0\n123\n", "123")] {
+            let fixture = crate::tests::topology_fixture(CgroupVersion::V2, "memory");
+            let manager = FsManager::new(
+                fixture.topology.clone(),
+                CgroupPath::new("cleanup").unwrap(),
+            )
+            .unwrap();
+            let root_procs = fixture
+                .topology
+                .fixture_root()
+                .unwrap()
+                .join("cgroup.procs");
+            let directory = manager.controller::<MemController>().unwrap().path();
+            let procs = directory.join("cgroup.procs");
+            fs::create_dir_all(directory).unwrap();
+            fs::write(&procs, members).unwrap();
+
+            // Reading a namespace placeholder and explicitly requesting PID 0
+            // remain valid; automatic migration must not replay that value.
+            assert!(manager
+                .cgroup
+                .procs()
+                .unwrap()
+                .contains(&CgroupPid::from(0)));
+            manager
+                .cgroup
+                .remove_task_by_tgid(CgroupPid::from(0))
+                .unwrap();
+            assert_eq!(fs::read_to_string(&root_procs).unwrap(), "0");
+            fs::write(&root_procs, "unchanged").unwrap();
+
+            manager
+                .destroy_with(|cgroup| {
+                    // These ordinary files prove which values are written,
+                    // not kernel process migration or namespace visibility.
+                    assert_eq!(fs::read_to_string(&root_procs).unwrap(), expected_root);
+                    fs::remove_file(&procs).unwrap();
+                    cgroup.delete()
+                })
+                .unwrap();
+            assert!(!directory.exists());
+        }
+    }
+
+    #[test]
+    fn test_destroy_v1_does_not_replay_pid_zero() {
+        for (members, expected_root) in [("0\n", "unchanged"), ("123\n0\n123\n", "123")] {
+            let fixture = crate::tests::topology_fixture(CgroupVersion::V1, "memory");
+            let manager = FsManager::new(
+                fixture.topology.clone(),
+                CgroupPath::new("cleanup").unwrap(),
+            )
+            .unwrap();
+            let root_tasks = fixture
+                .topology
+                .fixture_root()
+                .unwrap()
+                .join("memory")
+                .join("tasks");
+            let directory = manager.controller::<MemController>().unwrap().path();
+            let tasks = directory.join("tasks");
+            fs::create_dir_all(directory).unwrap();
+            fs::write(&tasks, members).unwrap();
+
+            assert!(manager
+                .cgroup
+                .tasks()
+                .unwrap()
+                .contains(&CgroupPid::from(0)));
+            manager.cgroup.remove_task(CgroupPid::from(0)).unwrap();
+            assert_eq!(fs::read_to_string(&root_tasks).unwrap(), "0");
+            fs::write(&root_tasks, "unchanged").unwrap();
+
+            manager
+                .destroy_with(|cgroup| {
+                    assert_eq!(fs::read_to_string(&root_tasks).unwrap(), expected_root);
+                    fs::remove_file(&tasks).unwrap();
+                    cgroup.delete()
+                })
+                .unwrap();
+            assert!(!directory.exists());
+        }
+    }
+
+    #[test]
+    fn test_destroy_v2_after_concurrent_removal() {
+        let fixture = crate::tests::topology_fixture(CgroupVersion::V2, "memory");
+        let mut manager = FsManager::new(
+            fixture.topology.clone(),
+            CgroupPath::new("cleanup").unwrap(),
+        )
+        .unwrap();
+        let directory = manager.controller::<MemController>().unwrap().path();
+        fs::create_dir_all(directory).unwrap();
+
+        manager
+            .destroy_v2_with(
+                |cgroup| {
+                    // Model another remover winning after the existence check
+                    // but before cgroup.procs is opened.
+                    fs::remove_dir(directory).unwrap();
+                    cgroup.procs()
+                },
+                |_| panic!("an already removed cgroup needs no deletion"),
+            )
+            .unwrap();
+        assert!(!manager.exists());
+        manager.destroy().unwrap();
+    }
+
+    #[test]
+    fn test_destroy_v2_propagates_procs_io_failure() {
+        let fixture = crate::tests::topology_fixture(CgroupVersion::V2, "memory");
+        let manager = FsManager::new(
+            fixture.topology.clone(),
+            CgroupPath::new("cleanup").unwrap(),
+        )
+        .unwrap();
+        let directory = manager.controller::<MemController>().unwrap().path();
+        fs::create_dir_all(directory.join("cgroup.procs")).unwrap();
+
+        let error = manager
+            .destroy_with(|_| panic!("a failed membership read must prevent deletion"))
+            .unwrap_err();
+        let Error::Cgroupfs(error) = error else {
+            panic!("expected cgroupfs membership failure");
+        };
+        assert_eq!(
+            error.kind(),
+            &FsErrorKind::ReadFailed(directory.join("cgroup.procs").display().to_string())
+        );
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EISDIR)
+        );
+        assert!(directory.is_dir());
+    }
+
+    #[test]
+    fn test_destroy_v2_threaded_cgroup_eopnotsupp() {
+        let fixture = crate::tests::topology_fixture(CgroupVersion::V2, "memory");
+        let manager = FsManager::new(
+            fixture.topology.clone(),
+            CgroupPath::new("cleanup").unwrap(),
+        )
+        .unwrap();
+        let directory = manager.controller::<MemController>().unwrap().path();
+        fs::create_dir_all(directory).unwrap();
+
+        let mut deleted = false;
+        manager
+            .destroy_v2_with(
+                |_| {
+                    Err(FsError::with_cause(
+                        FsErrorKind::ReadFailed(
+                            directory.join("cgroup.procs").display().to_string(),
+                        ),
+                        std::io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+                    ))
+                },
+                |cgroup| {
+                    deleted = true;
+                    cgroup.delete()
+                },
+            )
+            .unwrap();
+        assert!(deleted);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn test_pids_before_creation_and_after_removal() {
+        for version in [CgroupVersion::V1, CgroupVersion::V2] {
+            let fixture = crate::tests::topology_fixture(version, "memory");
+            let manager = FsManager::new(
+                fixture.topology.clone(),
+                CgroupPath::new("members").unwrap(),
+            )
+            .unwrap();
+            let controller = manager.controller::<MemController>().unwrap();
+            let directory = controller.path();
+            let tasks = directory.join(if manager.v2() {
+                "cgroup.threads"
+            } else {
+                "tasks"
+            });
+
+            assert!(manager.pids().unwrap().is_empty());
+            // The lifecycle exception belongs only to the manager API.
+            assert!(controller.tasks().unwrap_err().is_not_found());
+            assert!(manager.cgroup.tasks().unwrap_err().is_not_found());
+
+            fs::create_dir_all(directory).unwrap();
+            fs::write(&tasks, "100\n101\n").unwrap();
+            assert_eq!(
+                manager.pids().unwrap(),
+                [CgroupPid::from(100), CgroupPid::from(101)]
+            );
+            fs::remove_file(&tasks).unwrap();
+            assert!(matches!(
+                manager.pids().unwrap_err(),
+                Error::Cgroupfs(error) if error.is_not_found()
+            ));
+            fs::remove_dir(directory).unwrap();
+            assert!(manager.pids().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_pids_after_concurrent_removal() {
+        for version in [CgroupVersion::V1, CgroupVersion::V2] {
+            let fixture = crate::tests::topology_fixture(version, "memory");
+            let manager = FsManager::new(
+                fixture.topology.clone(),
+                CgroupPath::new("members").unwrap(),
+            )
+            .unwrap();
+            let directory = manager.controller::<MemController>().unwrap().path();
+            fs::create_dir_all(directory).unwrap();
+
+            let pids = manager
+                .pids_with(|controller| {
+                    // Model removal after the controller is selected and
+                    // before its membership file is opened.
+                    fs::remove_dir(controller.path()).unwrap();
+                    controller.tasks()
+                })
+                .unwrap();
+            assert!(pids.is_empty());
+            assert!(!directory.exists());
+        }
+    }
+
+    #[test]
+    fn test_pids_preserves_other_read_errors_after_removal() {
+        for version in [CgroupVersion::V1, CgroupVersion::V2] {
+            let fixture = crate::tests::topology_fixture(version, "memory");
+            let manager = FsManager::new(
+                fixture.topology.clone(),
+                CgroupPath::new("members").unwrap(),
+            )
+            .unwrap();
+            // Even if the directory is now absent, an earlier permission or
+            // I/O failure must not be downgraded to an empty membership list.
+            for errno in [libc::EACCES, libc::EIO] {
+                let error = manager
+                    .pids_with(|_| {
+                        Err(FsError::with_cause(
+                            FsErrorKind::ReadFailed("membership".into()),
+                            std::io::Error::from_raw_os_error(errno),
+                        ))
+                    })
+                    .unwrap_err();
+                let Error::Cgroupfs(error) = error else {
+                    panic!("expected cgroupfs membership failure");
+                };
+                assert_eq!(
+                    error
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(errno)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_membership_errors_propagate_from_pids_and_destroy() {
+        for version in [CgroupVersion::V1, CgroupVersion::V2] {
+            let fixture = crate::tests::topology_fixture(version, "memory");
+            let mut manager = FsManager::new(
+                fixture.topology.clone(),
+                CgroupPath::new("membership-errors").unwrap(),
+            )
+            .unwrap();
+            let directory = manager
+                .controller::<MemController>()
+                .unwrap()
+                .path()
+                .to_path_buf();
+            fs::create_dir_all(&directory).unwrap();
+            let tasks = directory.join(if manager.v2() {
+                "cgroup.threads"
+            } else {
+                "tasks"
+            });
+            let procs = directory.join("cgroup.procs");
+            fs::write(&tasks, "100\n101\n").unwrap();
+            fs::write(&procs, "100\n").unwrap();
+            assert_eq!(
+                manager.pids().unwrap(),
+                [CgroupPid::from(100), CgroupPid::from(101)]
+            );
+
+            for path in [&tasks, &procs] {
+                fs::write(path, "100\ninvalid\n").unwrap();
+            }
+            for error in [manager.pids().unwrap_err(), manager.destroy().unwrap_err()] {
+                assert!(
+                    matches!(error, Error::Cgroupfs(ref error) if error.kind() == &FsErrorKind::ParseError)
+                );
+            }
+            assert!(directory.is_dir());
+
+            for path in [&tasks, &procs] {
+                fs::remove_file(path).unwrap();
+            }
+            for error in [manager.pids().unwrap_err(), manager.destroy().unwrap_err()] {
+                assert!(matches!(error, Error::Cgroupfs(ref error) if error.is_not_found()));
+            }
+            assert!(directory.is_dir());
+
+            for path in [&tasks, &procs] {
+                fs::create_dir(path).unwrap();
+            }
+            for error in [manager.pids().unwrap_err(), manager.destroy().unwrap_err()] {
+                let Error::Cgroupfs(error) = error else {
+                    panic!("expected cgroupfs membership failure");
+                };
+                assert!(matches!(error.kind(), FsErrorKind::ReadFailed(_)));
+                assert_eq!(
+                    error
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(libc::EISDIR)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_stats_omit_cpu_accounting_when_required_reads_fail() {
+        let fixture = crate::tests::TopologyFixture::new(
+            b"41 33 0:31 / /sys/fs/cgroup/cpuacct rw - cgroup cgroup rw,cpuacct\n",
+            b"1:cpuacct:/\n",
+            "",
+        );
+        let manager = FsManager::new(
+            fixture.topology.clone(),
+            CgroupPath::new("accounting").unwrap(),
+        )
+        .unwrap();
+        let directory = manager.controller::<CpuAcctController>().unwrap().path();
+        fs::create_dir_all(directory).unwrap();
+        assert!(manager.stats().cpu.cpu_acct.is_none());
+
+        fs::write(directory.join("cpuacct.stat"), "user 0\nsystem 0\n").unwrap();
+        fs::write(directory.join("cpuacct.usage"), "0\n").unwrap();
+        fs::write(directory.join("cpuacct.usage_percpu"), "0\n").unwrap();
+        assert_eq!(manager.stats().cpu.cpu_acct.unwrap().total_usage, 0);
+    }
 
     #[test]
     fn test_managers_use_the_controller_selected_duplicate_v1_mount() {

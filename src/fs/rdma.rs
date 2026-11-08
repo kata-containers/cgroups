@@ -7,10 +7,8 @@
 //!
 //! See the Kernel's documentation for more information about this subsystem, found at:
 //!  [Documentation/cgroup-v1/rdma.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/rdma.txt)
-use std::io::Write;
 use std::path::PathBuf;
 
-use crate::fs::error::ErrorKind::*;
 use crate::fs::error::*;
 
 use crate::fs::read_string_from;
@@ -88,10 +86,6 @@ impl RdmaController {
 
     /// Set a maximum usage for each RDMA/IB resource.
     pub fn set_max(&self, max: &str) -> Result<()> {
-        self.open_path("rdma.max", true).and_then(|mut file| {
-            file.write_all(max.as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed("rdma.max".to_string(), max.to_string()), e)
-            })
-        })
+        self.write_value("rdma.max", max)
     }
 }

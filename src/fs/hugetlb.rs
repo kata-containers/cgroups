@@ -9,7 +9,6 @@
 //! See the Kernel's documentation for more information about this subsystem, found at:
 //!  [Documentation/cgroup-v1/hugetlb.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/hugetlb.txt)
 use log::warn;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::fs::error::ErrorKind::*;
@@ -177,11 +176,7 @@ impl HugeTlbController {
         if self.v2 {
             file_name = format!("hugetlb.{}.max", hugetlb_size);
         }
-        self.open_path(&file_name, true).and_then(|mut file| {
-            file.write_all(limit.to_string().as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed(file_name.to_string(), limit.to_string()), e)
-            })
-        })
+        self.write_value(&file_name, &limit.to_string())
     }
 }
 

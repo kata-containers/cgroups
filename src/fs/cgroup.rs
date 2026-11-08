@@ -438,10 +438,15 @@ impl Cgroup {
     }
 
     /// Apply a set of resource limits to the control group.
+    ///
+    /// Updates are not rolled back; earlier writes may have taken effect.
     pub fn apply(&self, res: &Resources) -> Result<()> {
+        if self.v2() && res.memory.swappiness.is_some() {
+            return Err(Error::new(CgroupVersion));
+        }
         self.subsystems
             .iter()
-            .try_fold((), |_, e| e.to_controller().apply(res))
+            .try_for_each(|subsystem| subsystem.to_controller().apply(res))
     }
 
     /// Retrieve a container based on type inference.
@@ -643,58 +648,62 @@ impl Cgroup {
             .try_for_each(|sub| sub.to_controller().set_release_agent(path))
     }
 
-    /// Returns an Iterator that can be used to iterate over the procs that are currently in the
-    /// control group.
-    pub fn procs(&self) -> Vec<CgroupPid> {
+    /// Returns the procs that are currently in the control group, or an error if reading failed.
+    ///
+    /// Combines the selected v1 controllers or reads the shared v2 hierarchy,
+    /// then sorts and deduplicates the result. An I/O or parse failure in any
+    /// selected controller fails the whole read without returning partial data.
+    pub fn procs(&self) -> Result<Vec<CgroupPid>> {
         // Collect the procs from all subsystems
         let mut v = if self.v2() {
             let subsystems = self.subsystems();
             if !subsystems.is_empty() {
                 let c = subsystems[0].to_controller();
-                c.procs()
+                c.procs()?
             } else {
                 vec![]
             }
         } else {
-            self.subsystems()
-                .iter()
-                .map(|x| x.to_controller().procs())
-                .fold(vec![], |mut acc, mut x| {
-                    acc.append(&mut x);
-                    acc
-                })
+            let mut acc = Vec::new();
+            for x in self.subsystems() {
+                let mut pids = x.to_controller().procs()?;
+                acc.append(&mut pids);
+            }
+            acc
         };
 
         v.sort();
         v.dedup();
-        v
+        Ok(v)
     }
 
-    /// Returns an Iterator that can be used to iterate over the tasks that are currently in the
-    /// control group.
-    pub fn tasks(&self) -> Vec<CgroupPid> {
+    /// Returns the tasks that are currently in the control group, or an error if reading failed.
+    ///
+    /// Combines the selected v1 controllers or reads the shared v2 hierarchy,
+    /// then sorts and deduplicates the result. An I/O or parse failure in any
+    /// selected controller fails the whole read without returning partial data.
+    pub fn tasks(&self) -> Result<Vec<CgroupPid>> {
         // Collect the tasks from all subsystems
         let mut v = if self.v2() {
             let subsystems = self.subsystems();
             if !subsystems.is_empty() {
                 let c = subsystems[0].to_controller();
-                c.tasks()
+                c.tasks()?
             } else {
                 vec![]
             }
         } else {
-            self.subsystems()
-                .iter()
-                .map(|x| x.to_controller().tasks())
-                .fold(vec![], |mut acc, mut x| {
-                    acc.append(&mut x);
-                    acc
-                })
+            let mut acc = Vec::new();
+            for x in self.subsystems() {
+                let mut pids = x.to_controller().tasks()?;
+                acc.append(&mut pids);
+            }
+            acc
         };
 
         v.sort();
         v.dedup();
-        v
+        Ok(v)
     }
 
     /// Checks if the cgroup exists.
@@ -888,6 +897,64 @@ mod tests {
         fs::write(directory.join("cgroup.controllers"), available).unwrap();
         fs::write(directory.join("cgroup.subtree_control"), enabled).unwrap();
         directory
+    }
+
+    fn apply_fixture() -> (crate::tests::TopologyFixture, Cgroup) {
+        let fixture = crate::tests::TopologyFixture::new(
+            b"41 33 0:31 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+              42 33 0:32 / /sys/fs/cgroup/pids rw - cgroup cgroup rw,pids\n\
+              43 33 0:33 / /sys/fs/cgroup/cpuset rw - cgroup cgroup rw,cpuset\n\
+              44 33 0:34 / /sys/fs/cgroup/cpuacct rw - cgroup cgroup rw,cpuacct\n\
+              45 33 0:35 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n\
+              46 33 0:36 / /sys/fs/cgroup/net_cls rw - cgroup cgroup rw,net_cls\n\
+              47 33 0:37 / /sys/fs/cgroup/hugetlb rw - cgroup cgroup rw,hugetlb\n",
+            b"1:memory:/\n2:pids:/\n3:cpuset:/\n4:cpuacct:/\n5:cpu:/\n6:net_cls:/\n7:hugetlb:/\n",
+            "",
+        );
+        let cg = Cgroup::load(
+            crate::fs::hierarchies::from_topology(fixture.topology.clone()),
+            CgroupPath::root(),
+        );
+        for subsystem in cg.subsystems() {
+            fs::create_dir_all(subsystem.to_controller().path()).unwrap();
+        }
+        (fixture, cg)
+    }
+
+    #[test]
+    fn test_apply_stops_at_failure_without_rolling_back_earlier_writes() {
+        let (_fixture, cg) = apply_fixture();
+        let cpuset: &crate::fs::cpuset::CpuSetController = cg.controller_of().unwrap();
+        let cpu: &crate::fs::cpu::CpuController = cg.controller_of().unwrap();
+        fs::create_dir(cpuset.path().join("cpuset.mems")).unwrap();
+        fs::write(cpu.path().join("cpu.shares"), "512").unwrap();
+        let mut resources = Resources::default();
+        resources.memory.memory_hard_limit = Some(1024);
+        resources.pid.maximum_number_of_processes = Some(crate::fs::MaxValue::Value(10));
+        resources.cpu.cpus = Some("0-1".into());
+        resources.cpu.mems = Some("0".into());
+        resources.cpu.shares = Some(1024);
+
+        let error = cg.apply(&resources).unwrap_err();
+        assert_eq!(error.kind(), &WriteFailed("cpuset.mems".into(), "0".into()));
+        let memory: &crate::fs::memory::MemController = cg.controller_of().unwrap();
+        let pids: &crate::fs::pid::PidController = cg.controller_of().unwrap();
+        assert_eq!(
+            fs::read_to_string(memory.path().join("memory.limit_in_bytes")).unwrap(),
+            "1024"
+        );
+        assert_eq!(
+            fs::read_to_string(pids.path().join("pids.max")).unwrap(),
+            "10"
+        );
+        assert_eq!(
+            fs::read_to_string(cpuset.path().join("cpuset.cpus")).unwrap(),
+            "0-1"
+        );
+        assert_eq!(
+            fs::read_to_string(cpu.path().join("cpu.shares")).unwrap(),
+            "512"
+        );
     }
 
     #[test]
@@ -2377,6 +2444,82 @@ mod tests {
     }
 
     #[test]
+    fn test_membership_reads_fail_without_returning_partial_v1_results() {
+        use std::error::Error as _;
+
+        let (_fixture, cg) = apply_fixture();
+        for subsystem in cg.subsystems() {
+            for file in ["cgroup.procs", "tasks"] {
+                fs::write(
+                    subsystem.to_controller().path().join(file),
+                    "200\n100\n100\n",
+                )
+                .unwrap();
+            }
+        }
+        let last = cg.subsystems().last().unwrap().to_controller();
+        for tasks in [false, true] {
+            let path = last
+                .path()
+                .join(if tasks { "tasks" } else { "cgroup.procs" });
+            fs::remove_file(&path).unwrap();
+            let error = if tasks { cg.tasks() } else { cg.procs() }.unwrap_err();
+            assert_eq!(error.kind(), &ReadFailed(path.display().to_string()));
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+
+            fs::write(&path, "100\ninvalid\n").unwrap();
+            let error = if tasks { cg.tasks() } else { cg.procs() }.unwrap_err();
+            assert_eq!(error.kind(), &ParseError);
+            let context = error
+                .source()
+                .unwrap()
+                .downcast_ref::<crate::fs::error::ParsePidFileError>()
+                .unwrap();
+            assert_eq!(context.path, path);
+            assert_eq!(context.cause.line, 2);
+
+            fs::write(&path, "200\n100\n100\n").unwrap();
+            let pids = if tasks { cg.tasks() } else { cg.procs() }.unwrap();
+            assert_eq!(pids, [CgroupPid::from(100), CgroupPid::from(200)]);
+        }
+    }
+
+    #[test]
+    fn test_tasks_v2_without_other_controllers() {
+        let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "");
+        let root = fixture.topology.fixture_root().unwrap();
+        fs::write(root.join("cgroup.procs"), b"100\n200\n").unwrap();
+        fs::write(root.join("cgroup.threads"), b"200\n101\n100\n101\n").unwrap();
+        let cg = Cgroup::load(
+            crate::fs::hierarchies::from_topology(fixture.topology.clone()),
+            CgroupPath::root(),
+        );
+
+        // V2 exposes a synthetic freezer even when cgroup.controllers is empty.
+        assert!(matches!(cg.subsystems(), [Subsystem::Freezer(_)]));
+        assert_eq!(
+            cg.procs().unwrap(),
+            vec![CgroupPid::from(100), CgroupPid::from(200)]
+        );
+        assert_eq!(
+            cg.tasks().unwrap(),
+            vec![
+                CgroupPid::from(100),
+                CgroupPid::from(101),
+                CgroupPid::from(200)
+            ]
+        );
+    }
+
+    #[test]
     fn test_cgroup_path_accessor() {
         let fixture = crate::tests::topology_fixture(crate::core::CgroupVersion::V1, "");
         let topology = fixture.topology.clone();
@@ -2502,5 +2645,37 @@ mod tests {
                     .join(OsStr::from_bytes(expected_parent))
             );
         }
+    }
+
+    #[test]
+    fn test_swappiness_v2_cgroup_apply_rejects_before_modifying_earlier_controllers() {
+        let fixture =
+            crate::tests::topology_fixture(crate::core::CgroupVersion::V2, "cpuset memory pids");
+        let cgroup = Cgroup::load(
+            crate::fs::hierarchies::from_topology(fixture.topology.clone()),
+            CgroupPath::new("test_swappiness_preflight").unwrap(),
+        );
+        let cpuset_ctrl: &crate::fs::cpuset::CpuSetController = cgroup.controller_of().unwrap();
+        let pids_ctrl: &crate::fs::pid::PidController = cgroup.controller_of().unwrap();
+
+        fs::create_dir_all(cpuset_ctrl.path()).unwrap();
+        fs::write(cpuset_ctrl.path().join("cpuset.cpus"), "0-1\n").unwrap();
+        fs::write(pids_ctrl.path().join("pids.max"), "max\n").unwrap();
+
+        let mut resources = Resources::default();
+        resources.cpu.cpus = Some("0".to_string());
+        resources.memory.swappiness = Some(60);
+        resources.pid.maximum_number_of_processes = Some(crate::fs::MaxValue::Value(100));
+
+        let error = cgroup.apply(&resources).unwrap_err();
+        assert_eq!(error.kind(), &CgroupVersion);
+        assert_eq!(
+            fs::read_to_string(cpuset_ctrl.path().join("cpuset.cpus")).unwrap(),
+            "0-1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(pids_ctrl.path().join("pids.max")).unwrap(),
+            "max\n"
+        );
     }
 }

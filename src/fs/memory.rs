@@ -10,7 +10,7 @@
 //!  [Documentation/cgroup-v1/memory.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/memory.txt)
 use log::warn;
 use std::collections::HashMap;
-use std::io::Write;
+use std::error::Error as _;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
@@ -507,6 +507,12 @@ impl ControllerInternal for MemController {
         // get the resources that apply to this controller
         let memres: &MemoryResources = &res.memory;
 
+        // v2 has no per-cgroup swappiness setting. Reject it before any
+        // memory writes, rather than letting the best-effort update ignore it.
+        if self.v2 && memres.swappiness.is_some() {
+            return Err(Error::new(CgroupVersion));
+        }
+
         update!(self, set_limit, memres.memory_hard_limit);
         update!(self, set_soft_limit, memres.memory_soft_limit);
         update!(self, set_kmem_limit, memres.kernel_memory_limit);
@@ -514,9 +520,7 @@ impl ControllerInternal for MemController {
         update!(self, set_tcp_limit, memres.kernel_tcp_memory_limit);
         update!(self, set_swappiness, memres.swappiness);
 
-        memres.attrs.iter().for_each(|(k, v)| {
-            let _ = self.set(k, v);
-        });
+        self.apply_attributes(&memres.attrs)?;
 
         Ok(())
     }
@@ -545,11 +549,7 @@ impl MemController {
             let f = value.1;
             if let Some(v) = v {
                 let v = v.to_string();
-                self.open_path(f, true).and_then(|mut file| {
-                    file.write_all(v.as_ref()).map_err(|e| {
-                        Error::with_cause(WriteFailed(f.to_string(), format!("{:?}", v)), e)
-                    })
-                })?;
+                self.write_value(f, &v)?;
             }
         }
         Ok(())
@@ -774,14 +774,7 @@ impl MemController {
 
     /// Reset the fail counter
     pub fn reset_fail_count(&self) -> Result<()> {
-        self.open_path("memory.failcnt", true).and_then(|mut file| {
-            file.write_all("0".to_string().as_ref()).map_err(|e| {
-                Error::with_cause(
-                    WriteFailed("memory.failcnt".to_string(), "0".to_string()),
-                    e,
-                )
-            })
-        })
+        self.write_value("memory.failcnt", "0")
     }
 
     /// Reset the kernel memory fail counter
@@ -791,15 +784,7 @@ impl MemController {
             return Ok(());
         }
 
-        self.open_path("memory.kmem.failcnt", true)
-            .and_then(|mut file| {
-                file.write_all("0".to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("memory.kmem.failcnt".to_string(), "0".to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("memory.kmem.failcnt", "0")
     }
 
     /// Reset the TCP related fail counter
@@ -809,41 +794,17 @@ impl MemController {
             return Ok(());
         }
 
-        self.open_path("memory.kmem.tcp.failcnt", true)
-            .and_then(|mut file| {
-                file.write_all("0".to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("memory.kmem.tcp.failcnt".to_string(), "0".to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("memory.kmem.tcp.failcnt", "0")
     }
 
     /// Reset the memory+swap fail counter
     pub fn reset_memswap_fail_count(&self) -> Result<()> {
-        self.open_path("memory.memsw.failcnt", true)
-            .and_then(|mut file| {
-                file.write_all("0".to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("memory.memsw.failcnt".to_string(), "0".to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("memory.memsw.failcnt", "0")
     }
 
     /// Reset the max memory usage recorded
     pub fn reset_max_usage(&self) -> Result<()> {
-        self.open_path("memory.max_usage_in_bytes", true)
-            .and_then(|mut file| {
-                file.write_all("0".to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("memory.max_usage_in_bytes".to_string(), "0".to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("memory.max_usage_in_bytes", "0")
     }
 
     /// Set the memory usage limit of the control group, in bytes.
@@ -856,10 +817,7 @@ impl MemController {
                 limit_str = "max".to_string();
             }
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(limit_str.as_ref())
-                .map_err(|e| Error::with_cause(WriteFailed(file_name.to_string(), limit_str), e))
-        })
+        self.write_value(file_name, &limit_str)
     }
 
     /// Set the kernel memory limit of the control group, in bytes.
@@ -869,21 +827,20 @@ impl MemController {
             return Ok(());
         }
 
-        self.open_path("memory.kmem.limit_in_bytes", true)
-            .and_then(|mut file| {
-                let r = file.write_all(limit.to_string().as_ref());
-                match r {
-                    Ok(()) => Ok(()),
-                    Err(ref e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
-                        warn!("memory.kmem.limit_in_bytes is unsupported by the kernel");
-                        Ok(())
-                    }
-                    Err(e) => Err(Error::with_cause(
-                        WriteFailed("memory.kmem.limit_in_bytes".to_string(), limit.to_string()),
-                        e,
-                    )),
-                }
-            })
+        match self.write_value("memory.kmem.limit_in_bytes", &limit.to_string()) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.source().and_then(|cause| cause.downcast_ref::<WriteFileError>()),
+                    Some(WriteFileError::Write { cause, .. })
+                        if cause.raw_os_error() == Some(libc::EOPNOTSUPP)
+                ) =>
+            {
+                warn!("memory.kmem.limit_in_bytes is unsupported by the kernel");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Set the memory+swap limit of the control group, in bytes.
@@ -896,10 +853,7 @@ impl MemController {
                 limit_str = "max".to_string();
             }
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(limit_str.as_ref())
-                .map_err(|e| Error::with_cause(WriteFailed(file_name.to_string(), limit_str), e))
-        })
+        self.write_value(file_name, &limit_str)
     }
 
     /// Set how much kernel memory can be used for TCP-related buffers by the control group.
@@ -909,18 +863,7 @@ impl MemController {
             return Ok(());
         }
 
-        self.open_path("memory.kmem.tcp.limit_in_bytes", true)
-            .and_then(|mut file| {
-                file.write_all(limit.to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed(
-                            "memory.kmem.tcp.limit_in_bytes".to_string(),
-                            limit.to_string(),
-                        ),
-                        e,
-                    )
-                })
-            })
+        self.write_value("memory.kmem.tcp.limit_in_bytes", &limit.to_string())
     }
 
     /// Set the soft limit of the control group, in bytes.
@@ -932,43 +875,29 @@ impl MemController {
         if self.v2 {
             file_name = "memory.low"
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(limit.to_string().as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed(file_name.to_string(), limit.to_string()), e)
-            })
-        })
+        self.write_value(file_name, &limit.to_string())
     }
 
     /// Set how likely the kernel is to swap out parts of the address space used by the control
     /// group.
     ///
     /// Note that a value of zero does not imply that the process will not be swapped out.
+    /// Returns [`ErrorKind::CgroupVersion`] on cgroup v2, which has no
+    /// per-cgroup swappiness setting. No file is written in that case.
     pub fn set_swappiness(&self, swp: u64) -> Result<()> {
-        let mut file_name = "memory.swappiness";
         if self.v2 {
-            file_name = "memory.swap.max"
+            return Err(Error::new(CgroupVersion));
         }
+        let file_name = "memory.swappiness";
 
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(swp.to_string().as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed(file_name.to_string(), swp.to_string()), e)
-            })
-        })
+        self.write_value(file_name, &swp.to_string())
     }
 
     pub fn disable_oom_killer(&self) -> Result<()> {
         if self.v2 {
             Err(Error::new(CgroupVersion))
         } else {
-            self.open_path("memory.oom_control", true)
-                .and_then(|mut file| {
-                    file.write_all("1".to_string().as_ref()).map_err(|e| {
-                        Error::with_cause(
-                            WriteFailed("memory.oom_control".to_string(), "1".to_string()),
-                            e,
-                        )
-                    })
-                })
+            self.write_value("memory.oom_control", "1")
         }
     }
 
@@ -1012,6 +941,93 @@ mod tests {
         OomControl,
     };
     use std::path::PathBuf;
+
+    fn swappiness_fixture(
+        version: crate::core::CgroupVersion,
+    ) -> (crate::tests::TopologyFixture, crate::fs::Cgroup) {
+        use crate::core::CgroupPath;
+        use crate::fs::{hierarchies, Cgroup, Controller};
+
+        let fixture = crate::tests::topology_fixture(version, "memory");
+        let cgroup = Cgroup::load(
+            hierarchies::from_topology(fixture.topology.clone()),
+            CgroupPath::root(),
+        );
+        let controller: &MemController = cgroup.controller_of().unwrap();
+        std::fs::create_dir_all(controller.path()).unwrap();
+        (fixture, cgroup)
+    }
+
+    #[test]
+    fn test_swappiness_v2_setter_rejects_without_changing_swap_limit() {
+        use crate::core::CgroupVersion;
+        use crate::fs::Controller;
+        use std::fs;
+
+        let (_fixture, cgroup) = swappiness_fixture(CgroupVersion::V2);
+        let controller: &MemController = cgroup.controller_of().unwrap();
+        let swap_path = controller.path().join("memory.swap.max");
+        fs::write(&swap_path, "1048576").unwrap();
+
+        let error = controller.set_swappiness(60).unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::CgroupVersion);
+        assert_eq!(fs::read_to_string(&swap_path).unwrap(), "1048576");
+        assert!(!controller.path().join("memory.swappiness").exists());
+    }
+
+    #[test]
+    fn test_swappiness_v2_apply_rejects_before_memory_writes() {
+        use crate::core::CgroupVersion;
+        use crate::fs::{Controller, Resources};
+        use std::fs;
+
+        let (_fixture, cgroup) = swappiness_fixture(CgroupVersion::V2);
+        let controller: &MemController = cgroup.controller_of().unwrap();
+        let memory_path = controller.path().join("memory.max");
+        let swap_path = controller.path().join("memory.swap.max");
+        fs::write(&memory_path, "65536").unwrap();
+        fs::write(&swap_path, "1048576").unwrap();
+        let mut resources = Resources::default();
+        resources.memory.memory_hard_limit = Some(4096);
+        resources.memory.memory_swap_limit = Some(8192);
+        resources.memory.swappiness = Some(60);
+
+        for error in [
+            controller.apply(&resources).unwrap_err(),
+            cgroup.apply(&resources).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), &ErrorKind::CgroupVersion);
+            assert_eq!(fs::read_to_string(&memory_path).unwrap(), "65536");
+            assert_eq!(fs::read_to_string(&swap_path).unwrap(), "1048576");
+            assert!(!controller.path().join("memory.swappiness").exists());
+        }
+
+        resources.memory.swappiness = None;
+        cgroup.apply(&resources).unwrap();
+        assert_eq!(fs::read_to_string(memory_path).unwrap(), "4096");
+        assert_eq!(fs::read_to_string(swap_path).unwrap(), "8192");
+    }
+
+    #[test]
+    fn test_swappiness_v1_setter_and_apply_use_swappiness_file() {
+        use crate::core::CgroupVersion;
+        use crate::fs::{Controller, Resources};
+        use std::fs;
+
+        let (_fixture, cgroup) = swappiness_fixture(CgroupVersion::V1);
+        let controller: &MemController = cgroup.controller_of().unwrap();
+        let path = controller.path().join("memory.swappiness");
+        controller.set_swappiness(60).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "60");
+
+        let mut resources = Resources::default();
+        resources.memory.swappiness = Some(75);
+        controller.apply(&resources).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "75");
+        cgroup.apply(&resources).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "75");
+        assert!(!controller.path().join("memory.swap.max").exists());
+    }
 
     static GOOD_VALUE: &str = "\
 total=51189 N0=51189 N1=123

@@ -7,7 +7,6 @@
 //!
 //! See the Kernel's documentation for more information about this subsystem, found at:
 //!  [Documentation/cgroup-v1/net_cls.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/net_cls.txt)
-use std::io::Write;
 use std::path::PathBuf;
 
 use crate::fs::error::ErrorKind::*;
@@ -85,13 +84,7 @@ impl NetClsController {
 
     /// Set the network class id of the outgoing packets of the control group's tasks.
     pub fn set_class(&self, class: u64) -> Result<()> {
-        self.open_path("net_cls.classid", true)
-            .and_then(|mut file| {
-                let s = format!("{:#08X}", class);
-                file.write_all(s.as_ref()).map_err(|e| {
-                    Error::with_cause(WriteFailed("net_cls.classid".to_string(), s), e)
-                })
-            })
+        self.write_value("net_cls.classid", &format!("{:#08X}", class))
     }
 
     /// Get the network class id of the outgoing packets of the control group's tasks.

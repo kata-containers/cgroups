@@ -8,7 +8,6 @@
 //!
 //! See the Kernel's documentation for more information about this subsystem, found at:
 //!  [Documentation/cgroup-v1/blkio-controller.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/blkio-controller.txt)
-use std::io::Write;
 use std::path::PathBuf;
 
 use crate::fs::error::ErrorKind::*;
@@ -400,9 +399,7 @@ impl ControllerInternal for BlkIoController {
             let _ = self.throttle_write_iops_for_device(dev.major, dev.minor, dev.rate);
         }
 
-        res.attrs.iter().for_each(|(k, v)| {
-            let _ = self.set(k, v);
-        });
+        self.apply_attributes(&res.attrs)?;
 
         Ok(())
     }
@@ -684,45 +681,20 @@ impl BlkIoController {
     /// Set the leaf weight on the control group's tasks, i.e., how are they weighted against the
     /// descendant control groups' tasks.
     pub fn set_leaf_weight(&self, w: u64) -> Result<()> {
-        self.open_path("blkio.leaf_weight", true)
-            .and_then(|mut file| {
-                file.write_all(w.to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("blkio.leaf_weight".to_string(), w.to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("blkio.leaf_weight", &w.to_string())
     }
 
     /// Same as `set_leaf_weight()`, but settable per each block device.
     pub fn set_leaf_weight_for_device(&self, major: u64, minor: u64, weight: u64) -> Result<()> {
-        self.open_path("blkio.leaf_weight_device", true)
-            .and_then(|mut file| {
-                file.write_all(format!("{}:{} {}", major, minor, weight).as_ref())
-                    .map_err(|e| {
-                        Error::with_cause(
-                            WriteFailed(
-                                "blkio.leaf_weight_device".to_string(),
-                                format!("{}:{} {}", major, minor, weight),
-                            ),
-                            e,
-                        )
-                    })
-            })
+        self.write_value(
+            "blkio.leaf_weight_device",
+            &format!("{}:{} {}", major, minor, weight),
+        )
     }
 
     /// Reset the statistics the kernel has gathered so far and start fresh.
     pub fn reset_stats(&self) -> Result<()> {
-        self.open_path("blkio.reset_stats", true)
-            .and_then(|mut file| {
-                file.write_all("1".to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("blkio.reset_stats".to_string(), "1".to_string()),
-                        e,
-                    )
-                })
-            })
+        self.write_value("blkio.reset_stats", "1")
     }
 
     /// Throttle the bytes per second rate of read operation affecting the block device
@@ -734,11 +706,7 @@ impl BlkIoController {
             file_name = "io.max";
             content = format!("{}:{} rbps={}", major, minor, bps);
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(content.as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed(file_name.to_string(), content.to_string()), e)
-            })
-        })
+        self.write_value(file_name, &content)
     }
 
     /// Throttle the I/O operations per second rate of read operation affecting the block device
@@ -750,11 +718,7 @@ impl BlkIoController {
             file_name = "io.max";
             content = format!("{}:{} riops={}", major, minor, iops);
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(content.as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed(file_name.to_string(), content.to_string()), e)
-            })
-        })
+        self.write_value(file_name, &content)
     }
     /// Throttle the bytes per second rate of write operation affecting the block device
     /// `major:minor` to `bps`.
@@ -765,11 +729,7 @@ impl BlkIoController {
             file_name = "io.max";
             content = format!("{}:{} wbps={}", major, minor, bps);
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(content.as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed(file_name.to_string(), content.to_string()), e)
-            })
-        })
+        self.write_value(file_name, &content)
     }
 
     /// Throttle the I/O operations per second rate of write operation affecting the block device
@@ -781,11 +741,7 @@ impl BlkIoController {
             file_name = "io.max";
             content = format!("{}:{} wiops={}", major, minor, iops);
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(content.as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed(file_name.to_string(), content.to_string()), e)
-            })
-        })
+        self.write_value(file_name, &content)
     }
 
     /// Set the weight of the control group's tasks.
@@ -795,11 +751,7 @@ impl BlkIoController {
         if self.v2 {
             file_name = "io.bfq.weight";
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(w.to_string().as_ref()).map_err(|e| {
-                Error::with_cause(WriteFailed(file_name.to_string(), w.to_string()), e)
-            })
-        })
+        self.write_value(file_name, &w.to_string())
     }
 
     /// Same as `set_weight()`, but settable per each block device.
@@ -811,18 +763,7 @@ impl BlkIoController {
             // may depends on IO schedulers https://wiki.ubuntu.com/Kernel/Reference/IOSchedulers
             file_name = "io.bfq.weight";
         }
-        self.open_path(file_name, true).and_then(|mut file| {
-            file.write_all(format!("{}:{} {}", major, minor, weight).as_ref())
-                .map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed(
-                            file_name.to_string(),
-                            format!("{}:{} {}", major, minor, weight),
-                        ),
-                        e,
-                    )
-                })
-        })
+        self.write_value(file_name, &format!("{}:{} {}", major, minor, weight))
     }
 }
 
