@@ -79,9 +79,7 @@ impl ControllerInternal for CpuController {
         update_and_test!(self, set_cfs_period, res.period, cfs_period);
         update_and_test!(self, set_cfs_quota, res.quota, cfs_quota);
 
-        res.attrs.iter().for_each(|(k, v)| {
-            let _ = self.set(k, v);
-        });
+        self.apply_attributes(&res.attrs)?;
 
         // TODO: rt properties (CONFIG_RT_GROUP_SCHED) are not yet supported
 

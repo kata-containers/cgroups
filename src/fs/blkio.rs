@@ -399,9 +399,7 @@ impl ControllerInternal for BlkIoController {
             let _ = self.throttle_write_iops_for_device(dev.major, dev.minor, dev.rate);
         }
 
-        res.attrs.iter().for_each(|(k, v)| {
-            let _ = self.set(k, v);
-        });
+        self.apply_attributes(&res.attrs)?;
 
         Ok(())
     }

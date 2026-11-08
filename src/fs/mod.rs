@@ -236,8 +236,10 @@ mod sealed {
             })
         }
 
-        /// Write a resource value with consistent context for open and write failures.
+        /// Write one resource file, validating its name before opening it and
+        /// retaining consistent context for open and write failures.
         fn write_value(&self, name: &str, value: &str) -> Result<()> {
+            validate_attribute_name(name, "ControllerInternal::write_value")?;
             let path = self.get_path().join(name);
             let mut file = File::create(&path).map_err(|cause| {
                 Error::with_cause(
@@ -278,6 +280,18 @@ mod sealed {
             self.write_value(key, value)
         }
 
+        /// Reject invalid names before any customized writes. I/O failures for
+        /// valid names retain the released best-effort apply behavior.
+        fn apply_attributes(&self, attrs: &HashMap<String, String>) -> Result<()> {
+            for name in attrs.keys() {
+                validate_attribute_name(name, "Controller::apply")?;
+            }
+            for (name, value) in attrs {
+                let _ = self.set(name, value);
+            }
+            Ok(())
+        }
+
         #[allow(dead_code)]
         fn get(&self, key: &str) -> Result<String> {
             self.open_path(key, false).and_then(|mut file: File| {
@@ -293,6 +307,38 @@ mod sealed {
 
 pub(crate) use crate::fs::sealed::{ControllerInternal, CustomizedAttribute};
 use crate::CgroupPid;
+
+/// Validate one Linux filename without normalizing away path components.
+fn validate_attribute_name(name: &str, operation: &'static str) -> Result<()> {
+    let cause = match name {
+        "" => AttributeNameError::EmptyName {
+            input: name.to_owned(),
+            operation,
+        },
+        "." => AttributeNameError::CurrentComponent {
+            input: name.to_owned(),
+            operation,
+        },
+        ".." => AttributeNameError::ParentComponent {
+            input: name.to_owned(),
+            operation,
+        },
+        name if name.starts_with('/') => AttributeNameError::AbsolutePath {
+            input: name.to_owned(),
+            operation,
+        },
+        name if name.contains('/') => AttributeNameError::PathSeparator {
+            input: name.to_owned(),
+            operation,
+        },
+        name if name.contains('\0') => AttributeNameError::NulByte {
+            input: name.to_owned(),
+            operation,
+        },
+        _ => return Ok(()),
+    };
+    Err(Error::with_cause(InvalidPath, cause))
+}
 
 /// Read a kernel-version-dependent cgroup file.
 ///
@@ -644,7 +690,10 @@ pub struct MemoryResources {
     /// Note, however, that a value of zero does not mean the process is never swapped out. Use the
     /// traditional `mlock(2)` system call for that purpose.
     pub swappiness: Option<u64>,
-    /// Customized key-value attributes
+    /// Customized key-value attributes.
+    ///
+    /// Keys must be single nonempty filenames, excluding `.`, `..`, `/`, and
+    /// NUL bytes. Invalid keys make `Controller::apply()` return `InvalidPath`.
     ///
     /// # Usage:
     /// ```
@@ -690,7 +739,9 @@ pub struct CpuResources {
     pub realtime_runtime: Option<i64>,
     /// This is currently a no-operation.
     pub realtime_period: Option<u64>,
-    /// Customized key-value attributes
+    /// Customized key-value attributes.
+    ///
+    /// Keys follow the same filename rules as [`MemoryResources::attrs`].
     /// # Usage:
     /// ```
     /// let resource = &mut cgroups_rs::fs::Resources::default();
@@ -811,7 +862,9 @@ pub struct BlkIoResources {
     /// Throttled write IO operations per second can be provided for each device.
     pub throttle_write_iops_device: Vec<BlkIoDeviceThrottleResource>,
 
-    /// Customized key-value attributes
+    /// Customized key-value attributes.
+    ///
+    /// Keys follow the same filename rules as [`MemoryResources::attrs`].
     /// # Usage:
     /// ```
     /// let resource = &mut cgroups_rs::fs::Resources::default();
@@ -1113,6 +1166,152 @@ fn read_u64_from(file: File) -> Result<u64> {
 /// read and parse an i64 data
 fn read_i64_from(file: File) -> Result<i64> {
     read_from::<i64>(file)
+}
+
+#[cfg(test)]
+mod controller_attribute_tests {
+    use super::*;
+    use crate::tests::TestDir;
+    use std::error::Error as _;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn assert_name_error(error: &Error, name: &str, operation: &str) {
+        assert_eq!(error.kind(), &InvalidPath);
+        let context = error
+            .source()
+            .unwrap()
+            .downcast_ref::<AttributeNameError>()
+            .unwrap();
+        let (input, actual_operation) = match context {
+            AttributeNameError::EmptyName { input, operation }
+            | AttributeNameError::AbsolutePath { input, operation }
+            | AttributeNameError::CurrentComponent { input, operation }
+            | AttributeNameError::ParentComponent { input, operation }
+            | AttributeNameError::PathSeparator { input, operation }
+            | AttributeNameError::NulByte { input, operation } => (input, operation),
+        };
+        assert_eq!(input, name);
+        assert_eq!(*actual_operation, operation);
+    }
+
+    #[test]
+    fn attribute_writes_reject_paths_before_opening_targets() {
+        let fixture = TestDir::new("attribute_paths");
+        let directory = fixture.join(OsStr::from_bytes(b"group-\xff"));
+        fs::create_dir(&directory).unwrap();
+        let controller = MemController::new(directory.clone(), directory.clone(), false);
+        let outside = fixture.join("outside");
+        fs::write(&outside, "unchanged").unwrap();
+        let absolute = outside.to_str().unwrap();
+
+        for name in [
+            absolute,
+            "../outside",
+            "../created",
+            "child/limit",
+            "./memory.limit_in_bytes",
+            "memory.limit_in_bytes/",
+            "",
+            ".",
+            "..",
+            "memory.\0limit",
+        ] {
+            let error = controller.write_value(name, "overwrite").unwrap_err();
+            assert_name_error(&error, name, "ControllerInternal::write_value");
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "unchanged");
+            assert!(!fixture.join("created").exists());
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn customized_attributes_reject_paths_before_any_attribute_write() {
+        for v2 in [false, true] {
+            let fixture = TestDir::new("attribute_apply_paths");
+            let directory = fixture.join("group");
+            fs::create_dir(&directory).unwrap();
+            let outside = fixture.join("outside");
+            fs::write(&outside, "unchanged").unwrap();
+            let memory = MemController::new(directory.clone(), directory.clone(), v2);
+            let cpu = CpuController::new(directory.clone(), directory.clone(), v2);
+            let blkio = BlkIoController::new(directory.clone(), directory.clone(), v2);
+
+            for invalid in [outside.to_str().unwrap(), "../outside", "../created"] {
+                let mut resources = Resources::default();
+                for attrs in [
+                    &mut resources.memory.attrs,
+                    &mut resources.cpu.attrs,
+                    &mut resources.blkio.attrs,
+                ] {
+                    attrs.insert("vendor.limit".into(), "updated".into());
+                    attrs.insert(invalid.into(), "overwrite".into());
+                }
+
+                for controller in [&memory as &dyn Controller, &cpu, &blkio] {
+                    fs::write(directory.join("vendor.limit"), "unchanged").unwrap();
+                    let error = controller.apply(&resources).unwrap_err();
+                    assert_name_error(&error, invalid, "Controller::apply");
+                    assert_eq!(fs::read_to_string(&outside).unwrap(), "unchanged");
+                    assert!(!fixture.join("created").exists());
+                    assert_eq!(
+                        fs::read_to_string(directory.join("vendor.limit")).unwrap(),
+                        "unchanged"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn customized_attributes_keep_valid_names_and_best_effort_io() {
+        for v2 in [false, true] {
+            let fixture = TestDir::new("attribute_apply_valid");
+            let directory = fixture.path().to_path_buf();
+            let memory = MemController::new(directory.clone(), directory.clone(), v2);
+            let cpu = CpuController::new(directory.clone(), directory.clone(), v2);
+            let blkio = BlkIoController::new(directory.clone(), directory.clone(), v2);
+            let mut resources = Resources::default();
+            for attrs in [
+                &mut resources.memory.attrs,
+                &mut resources.cpu.attrs,
+                &mut resources.blkio.attrs,
+            ] {
+                attrs.insert("vendor.limit".into(), "updated".into());
+                attrs.insert("vendor..limit".into(), "accepted".into());
+            }
+            for controller in [&memory as &dyn Controller, &cpu, &blkio] {
+                fs::write(directory.join("vendor.limit"), "unchanged").unwrap();
+                controller.apply(&resources).unwrap();
+                assert_eq!(
+                    fs::read_to_string(directory.join("vendor.limit")).unwrap(),
+                    "updated"
+                );
+                assert_eq!(
+                    fs::read_to_string(directory.join("vendor..limit")).unwrap(),
+                    "accepted"
+                );
+            }
+
+            // An ordinary directory produces a root-independent open failure.
+            fs::remove_file(directory.join("vendor.limit")).unwrap();
+            fs::create_dir(directory.join("vendor.limit")).unwrap();
+            for controller in [&memory as &dyn Controller, &cpu, &blkio] {
+                controller.apply(&resources).unwrap();
+            }
+            let error = memory.set("vendor.limit", "updated").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &WriteFailed("vendor.limit".into(), "updated".into())
+            );
+            assert!(matches!(
+                error.source().unwrap().downcast_ref::<WriteFileError>().unwrap(),
+                WriteFileError::Open { path, cause }
+                    if path == &directory.join("vendor.limit")
+                        && cause.raw_os_error() == Some(libc::EISDIR)
+            ));
+        }
+    }
 }
 
 #[cfg(test)]

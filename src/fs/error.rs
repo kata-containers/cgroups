@@ -131,6 +131,67 @@ impl WriteFileError {
     }
 }
 
+/// A controller attribute name rejected before opening a filesystem target.
+///
+/// Attribute names identify one file within the controller directory, rather
+/// than a cgroup path. [`ErrorKind::InvalidPath`] retains this structured source.
+#[non_exhaustive]
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum AttributeNameError {
+    /// An attribute name cannot be empty.
+    #[error("invalid controller attribute {input:?} in {operation}: name is empty")]
+    EmptyName {
+        /// The original attribute name.
+        input: String,
+        /// The operation that attempted to use the name.
+        operation: &'static str,
+    },
+    /// An absolute path would replace the controller directory.
+    #[error("invalid controller attribute {input:?} in {operation}: path is absolute")]
+    AbsolutePath {
+        /// The original attribute name.
+        input: String,
+        /// The operation that attempted to use the name.
+        operation: &'static str,
+    },
+    /// The current-directory component does not name an attribute file.
+    #[error(
+        "invalid controller attribute {input:?} in {operation}: name is the current directory"
+    )]
+    CurrentComponent {
+        /// The original attribute name.
+        input: String,
+        /// The operation that attempted to use the name.
+        operation: &'static str,
+    },
+    /// The parent-directory component could escape the controller directory.
+    #[error("invalid controller attribute {input:?} in {operation}: name is the parent directory")]
+    ParentComponent {
+        /// The original attribute name.
+        input: String,
+        /// The operation that attempted to use the name.
+        operation: &'static str,
+    },
+    /// Attribute names must not contain the Linux path separator `/`.
+    #[error(
+        "invalid controller attribute {input:?} in {operation}: name contains a path separator"
+    )]
+    PathSeparator {
+        /// The original attribute name.
+        input: String,
+        /// The operation that attempted to use the name.
+        operation: &'static str,
+    },
+    /// Filesystem names cannot contain a NUL byte.
+    #[error("invalid controller attribute {input:?} in {operation}: name contains a NUL byte")]
+    NulByte {
+        /// The original attribute name.
+        input: String,
+        /// The operation that attempted to use the name.
+        operation: &'static str,
+    },
+}
+
 /// The different types of errors that can occur while manipulating control groups.
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
@@ -176,8 +237,9 @@ pub enum ErrorKind {
 
     /// The path of the control group was invalid.
     ///
-    /// This could be caused by trying to escape the control group filesystem via a string of "..".
-    /// This crate checks against this and operations will fail with this error.
+    /// Cgroup path constructors and controller attribute writers reject path
+    /// traversal. Attribute-name failures retain [`AttributeNameError`] as
+    /// their source, including the original name and operation.
     #[error("the given path is invalid")]
     InvalidPath,
 

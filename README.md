@@ -77,6 +77,12 @@ cg.delete();
   open failures previously reported a full path and placeholder. Update
   `WriteFailed` matches and downcast the immediate source to
   `fs::error::WriteFileError` for the full path and original I/O error.
+- Customized keys in `Resources.memory.attrs`, `cpu.attrs`, and `blkio.attrs`
+  must now be single nonempty filenames, excluding `.`, `..`, `/`, and NUL
+  bytes. In 0.5.1, keys could be interpreted as paths outside the cgroup.
+  `apply()` now rejects invalid keys with `ErrorKind::InvalidPath` and an
+  `fs::error::AttributeNameError` source. Pass a filename such as `memory.high`
+  and select the cgroup directory through `CgroupPath` instead.
 - `fs::error::ErrorKind` is now `#[non_exhaustive]`; add a wildcard arm
   (`_ => ...`) to downstream matches so future variants do not break them.
 - `Cgroup::new` and `Cgroup::load` now take `Arc<dyn Hierarchy>` and a
